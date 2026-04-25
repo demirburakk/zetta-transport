@@ -1,6 +1,6 @@
-# ZettaTransport (ZT) 🚀
+# ZettaTransport (ZT) 
 
-[![License: MIT/Apache-2.0](https://img.shields.io/badge/License-MIT%2FApache--2.0-blue.svg)](LICENSE)
+[![License: MIT/Apache-2.0](https://img.shields.io/badge/License-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust: 2024](https://img.shields.io/badge/Rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![Security: X25519/ChaCha20](https://img.shields.io/badge/Security-X25519%2FChaCha20-green.svg)](RFC.md)
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
@@ -110,7 +110,7 @@ For deep architectural details, bit-layouts, and state machine logic, please ref
 
 ## ⚖️ License
 
-Licensed under [MIT](LICENSE) OR [Apache-2.0](LICENSE-APACHE).
+Licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE).
 
 ---
 *Developed & Maintained by **Burak Demir** ([demirburak8338@gmail.com](mailto:demirburak8338@gmail.com))*
