@@ -9,11 +9,11 @@
 
 ---
 
-## 🌟 The Vision: "Hardened by Default"
+##  The Vision: "Hardened by Default"
 
 Traditional protocols like TCP suffer from head-of-line blocking in lossy networks, while standard UDP offers zero security or reliability. ZettaTransport bridges this gap. It doesn't just send data; it ensures your telemetry, command & control (C2), and sensor streams survive extreme packet loss, jamming attempts, and network handovers, all while remaining cryptographically invisible to unauthorized actors.
 
-## 🛡️ Core Strengths & Features
+##  Core Strengths & Features
 
 ### 1. Built for Hostile Networks (Active FEC & AIMD)
 - **Advanced Mathematical Recovery:** Integrates a dual-engine Forward Error Correction (FEC) system supporting both **XOR Parity** and **Reed-Solomon Erasure Coding** for variable-length payloads. Dropped packets are mathematically reconstructed on the fly, avoiding high-latency retransmissions.
@@ -35,18 +35,18 @@ Traditional protocols like TCP suffer from head-of-line blocking in lossy networ
 
 ---
 
-## 🎯 Ideal Use Cases
+##  Ideal Use Cases
 
 ZettaTransport shines where standard protocols fail:
 
-*   🚁 **Autonomous Swarm Robotics (UAVs/Drones):** Perfect for high-frequency telemetry and swarm coordination where latency is critical and RF links are constantly degraded by distance or obstacles.
-*   🏭 **Industrial IoT (IIoT) Gateways:** Securely aggregating and blasting thousands of sensor readings from the factory floor to the cloud over unstable cellular links.
-*   🎮 **Real-Time Telemetry & C2:** Remote operation of rovers, submersibles, or heavy machinery where a TCP stall (head-of-line blocking) could cause a catastrophic crash.
-*   📡 **Seamless Network Handovers:** Mobile edge nodes that constantly jump between different access points or cellular towers.
+*    **Autonomous Swarm Robotics (UAVs/Drones):** Perfect for high-frequency telemetry and swarm coordination where latency is critical and RF links are constantly degraded by distance or obstacles.
+*    **Industrial IoT (IIoT) Gateways:** Securely aggregating and blasting thousands of sensor readings from the factory floor to the cloud over unstable cellular links.
+*    **Real-Time Telemetry & C2:** Remote operation of rovers, submersibles, or heavy machinery where a TCP stall (head-of-line blocking) could cause a catastrophic crash.
+*    **Seamless Network Handovers:** Mobile edge nodes that constantly jump between different access points or cellular towers.
 
 ---
 
-## 🥊 How it Compares (Alternatives)
+##  How it Compares (Alternatives)
 
 *   **vs. QUIC (Google):** QUIC is fantastic but heavyweight, carrying significant HTTP/3 legacy baggage. ZT is a lightweight, stripped-down alternative designed specifically for robotics, featuring built-in Forward Error Correction (FEC) which is not standard in QUIC.
 *   **vs. WireGuard:** WireGuard is a Layer 3 VPN tunnel. ZT uses the **exact same cryptographic primitives** (X25519/ChaCha20) but operates at Layer 4, allowing you to embed it directly into your application binary without requiring root network privileges or OS-level interface configuration.
@@ -55,7 +55,7 @@ ZettaTransport shines where standard protocols fail:
 
 ---
 
-## 🚀 Getting Started
+##  Getting Started
 
 ### Installation
 Add ZettaTransport to your `Cargo.toml`:
@@ -73,7 +73,7 @@ use zetta_transport::{ZtEndpoint, Result};
 async fn main() -> Result<()> {
     // 1. Bind the ZT node to a UDP port (with optional PSK auth)
     let server = ZtEndpoint::bind("0.0.0.0:4433", None).await?;
-    println!("🛡️ Zetta Node listening on 4433...");
+    println!("Zetta Node listening on 4433...");
 
     // 2. Await cryptographically verified and reliable data
     while let Some(received) = server.recv().await {
@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
 
 ---
 
-## 📊 Final Audit & Test Results (The Gauntlet)
+##  Final Audit & Test Results (The Gauntlet)
 
 ZettaTransport v1.0 has successfully passed a battery of extreme reliability tests, maintaining a **Zero Warning / Zero Error** standard in strict `clippy` audits.
 
@@ -104,7 +104,7 @@ ZettaTransport v1.0 has successfully passed a battery of extreme reliability tes
 
 ---
 
-## 📜 Technical Specification
+##  Technical Specification
 
 For deep architectural details, bit-layouts, and state machine logic, please refer to the **[ZettaTransport RFC-001 Specification](RFC.md)**.
 
