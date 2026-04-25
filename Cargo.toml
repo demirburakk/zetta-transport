@@ -1,0 +1,25 @@
+[package]
+name = "zetta-transport"
+version = "0.1.0"
+edition = "2024"
+authors = ["Burak Demir <demirburak8338@gmail.com>"]
+description = "A high-performance, secure, and fault-tolerant UDP-based transport protocol written in Rust 2024."
+license = "MIT OR Apache-2.0"
+keywords = ["networking", "protocol", "udp", "iot", "security"]
+categories = ["network-programming", "cryptography"]
+repository = "https://github.com/demirburakk/zetta-transport"
+
+[dependencies]
+tokio = { version = "1.52", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+bytes = "1.11"
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+sha2 = "0.10"
+thiserror = "2.0"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
+rand = "0.8"
+reed-solomon-erasure = "6.0.0"
