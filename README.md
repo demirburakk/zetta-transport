@@ -55,30 +55,52 @@ ZettaTransport shines where standard protocols fail:
 
 ---
 
-##  Getting Started
+## 🚀 Getting Started
 
 ### Installation
-Add ZettaTransport to your `Cargo.toml`:
+
+Add `zetta-transport` to your `Cargo.toml`:
+
 ```toml
 [dependencies]
-zetta-transport = { git = "https://github.com/demirburakk/zetta-transport" }
-tokio = { version = "1.0", features = ["full"] }
+zetta-transport = "0.1.0"
+tokio = { version = "1", features = ["full", "macros"] }
 ```
 
-### Quick Example: Async Secure Receiver (Server)
+### Quick Start: Secure Client-Server Communication
+
+ZettaTransport provides an elegantly simple async API to establish highly reliable, zero-trust UDP tunnels. Here is a baseline example demonstrating a secure handshake and transmission between an edge device and a control server.
+
 ```rust
 use zetta_transport::{ZtEndpoint, Result};
+use bytes::Bytes;
+use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 1. Bind the ZT node to a UDP port (with optional PSK auth)
-    let server = ZtEndpoint::bind("0.0.0.0:4433", None).await?;
-    println!("Zetta Node listening on 4433...");
+    // 1. Initialize the Server Node (C2 / Gateway)
+    // Binds to a UDP port. The optional PSK (Pre-Shared Key) enforces strict hardware authentication.
+    let mut server = ZtEndpoint::bind("127.0.0.1:4433", None).await?;
+    println!("🟢 ZT Server securely listening on 4433...");
 
-    // 2. Await cryptographically verified and reliable data
-    while let Some(received) = server.recv().await {
-        println!("Received {} bytes from CID: {:?}", received.data.len(), received.cid);
-        // Process telemetry, MAVLink frame, etc.
+    // 2. Initialize the Client Node (Edge Device / Drone)
+    // Drones bind to an ephemeral port (0) and initiate the outbound connection.
+    let mut client = ZtEndpoint::bind("127.0.0.1:0", None).await?;
+    
+    // 3. Perform the X25519 Handshake
+    let peer_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+    client.connect(peer_addr).await?;
+    println!("🔗 Handshake successful. Secure tunnel established.");
+    
+    // 4. Dispatch Telemetry Data (Client -> Server)
+    // Data is chunked, encrypted via ChaCha20-Poly1305, and reliably transmitted.
+    let payload = Bytes::from("{\"telemetry\": {\"alt\": 120.5, \"batt\": 98.2}}");
+    client.send(payload, peer_addr).await?;
+
+    // 5. Receive & Authenticate (Server)
+    if let Some(received) = server.recv().await {
+        let message = String::from_utf8_lossy(&received.data);
+        println!("📡 Received securely from {}: {}", received.peer_addr, message);
     }
     
     Ok(())
@@ -87,7 +109,7 @@ async fn main() -> Result<()> {
 
 ---
 
-##  Final Audit & Test Results (The Gauntlet)
+## 🛡️ Final Audit & Test Results (The Gauntlet)
 
 ZettaTransport v1.0 has successfully passed a battery of extreme reliability tests, maintaining a **Zero Warning / Zero Error** standard in strict `clippy` audits.
 

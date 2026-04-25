@@ -8,6 +8,13 @@ license = "MIT OR Apache-2.0"
 keywords = ["networking", "protocol", "udp", "iot", "security"]
 categories = ["network-programming", "cryptography"]
 repository = "https://github.com/demirburakk/zetta-transport"
+readme = "README.md"
+exclude = [
+    "/.github/",
+    "/.vscode/",
+    "/tests/",
+    "RFC.md"
+]
 
 [dependencies]
 tokio = { version = "1.52", features = ["full"] }
