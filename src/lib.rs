@@ -35,7 +35,7 @@
 //!     
 //!     // Dispatch Telemetry Data (Client -> Server)
 //!     let payload = Bytes::from("{\"telemetry\": {\"alt\": 120.5, \"batt\": 98.2}}");
-//!     client.send(payload, peer_addr).await?;
+//!     client.send(server.local_addr().unwrap().ip().to_string().as_bytes(), &payload).await?;
 //!
 //!     // Receive Data (Server)
 //!     if let Some(received) = server.recv().await {
