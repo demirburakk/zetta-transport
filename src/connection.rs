@@ -112,9 +112,16 @@ impl ZtConnection {
     }
 
     pub fn handle_ack(&mut self, pn: u64, window_size: u32) {
-        if let Some((packet, _, _)) = self.unacked_packets.remove(&pn) {
+        if let Some((packet, sent_time, retries)) = self.unacked_packets.remove(&pn) {
             self.bytes_in_flight = self.bytes_in_flight.saturating_sub(packet.len());
             
+            // Karn's Algorithm: Measure RTT only if the packet was never retransmitted
+            if retries == 0 {
+                let sample_rtt = sent_time.elapsed();
+                // Simple EWMA for RTT
+                self.rtt = (self.rtt * 7 + sample_rtt) / 8;
+            }
+
             // Congestion Control: AIMD
             if self.cwnd < self.ssthresh {
                 // Slow Start

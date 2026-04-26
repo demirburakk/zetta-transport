@@ -51,7 +51,7 @@ Packets are either Long Headers (for unestablished connections) or Short Headers
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
-**Payload Structure for Initial/Handshake:** The Payload of `Initial` (0x00) and `Handshake` (0x01) packets MUST contain the 32-byte X25519 Public Key of the sender exactly at the beginning of the Payload boundary.
+**Payload Structure for Initial/Handshake:** The Payload of `Initial` (0x00) and `Handshake` (0x01) packets MUST contain the 32-byte X25519 Public Key of the sender exactly at the beginning of the Payload boundary. **These packets are sent in Plaintext (unencrypted) and DO NOT contain a Poly1305 Authentication Tag.**
 
 ### 3.3. Short Header (Data / Fec / Close / MtuProbe)
 ```text
@@ -65,9 +65,9 @@ Packets are either Long Headers (for unestablished connections) or Short Headers
 |                                                               |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
-*(Note 1: If Type is `0x03` (Ack), a 32-bit `Window Size` field IMMEDIATELY follows the Packet Number, before any payload.)*
+*(Note 1: If Type is `0x03` (Ack), a 32-bit `Window Size` field immediately follows the Packet Number, before any payload.)*
 *(Note 2: Short Headers omit the 32-bit Version field to save overhead; the protocol version is implicitly bound to the Destination CID established during the Handshake.)*
-*(Note 3: For `Close` (0x05) packets, the application payload is completely empty (0 bytes) but MUST still undergo AEAD encryption (using the header as AAD) to generate a valid Pol1305 authentication tag for secure connection teardown.)*
+*(Note 3: For `Ack` (0x03), `Close` (0x05), and `MtuProbe` (0x06) packets, the application payload may be completely empty (0 bytes) or just padding, but it must still undergo AEAD encryption (using the header as AAD). This generates a mandatory 16-byte Poly1305 Authentication Tag, cryptographically securing flow control and connection states against spoofing and denial-of-service attacks.)*
 
 ## 4. State Machine and Lifecycle
 Connections transition through the following states: `Handshaking -> Active -> Closed`.
@@ -77,7 +77,7 @@ Connections transition through the following states: `Handshaking -> Active -> C
 2. **Server** receives `Initial`. Extracts SCID as DCID for response. Combines `Shared_Secret` + CIDs + optional `PSK` to derive Tx/Rx keys. Sends `Handshake` packet.
 3. **Client** receives `Handshake`. Derives keys identically. Transitions to `Active`. State locks are released for high-throughput mode.
 
-**State Enforcement:** Any `Data`, `Ack`, or `Fec` packet received while a connection is in the `Handshaking` state MUST be silently dropped. Any `Initial` packet received when a connection is already `Active` is treated as a new connection attempt and processed independently.
+**State Enforcement:** Any `Data`, `Ack`, `Fec`, `MtuProbe`, or `Close` packet received while a connection is in the `Handshaking` state MUST be silently dropped. Furthermore, once in the `Active` state, all incoming packets with a Short Header MUST successfully pass AEAD decryption (Authentication Tag verification). Any packet with an invalid or missing cryptographic seal (such as a plaintext `Ack`) MUST be silently dropped to prevent flow poisoning or state desynchronization. Any `Initial` packet received when a connection is already `Active` is treated as a new connection attempt and processed independently.
 
 ### 4.2. Timers and Keep-Alives
 - **Retransmission Timeout (RTO)**: Starts dynamically at 400ms (based on a 100ms base RTT x 4), adjusted via exponential backoff upon loss. Round-Trip Time (RTT) measurements MUST ignore retransmitted packets to avoid Retransmission Ambiguity (Karn's Algorithm).
@@ -97,7 +97,7 @@ A graceful teardown occurs when either party sends a `Close (0x05)` packet. The 
   - `Rx Key` = `SHA256( Shared_Secret || Peer_DCID [|| Optional_PSK] )`
 - **Nonce Generation (12 bytes)**: The 96-bit nonce is constructed by taking 4 bytes of zero padding (`0x00 0x00 0x00 0x00`) prepended to the 8-byte **Packet Number (Big-Endian)**.
 - **AAD (Associated Data)**: The complete correctly framed packet header (everything before the payload) is bound as AAD for ciphertext integrity validation. 
-- **Authentication Tag (16 bytes)**: A 16-byte Poly1305 Authentication Tag is implicitly appended to the end of every Encrypted Payload. The decoding engine must account for this fixed overhead during payload parsing to accurately compute the length of the underlying plaintext.
+- **Authentication Tag (16 bytes)**: A 16-byte Poly1305 Authentication Tag is implicitly appended to the end of every Encrypted Payload (i.e. `Data`, `Ack`, `Fec`, `Close` packets). The decoding engine must account for this fixed overhead during payload parsing to accurately compute the length of the underlying plaintext.
 
 ### 5.2. Forward Error Correction (FEC)
 Variable-length shards are supported natively. Shards inside an FEC block are evaluated by determining the `max_len` across the block.

@@ -207,8 +207,12 @@ impl ZtEndpoint {
                                     Some((header.dcid.clone(), header.packet_number, decoded));
                             }
                         }
-                        PacketType::Ack => {
-                            conn.handle_ack(header.packet_number, header.window_size);
+                        PacketType::Ack if conn.state == ConnectionState::Active => {
+                            if let Some(ref crypto) = conn.crypto {
+                                if crypto.decrypt(header.packet_number, &payload, header_bytes).is_ok() {
+                                    conn.handle_ack(header.packet_number, header.window_size);
+                                }
+                            }
                         }
                         PacketType::Fec if conn.state == ConnectionState::Active => {
                             let expected_pns = [
@@ -284,9 +288,14 @@ impl ZtEndpoint {
                                 conn.state = ConnectionState::Closed;
                             }
                         }
-                        PacketType::MtuProbe => {
-                            conn.mark_processed(header.packet_number);
-                            // We will ack this, proving MTU size is valid.
+                        PacketType::MtuProbe if conn.state == ConnectionState::Active => {
+                            if let Some(ref crypto) = conn.crypto {
+                                if crypto.decrypt(header.packet_number, &payload, header_bytes).is_ok() {
+                                    conn.mark_processed(header.packet_number);
+                                    // Trigger an immediate Ack response
+                                    conn_to_update = Some((header.dcid.clone(), header.packet_number, vec![]));
+                                }
+                            }
                         }
                         _ => {}
                     }
@@ -316,13 +325,15 @@ impl ZtEndpoint {
         }
 
         if let Some((cid, pn, decoded)) = conn_to_update {
-            let _ = self
-                .app_tx
-                .send(ReceivedData {
-                    cid: cid.clone(),
-                    data: Bytes::from(decoded),
-                })
-                .await;
+            if !decoded.is_empty() {
+                let _ = self
+                    .app_tx
+                    .send(ReceivedData {
+                        cid: cid.clone(),
+                        data: Bytes::from(decoded),
+                    })
+                    .await;
+            }
             self.send_ack_internal(&cid, pn).await?;
         }
 
@@ -335,10 +346,10 @@ impl ZtEndpoint {
     }
 
     async fn send_ack_internal(&self, cid: &[u8], pn: u64) -> Result<()> {
-        let (addr, local_window) = {
+        let (addr, local_window, has_crypto) = {
             let conns = self.connections.lock().await;
             let c = conns.get(cid).ok_or(ZtError::Unauthorized)?;
-            (c.addr, c.local_window)
+            (c.addr, c.local_window, c.crypto.is_some())
         };
 
         let header = PacketHeader {
@@ -352,7 +363,24 @@ impl ZtEndpoint {
         };
         let mut buf = BytesMut::with_capacity(64);
         header.encode(&mut buf);
-        self.socket.send_to(&buf, addr).await?;
+        let header_bytes = buf.freeze();
+
+        let payload: &[u8] = &[];
+        let encrypted = if has_crypto {
+            let conns = self.connections.lock().await;
+            let conn = conns.get(cid).ok_or(ZtError::Unauthorized)?;
+            conn.crypto
+                .as_ref()
+                .ok_or_else(|| ZtError::Crypto("Crypto missing".into()))?
+                .encrypt(pn, payload, &header_bytes)?
+        } else {
+            payload.to_vec()
+        };
+
+        let mut full_packet = BytesMut::from(&header_bytes[..]);
+        full_packet.extend_from_slice(&encrypted);
+
+        self.socket.send_to(&full_packet.freeze(), addr).await?;
         Ok(())
     }
 
