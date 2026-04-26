@@ -12,6 +12,7 @@ pub enum PacketType {
     Fec = 0x04,
     Close = 0x05,
     MtuProbe = 0x06,
+    Retry = 0x07,
 }
 
 #[derive(Debug)]
@@ -23,6 +24,8 @@ pub struct PacketHeader {
     pub scid: Vec<u8>,
     pub packet_number: u64,
     pub window_size: u32,
+    pub stream_id: u32,
+    pub offset: u64,
 }
 
 impl PacketHeader {
@@ -45,6 +48,10 @@ impl PacketHeader {
             if self.p_type == PacketType::Ack {
                 dst.put_u32(self.window_size);
             }
+            if self.p_type == PacketType::Data {
+                dst.put_u32(self.stream_id);
+                dst.put_u64(self.offset);
+            }
         }
     }
 
@@ -64,6 +71,7 @@ impl PacketHeader {
                 0x02 => PacketType::Data,
                 0x03 => PacketType::Ack,
                 0x04 => PacketType::Fec,
+                0x07 => PacketType::Retry,
                 _ => return Err(ZtError::InvalidPacket("Invalid long packet type".into())),
             };
 
@@ -102,6 +110,8 @@ impl PacketHeader {
                 scid,
                 packet_number,
                 window_size: 0,
+                stream_id: 0,
+                offset: 0,
             })
         } else {
             let p_type = match p_type_val {
@@ -137,6 +147,18 @@ impl PacketHeader {
                 window_size = src.get_u32();
             }
 
+            let mut stream_id = 0;
+            let mut offset = 0;
+            if p_type == PacketType::Data {
+                if src.remaining() < 12 {
+                    return Err(ZtError::InvalidPacket(
+                        "Missing stream_id or offset in Data".into(),
+                    ));
+                }
+                stream_id = src.get_u32();
+                offset = src.get_u64();
+            }
+
             Ok(Self {
                 p_type,
                 is_long,
@@ -145,6 +167,8 @@ impl PacketHeader {
                 scid: vec![],
                 packet_number,
                 window_size,
+                stream_id,
+                offset,
             })
         }
     }
