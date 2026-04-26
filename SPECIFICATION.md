@@ -30,7 +30,7 @@ Packets are either Long Headers (for unestablished connections) or Short Headers
 - **Destination CID (Variable)**: The receiver's Connection ID (typically 8 bytes).
 - **SCID Len (8 bits)**: Length of Source Connection ID in bytes.
 - **Source CID (Variable)**: The sender's Connection ID (typically 8 bytes).
-- **Packet Number (64 bits)**: Monotonically increasing 64-bit integer, preventing replay.
+- **Packet Number (64 bits)**: Monotonically increasing 64-bit integer, preventing replay. For `Ack` packets (Type `0x03`), this field does NOT contain a new sequence number; instead, it echoes the exact Packet Number of the `Data` packet being acknowledged.
 - **Window Size (32 bits)**: Flow control window size, present ONLY in ACK packets.
 
 ### 3.2. Long Header (Initial / Handshake)
@@ -72,6 +72,8 @@ Connections transition through the following states: `Handshaking -> Active -> C
 2. **Server** receives `Initial`. Extracts SCID as DCID for response. Combines `Shared_Secret` + CIDs + optional `PSK` to derive Tx/Rx keys. Sends `Handshake` packet.
 3. **Client** receives `Handshake`. Derives keys identically. Transitions to `Active`. State locks are released for high-throughput mode.
 
+**State Enforcement:** Any `Data`, `Ack`, or `Fec` packet received while a connection is in the `Handshaking` state MUST be silently dropped. Any `Initial` packet received when a connection is already `Active` is treated as a new connection attempt and processed independently.
+
 ### 4.2. Timers and Keep-Alives
 - **Retransmission Timeout (RTO)**: Starts dynamically at 400ms (based on a 100ms base RTT x 4), adjusted via exponential backoff upon loss.
 - **Idle Timeout**: If no packets (including ACKs or Data) are received for 60s, unacked buffers are pruned (Tier 1). Total session state is destroyed after 3600s (Tier 2).
@@ -92,6 +94,9 @@ A graceful teardown occurs when either party sends a `Close (0x05)` packet. The 
 
 ### 5.2. Forward Error Correction (FEC)
 Variable-length shards are supported natively. Shards inside an FEC block are evaluated by determining the `max_len` across the block.
+
+**Stripe Mapping Rule:** An `Fec` packet with Packet Number $N$ always protects the immediately preceding contiguous block of `Data` packets. For example, in a 4-data-shard configuration, `Fec` packet $N$ protects packets $(N-4, N-3, N-2, N-1)$.
+
 - **XOR Engine**: Smaller shards are logically right-padded with `0x00` up to `max_len`. Parity is computed byte-by-byte: `parity[i] = shard1[i] ^ shard2[i] ^ ...`
 - **Reed-Solomon Engine**: Employs Galois $2^8$ finite fields. To reconstruct lost packets, padded ciphertext fragments are run backwards through the interpolation matrix (commonly grouped as 4 data + 1 parity shards). The result is decrypted via Poly1305.
 
