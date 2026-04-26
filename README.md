@@ -109,7 +109,7 @@ async fn main() -> Result<()> {
 
 ---
 
-## 🛡️ Final Audit & Test Results (The Gauntlet)
+## Final Audit & Test Results (The Gauntlet)
 
 ZettaTransport v1.0 has successfully passed a battery of extreme reliability tests, maintaining a **Zero Warning / Zero Error** standard in strict `clippy` audits.
 
@@ -128,7 +128,7 @@ ZettaTransport v1.0 has successfully passed a battery of extreme reliability tes
 
 ##  Technical Specification
 
-For deep architectural details, bit-layouts, and state machine logic, please refer to the **[ZettaTransport RFC-001 Specification](RFC.md)**.
+For deep architectural details, bit-layouts, and state machine logic, please refer to the **[ZettaTransport RFC-001 Specification](SPECIFICATION.md)**.
 
 ## ⚖️ License
 
