@@ -1,4 +1,4 @@
-# RFC-001: ZettaTransport Protocol Specification (ZT-v1.0)
+# RFC-001: ZettaTransport Protocol Specification (ZT-v0.1.1)
 
 **Author:** Burak Demir <demirburak8338@gmail.com>  
 **Status:** Review / Testing  
