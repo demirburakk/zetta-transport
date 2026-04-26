@@ -79,20 +79,37 @@ Connections transition through the following states: `Handshaking -> Active -> C
 ### 4.3. Finalization
 A graceful teardown occurs when either party sends a `Close (0x05)` packet. The connection transitions to `Closed`, and memory buffers for that CID are reclaimed instantly without relying on the Idle Timeout.
 
-## 5. Exact Definitions
+## 5. Definitions and Calculations
 
 ### 5.1. Cryptography and Key Exchange
-- ZT mandates **ChaCha20-Poly1305** for its AEAD cipher due to its performance without hardware acceleration.
-- **Key Derivation**: 32-byte derivations run through `SHA-256`. 
-  - `Tx Key` = `SHA256(Shared_Secret || SCID [|| PSK])`
-  - `Rx Key` = `SHA256(Shared_Secret || DCID [|| PSK])`
-- **Nonce generation**: padding `00 00 00 00` prepended to the 8-byte, Big-Endian Packet Number.
-- **AAD**: The complete correctly framed packet header (everything before the payload) acts as Associated Data. 
+- **Key Exchange**: Uses **X25519** (Elliptic Curve Diffie-Hellman) to establish a 32-byte `Shared_Secret`.
+- ZT mandates **ChaCha20-Poly1305** for its AEAD cipher due to its high performance without hardware acceleration.
+- **Key Derivation**: 32-byte session keys are derived via `SHA-256` to ensure distinct Tx and Rx keys, preventing two-time pad attacks.
+  - `Tx Key` = `SHA256( Shared_Secret || Local_SCID [|| Optional_PSK] )`
+  - `Rx Key` = `SHA256( Shared_Secret || Peer_DCID [|| Optional_PSK] )`
+- **Nonce Generation (12 bytes)**: The 96-bit nonce is constructed by taking 4 bytes of zero padding (`0x00 0x00 0x00 0x00`) prepended to the 8-byte **Packet Number (Big-Endian)**.
+- **AAD (Associated Data)**: The complete correctly framed packet header (everything before the payload) is bound as AAD for ciphertext integrity validation. 
 
 ### 5.2. Forward Error Correction (FEC)
-Variable-length standard XOR/Reed-Solomon shards are stored directly as ciphertexts. Recovery happens pre-decryption. Upon identifying a gap inside a stripe via missing PN, the engine leverages 0-padding of sub-length fragments to reconstruct the erased ciphertext block, which is then decrypted via Poly1305 using the reconstructed packet header (AAD).
+Variable-length shards are supported natively. Shards inside an FEC block are evaluated by determining the `max_len` across the block.
+- **XOR Engine**: Smaller shards are logically right-padded with `0x00` up to `max_len`. Parity is computed byte-by-byte: `parity[i] = shard1[i] ^ shard2[i] ^ ...`
+- **Reed-Solomon Engine**: Employs Galois $2^8$ finite fields. To reconstruct lost packets, padded ciphertext fragments are run backwards through the interpolation matrix (commonly grouped as 4 data + 1 parity shards). The result is decrypted via Poly1305.
 
-### 5.3. Flow and Congestion Windows
-- `local_window`: The number of bytes/packets the local endpoint can ingest. Sent in every `Ack` packet using the `Window Size` field.
-- `cwnd`: Congestion window size. Starts at 10 packets. Increased by 1 MSS (Maximum Segment Size) for each acknowledged packet. On timeout event (packet drop), `cwnd` immediately halves (AIMD multiplicative decrease).
+### 5.3. Reliability, Flow, and Congestion Control
+Congestion relies on TCP-like AIMD calculated in exact bytes (not abstracted packets). The initial `MTU` is set to `1200` bytes.
+- **Initialization**: 
+  - `ssthresh` (Slow Start Threshold) = `64 KB` (`64 * 1024` bytes).
+  - `cwnd` (Congestion Window) = `10 * MTU` (`12000` bytes).
+  - `local_window/remote_window` = `1 MB` (`1024 * 1024` bytes).
+- **On Successful Ack**:
+  - If `cwnd < ssthresh` (Slow Start): `cwnd = cwnd + MTU`
+  - If `cwnd >= ssthresh` (Congestion Avoidance): `cwnd = cwnd + ((MTU * MTU) / max(cwnd, MTU))`
+- **On Packet Loss (Timeout)**:
+  - `ssthresh = max(cwnd / 2, MTU * 2)`
+  - `cwnd = ssthresh` (Immediate multiplication decrease)
+
+### 5.4. Replay Protection (O(1) Sliding Window)
+ZT mitigates CPU-exhaustion attacks by keeping `highest_processed_pn` and a fixed `max_replay_window` of `1024`.
+- **Immediate Rejection:** Any incoming packet where `Packet Number < highest_processed_pn - 1024` is considered too old and instantly dropped.
+- **HashSet Check:** Packets within the valid window bounds are checked against a dynamic `HashSet`. Duplicates are dropped. Upon processing, the window slides forward and prunes numbers behind the new threshold.
 
