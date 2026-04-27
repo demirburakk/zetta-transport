@@ -1,7 +1,7 @@
 use crate::crypto::CryptoContext;
 use crate::error::{Result, ZtError};
 use bytes::Bytes;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,7 @@ pub struct ZtConnection {
 
     // FEC Shards (Encrypted payloads)
     pub sent_shards: Vec<Bytes>,
+    pub last_fec_shard_added: Option<Instant>,
     pub received_shards: BTreeMap<u64, Bytes>,
 
     // Reliability & Flow Control
@@ -38,9 +39,12 @@ pub struct ZtConnection {
     pub ssthresh: usize,
     pub bytes_in_flight: usize,
     pub mtu: usize,
+    pub probe_mtu: usize,
+    pub last_probe_time: Option<Instant>,
+    pub highest_acked_pn: u64,
 
     // Replay Attack Protection
-    pub processed_packets: HashSet<u64>,
+    pub replay_window: Box<[u64]>,
     pub max_replay_window: u64,
     pub highest_processed_pn: u64,
 }
@@ -56,6 +60,7 @@ impl ZtConnection {
             last_activity: Instant::now(),
             crypto: None,
             sent_shards: Vec::with_capacity(5),
+            last_fec_shard_added: None,
             received_shards: BTreeMap::new(),
             unacked_packets: HashMap::new(),
             rtt: Duration::from_millis(100),
@@ -67,8 +72,11 @@ impl ZtConnection {
             ssthresh: 64 * 1024,
             bytes_in_flight: 0,
             mtu: 1200,
+            probe_mtu: 1400,
+            last_probe_time: None,
+            highest_acked_pn: 0,
 
-            processed_packets: HashSet::with_capacity(1024),
+            replay_window: vec![u64::MAX; 1024].into_boxed_slice(),
             max_replay_window: 1024,
             highest_processed_pn: 0,
         }
@@ -80,19 +88,15 @@ impl ZtConnection {
         {
             return true;
         }
-        self.processed_packets.contains(&pn)
+        let idx = (pn % self.max_replay_window) as usize;
+        self.replay_window[idx] == pn
     }
 
     pub fn mark_processed(&mut self, pn: u64) {
-        self.processed_packets.insert(pn);
+        let idx = (pn % self.max_replay_window) as usize;
+        self.replay_window[idx] = pn;
         if pn > self.highest_processed_pn {
             self.highest_processed_pn = pn;
-        }
-        if self.processed_packets.len() > self.max_replay_window as usize * 2 {
-            let threshold = self
-                .highest_processed_pn
-                .saturating_sub(self.max_replay_window);
-            self.processed_packets.retain(|&p| p >= threshold);
         }
     }
 
@@ -112,9 +116,17 @@ impl ZtConnection {
     }
 
     pub fn handle_ack(&mut self, pn: u64, window_size: u32) {
+        if pn > self.highest_acked_pn {
+            self.highest_acked_pn = pn;
+        }
+
         if let Some((packet, sent_time, retries)) = self.unacked_packets.remove(&pn) {
+            if packet.len() > self.mtu {
+                self.mtu = packet.len();
+                self.probe_mtu = self.mtu + 50;
+            }
             self.bytes_in_flight = self.bytes_in_flight.saturating_sub(packet.len());
-            
+
             // Karn's Algorithm: Measure RTT only if the packet was never retransmitted
             if retries == 0 {
                 let sample_rtt = sent_time.elapsed();
@@ -150,7 +162,7 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let mut conn = ZtConnection::new(addr, vec![], vec![]);
         conn.max_replay_window = 10;
-        
+
         conn.mark_processed(5);
         assert!(conn.is_replay(5));
         assert!(!conn.is_replay(6));
@@ -160,15 +172,15 @@ mod tests {
         assert!(conn.is_replay(5));
         assert!(conn.is_replay(9));
         assert!(!conn.is_replay(15));
-        
+
         conn.mark_processed(15);
         assert!(conn.is_replay(15));
-        
+
         // Trigger cleanup
         for i in 21..45 {
             conn.mark_processed(i);
         }
-        
+
         // Window is 34..44
         assert!(conn.is_replay(20)); // Cleaned up, < 34
         assert!(conn.is_replay(40)); // In window, processed

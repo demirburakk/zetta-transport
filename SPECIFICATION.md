@@ -5,7 +5,7 @@
 **Date:** April 2026
 
 ## 1. Introduction
-ZettaTransport (ZT) is a secure, reliable, and high-performance transport layer protocol built over UDP. It rigorously defines packet structures, state machine transitions, and cryptographic operations to allow independent, interoperable implementations.
+ZettaTransport (ZT) is a transport layer protocol built over UDP. It defines packet structures, state machine transitions, and cryptographic operations to allow independent, interoperable implementations.
 
 ## 2. Packet Types
 ZT defines the following packet types (represented as a 4-bit integer):
@@ -127,4 +127,3 @@ Congestion relies on TCP-like AIMD calculated in exact bytes (not abstracted pac
 ZT mitigates CPU-exhaustion attacks by keeping `highest_processed_pn` and a fixed `max_replay_window` of `1024`.
 - **Immediate Rejection:** Any incoming packet where `Packet Number < highest_processed_pn - 1024` (using saturating subtraction to prevent unsigned integer underflow for the first 1024 packets) is considered too old and instantly dropped.
 - **HashSet Check:** Packets within the valid window bounds are checked against a dynamic `HashSet`. Duplicates are dropped. Upon processing, the window slides forward and prunes numbers behind the new threshold.
-

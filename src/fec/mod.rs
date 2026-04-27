@@ -20,7 +20,7 @@ impl FecEngine {
         }
 
         let max_len = shards.iter().map(|s| s.len()).max().unwrap_or(0);
-        
+
         let mut rs_shards: Vec<Vec<u8>> = shards
             .iter()
             .map(|s| {
@@ -38,7 +38,7 @@ impl FecEngine {
         // 4 Data, 1 Parity
         let rs = ReedSolomon::new(4, 1).expect("Failed to init ReedSolomon");
         rs_shards.push(vec![0u8; max_len]); // Parity placeholder
-        
+
         rs.encode(&mut rs_shards).expect("Failed to encode RS");
 
         Bytes::from(rs_shards.pop().unwrap())
@@ -46,15 +46,34 @@ impl FecEngine {
 
     /// Recovers a missing packet using XOR parity (position-independent).
     pub fn recover(available_shards: &[Bytes], parity: &Bytes) -> Bytes {
-        let mut all_shards = available_shards.to_vec();
-        all_shards.push(parity.clone());
-        Self::build_parity_xor(&all_shards)
+        if parity.len() < 2 {
+            return Bytes::new();
+        }
+
+        let mut recovered = bytes::BytesMut::zeroed(parity.len());
+        recovered.copy_from_slice(parity);
+
+        for shard in available_shards {
+            let len_bytes = (shard.len() as u16).to_be_bytes();
+            recovered[0] ^= len_bytes[0];
+            recovered[1] ^= len_bytes[1];
+            for (i, &byte) in shard.iter().enumerate() {
+                recovered[i + 2] ^= byte;
+            }
+        }
+
+        let recovered_len = u16::from_be_bytes([recovered[0], recovered[1]]) as usize;
+        let mut result = recovered.split_off(2);
+        result.truncate(recovered_len);
+        result.freeze()
     }
 
     /// Recovers missing shards using Reed-Solomon.
     /// Expects exactly 5 slots (4 data + 1 parity). Missing slots should be None.
     #[allow(dead_code)]
-    pub fn recover_rs(mut rs_shards: Vec<Option<Vec<u8>>>) -> Result<(), reed_solomon_erasure::Error> {
+    pub fn recover_rs(
+        mut rs_shards: Vec<Option<Vec<u8>>>,
+    ) -> Result<(), reed_solomon_erasure::Error> {
         let rs = ReedSolomon::new(4, 1)?;
         rs.reconstruct(&mut rs_shards)
     }
@@ -65,11 +84,16 @@ impl FecEngine {
         }
 
         let max_len = shards.iter().map(|s| s.len()).max().unwrap_or(0);
-        let mut parity = BytesMut::zeroed(max_len);
+        // We prepend 2 bytes for length
+        let padded_max = max_len + 2;
+        let mut parity = BytesMut::zeroed(padded_max);
 
         for shard in shards {
+            let len_bytes = (shard.len() as u16).to_be_bytes();
+            parity[0] ^= len_bytes[0];
+            parity[1] ^= len_bytes[1];
             for (i, &byte) in shard.iter().enumerate() {
-                parity[i] ^= byte;
+                parity[i + 2] ^= byte;
             }
         }
 
@@ -101,13 +125,13 @@ mod tests {
         let shard1 = Bytes::from(&b"short"[..]);
         let shard2 = Bytes::from(&b"longer payload"[..]);
         let shards = vec![shard1.clone(), shard2.clone()];
-        
+
         let parity = FecEngine::build_parity_xor(&shards);
-        assert_eq!(parity.len(), 14);
+        assert_eq!(parity.len(), 16);
 
         let available = vec![shard1.clone()];
         let recovered = FecEngine::recover(&available, &parity);
-        
+
         assert_eq!(&recovered[..shard2.len()], &shard2[..]);
     }
 }

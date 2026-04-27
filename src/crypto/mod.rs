@@ -18,7 +18,12 @@ impl CryptoContext {
     /// Creates a new encryption context from a derived shared secret (32 bytes).
     /// Uses SCID and DCID to derive unique Tx and Rx keys to prevent two-time pad attacks.
     /// If a Pre-Shared Key (PSK) is provided, it is mixed into the KDF to authenticate the endpoints.
-    pub fn from_shared_secret(shared_secret: [u8; 32], my_scid: &[u8], peer_dcid: &[u8], psk: Option<[u8; 32]>) -> Self {
+    pub fn from_shared_secret(
+        shared_secret: [u8; 32],
+        my_scid: &[u8],
+        peer_dcid: &[u8],
+        psk: Option<[u8; 32]>,
+    ) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(shared_secret);
         hasher.update(my_scid);
@@ -123,14 +128,14 @@ mod tests {
         let aad = b"PacketHeader123";
 
         let ciphertext = alice_ctx.encrypt(1, plaintext, aad).unwrap();
-        
+
         // Bob should be able to decrypt
         let decrypted = bob_ctx.decrypt(1, &ciphertext, aad).unwrap();
         assert_eq!(plaintext, &decrypted[..]);
 
         // Decryption with wrong AAD should fail
         assert!(bob_ctx.decrypt(1, &ciphertext, b"WrongHeader").is_err());
-        
+
         // Decryption with wrong packet number should fail
         assert!(bob_ctx.decrypt(2, &ciphertext, aad).is_err());
 

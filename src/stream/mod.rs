@@ -1,4 +1,4 @@
-use crate::endpoint::ZtEndpoint;
+use crate::transport::endpoint::ZtEndpoint;
 use crate::error::Result;
 use std::sync::Arc;
 
@@ -22,7 +22,9 @@ impl ZtStream {
         loop {
             match self.endpoint.send(&self.cid, data).await {
                 Ok(_) => return Ok(()),
-                Err(crate::error::ZtError::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(crate::error::ZtError::Io(ref e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
                     // Backoff and wait for window to open
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
