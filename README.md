@@ -1,40 +1,105 @@
-# 🛰️ ZettaTransport (ZT)
-**An Experimental, High-Performance UDP Transport Protocol in Rust**
+# ZettaTransport (ZT)
+**An Experimental, Multiplexed UDP-Based Transport Protocol in Rust**
 
 [![License: MIT/Apache-2.0](https://img.shields.io/badge/License-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 [![Rust: 2024](https://img.shields.io/badge/Rust-2024-orange.svg)](https://www.rust-lang.org/)
+[![Crates.io](https://img.shields.io/crates/v/zetta-transport.svg)](https://crates.io/crates/zetta-transport)
+[![Documentation](https://docs.rs/zetta-transport/badge.svg)](https://docs.rs/zetta-transport)
 
-> **⚠️ Note:** ZettaTransport is a **hobby and learning project**. It is an experimental playground for exploring network protocol design, congestion control, and cryptographic transport. It is **not** intended for production use, but rather as a deep dive into how modern protocols like QUIC and WireGuard function under the hood.
+> **Note:** ZettaTransport is primarily a **hobby and learning project**. It is an experimental playground for exploring network protocol design, congestion control, multiplexing, and cryptographic transport. It is **not** intended for mission-critical or production use, but rather as a deep dive into how modern protocols like QUIC function under the hood.
 
-## 🚀 The Vision
-ZettaTransport (ZT) is a research-oriented transport protocol built on top of UDP. The goal of this project is to implement and experiment with advanced networking concepts in a "clean-slate" environment using Rust. It focuses on low-latency communication, resilience in unstable environments (like drone/IoT telemetry), and modern concurrency patterns.
+ZettaTransport (ZT) is a research-oriented transport protocol built entirely in Rust. It operates over UDP and aims to provide reliable, in-order delivery of multiplexed streams with built-in cryptography (AEAD ChaCha20-Poly1305 and X25519 Diffie-Hellman).
 
-## 🛠️ Implemented Concepts & Learning Goals
-Through this project, the following network engineering challenges are being addressed:
+## Core Features Explored
 
-*   **Custom Handshake & Security:** Implementing a X25519 Diffie-Hellman key exchange and AEAD (ChaCha20-Poly1305) encryption from scratch.
-*   **Stateless Handshake (DoS Mitigation):** Exploring the use of "Stateless Cookies" to prevent CPU exhaustion during connection establishment.
-*   **Forward Error Correction (FEC):** Implementing XOR-based and Reed-Solomon erasure coding to recover lost packets without retransmission overhead.
-*   **Congestion Control:** Experimenting with AIMD (Additive Increase/Multiplicative Decrease) and exploring more advanced algorithms like Fast Retransmit.
-*   **Path MTU Discovery (PMTUD):** Dynamically probing the network to find the maximum possible packet size without fragmentation.
-*   **Lock-Free Concurrency:** Leveraging `DashMap` and the Actor pattern to handle thousands of concurrent connections without global mutex contention.
+*   **Multiplexed Streams:** Transfer multiple independent data streams over a single UDP connection. This is implemented to study solutions to the Head-of-Line blocking problem found in TCP.
+*   **In-Place Cryptography:** Payload encryption and decryption are performed directly in place to minimize memory allocations and understand zero-copy data paths.
+*   **Congestion Control & Loss Recovery:** Experimenting with AIMD (Additive Increase/Multiplicative Decrease) along with 3-Duplicate ACK detection to recover lost packets without relying solely on timeouts.
+*   **Cryptographic Key Rotation:** Implementing epoch-based key rotation for ChaCha20 to study how protocols prevent key exhaustion on long-lived connections.
+*   **DoS Mitigation Concepts:** Enforcing a 1200-byte padding requirement for initial handshake packets to explore anti-amplification techniques against IP spoofing.
+*   **Path MTU Discovery (PMTUD):** Probing the network with inflated packets to dynamically adjust the MTU size based on the current network path.
 
-## 🏗️ Project Architecture
-The project is modularized for better maintainability and study:
-*   `transport/`: Core endpoint logic and background workers.
-*   `protocol/`: Packet definitions and binary encoding/decoding.
-*   `crypto/`: Handshake and encrypted transport wrappers.
-*   `fec/`: Error correction engines.
-*   `stream/`: (In Progress) High-level API for ordered data streams.
+## Installation
 
-## 🧪 Running the Experiments
-Since this is a research project, you can explore the examples to see the protocol in action:
-```bash
-# Run a basic client-server handshake simulation
-cargo run --example basic
+Add ZettaTransport to your `Cargo.toml`:
+
+```toml
+[dependencies]
+zetta-transport = "0.1.2"
+tokio = { version = "1.52", features = ["full"] }
 ```
 
-## ⚖️ License
+## Usage Guide
+
+ZettaTransport exposes an asynchronous API built on top of Tokio.
+
+### Server Side
+
+```rust
+use zetta_transport::transport::endpoint::ZtEndpoint;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Bind the endpoint to a local port. (None means no Pre-Shared Key is used).
+    let server = ZtEndpoint::bind("127.0.0.1:8080", None).await?;
+    println!("Server listening on 127.0.0.1:8080");
+
+    // 2. Accept incoming connections in a loop.
+    while let Some(mut stream) = server.accept().await {
+        println!("New connection established!");
+        
+        tokio::spawn(async move {
+            // 3. Receive data reliably and in-order.
+            while let Some(data) = stream.recv().await {
+                println!("Received: {:?}", String::from_utf8_lossy(&data));
+                
+                // 4. Send a response back.
+                let _ = stream.send(b"Message received!").await;
+            }
+        });
+    }
+    
+    Ok(())
+}
+```
+
+### Client Side
+
+```rust
+use zetta_transport::transport::endpoint::ZtEndpoint;
+use std::net::SocketAddr;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Bind the client to an available local UDP port.
+    let client = ZtEndpoint::bind("127.0.0.1:0", None).await?;
+    
+    // 2. Connect to the target server. This performs the X25519 handshake.
+    let target: SocketAddr = "127.0.0.1:8080".parse()?;
+    let mut stream = client.connect(target).await?;
+    println!("Connected to the server!");
+
+    // 3. Send data over the stream.
+    stream.send(b"Hello from ZettaTransport Client!").await?;
+    
+    // 4. Await a response from the server.
+    if let Some(reply) = stream.recv().await {
+        println!("Server replied: {:?}", String::from_utf8_lossy(&reply));
+    }
+
+    Ok(())
+}
+```
+
+## Project Architecture Overview
+
+*   `transport/endpoint.rs`: The main UDP socket manager. Routes packets and handles the X25519 cryptography during handshakes.
+*   `transport/actor.rs`: An asynchronous state machine that runs independently for every connected peer. It manages congestion control, PMTUD, Keep-Alives, and Retransmits.
+*   `stream/mod.rs`: The `ZtStream` object returned to the user. It isolates multiplexed data flows and provides the `.send()` and `.recv()` API.
+*   `crypto/mod.rs`: Wrapper for `chacha20poly1305` and `x25519-dalek` providing in-place encryption utilities.
+
+## License
+
 Licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE).
 
 ---

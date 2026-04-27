@@ -25,6 +25,7 @@ pub struct PacketHeader {
     pub window_size: u32,
     pub stream_id: u32,
     pub offset: u64,
+    pub acked_pn: u64,
 }
 
 impl PacketHeader {
@@ -46,7 +47,9 @@ impl PacketHeader {
             dst.put_u64(self.packet_number);
             if self.p_type == PacketType::Ack {
                 dst.put_u32(self.window_size);
-                dst.put_u64(self.offset); // ÇÖZÜM: ACK offset taşıyor
+                dst.put_u32(self.stream_id);
+                dst.put_u64(self.offset);
+                dst.put_u64(self.acked_pn);
             }
             if self.p_type == PacketType::Data {
                 dst.put_u32(self.stream_id);
@@ -110,6 +113,7 @@ impl PacketHeader {
                 window_size: 0,
                 stream_id: 0,
                 offset: 0,
+                acked_pn: 0,
             })
         } else {
             let p_type = match p_type_val {
@@ -136,17 +140,20 @@ impl PacketHeader {
             let packet_number = src.get_u64();
 
             let mut window_size = 0;
+            let mut stream_id = 0;
             let mut offset = 0;
+            let mut acked_pn = 0;
             
             if p_type == PacketType::Ack {
-                if src.remaining() < 12 {
-                    return Err(ZtError::InvalidPacket("Missing window size or offset in ACK".into()));
+                if src.remaining() < 24 {
+                    return Err(ZtError::InvalidPacket("Missing fields in ACK".into()));
                 }
                 window_size = src.get_u32();
+                stream_id = src.get_u32();
                 offset = src.get_u64();
+                acked_pn = src.get_u64();
             }
 
-            let mut stream_id = 0;
             if p_type == PacketType::Data {
                 if src.remaining() < 12 {
                     return Err(ZtError::InvalidPacket(
@@ -167,6 +174,7 @@ impl PacketHeader {
                 window_size,
                 stream_id,
                 offset,
+                acked_pn,
             })
         }
     }

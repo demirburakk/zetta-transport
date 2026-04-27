@@ -4,15 +4,41 @@ use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConnectionState {
     Handshaking,
     Active,
-    Closing, // YENİ: TIME_WAIT / Teardown durumu
+    Closing,
     Closed,
+}
+
+pub struct StreamState {
+    pub expected_rx_offset: u64,
+    pub next_tx_offset: u64,
+    pub reorder_buffer: BTreeMap<u64, Bytes>,
+    pub buffered_bytes: usize,
+    pub window_opened: Arc<Notify>,
+    pub last_acked_offset: u64,
+    pub dup_ack_count: u8,
+    pub app_tx: mpsc::Sender<Bytes>,
+}
+
+impl StreamState {
+    pub fn new(app_tx: mpsc::Sender<Bytes>, window_opened: Arc<Notify>) -> Self {
+        Self {
+            expected_rx_offset: 0,
+            next_tx_offset: 0,
+            reorder_buffer: BTreeMap::new(),
+            buffered_bytes: 0,
+            window_opened,
+            last_acked_offset: 0,
+            dup_ack_count: 0,
+            app_tx,
+        }
+    }
 }
 
 pub struct ZtConnection {
@@ -24,17 +50,10 @@ pub struct ZtConnection {
     pub last_activity: Instant,
     pub crypto: Option<CryptoContext>,
 
-    pub expected_rx_offset: u64,
-    pub next_tx_offset: u64,
-    pub reorder_buffer: BTreeMap<u64, Bytes>,
-    pub buffered_bytes: usize,
-
-    pub window_opened: Arc<Notify>, // YENİ: Backpressure Waker (Stream'i uyandırmak için)
-
-    // ÇÖZÜM: TCP Tarzı Fast Retransmit
-    pub unacked_packets: HashMap<u64, (Bytes, Instant, u32, u64, u64)>, // (packet, sent_time, retries, start_offset, end_offset)
-    pub last_acked_offset: u64,
-    pub dup_ack_count: u8,
+    pub streams: HashMap<u32, StreamState>,
+    pub mtu_probes: HashMap<u64, usize>,
+    
+    pub unacked_packets: HashMap<u64, (Bytes, Instant, u32, u32, u64, u64)>, 
     
     pub rtt: Duration,
     pub local_window: u32,
@@ -48,10 +67,12 @@ pub struct ZtConnection {
 
     pub replay_window: Box<[u64]>,
     pub max_replay_window: u64,
+
+    pub current_key_epoch: u64,
 }
 
 impl ZtConnection {
-    pub fn new(addr: SocketAddr, scid: Vec<u8>, dcid: Vec<u8>, window_opened: Arc<Notify>) -> Self {
+    pub fn new(addr: SocketAddr, scid: Vec<u8>, dcid: Vec<u8>) -> Self {
         Self {
             addr,
             dcid,
@@ -61,16 +82,9 @@ impl ZtConnection {
             last_activity: Instant::now(),
             crypto: None,
             
-            expected_rx_offset: 0,
-            next_tx_offset: 0,
-            reorder_buffer: BTreeMap::new(),
-            buffered_bytes: 0,
-            
-            window_opened,
-
+            streams: HashMap::new(),
+            mtu_probes: HashMap::new(),
             unacked_packets: HashMap::new(),
-            last_acked_offset: 0,
-            dup_ack_count: 0,
             
             rtt: Duration::from_millis(100),
 
@@ -85,6 +99,8 @@ impl ZtConnection {
 
             replay_window: vec![u64::MAX; 1024].into_boxed_slice(),
             max_replay_window: 1024,
+
+            current_key_epoch: 0,
         }
     }
 
@@ -119,27 +135,35 @@ impl ZtConnection {
         self.last_activity = Instant::now();
     }
 
-    pub fn handle_ack(&mut self, acked_offset: u64, window_size: u32) {
+    pub fn handle_ack(&mut self, acked_pn: u64, acked_stream_id: u32, acked_offset: u64, window_size: u32) {
         let mut bytes_acked = 0;
         let mut sample_rtt = None;
 
-        // ÇÖZÜM: Fast Retransmit (3 Dup ACK) Hesaplaması
-        if acked_offset == self.last_acked_offset {
-            self.dup_ack_count += 1;
-        } else if acked_offset > self.last_acked_offset {
-            self.last_acked_offset = acked_offset;
-            self.dup_ack_count = 0;
+        if let Some(probe_size) = self.mtu_probes.remove(&acked_pn) {
+            if probe_size > self.mtu {
+                self.mtu = probe_size;
+                tracing::info!("MTU upgraded to {} via PMTUD", self.mtu);
+            }
         }
 
-        self.unacked_packets.retain(|_pn, (packet, sent_time, retries, _start_offset, end_offset)| {
-            if *end_offset <= acked_offset {
+        if let Some(stream) = self.streams.get_mut(&acked_stream_id) {
+            if acked_offset == stream.last_acked_offset {
+                stream.dup_ack_count += 1;
+            } else if acked_offset > stream.last_acked_offset {
+                stream.last_acked_offset = acked_offset;
+                stream.dup_ack_count = 0;
+            }
+        }
+
+        self.unacked_packets.retain(|_pn, (packet, sent_time, retries, stream_id, _start_offset, end_offset)| {
+            if *stream_id == acked_stream_id && *end_offset <= acked_offset {
                 bytes_acked += packet.len();
                 if *retries == 0 && sample_rtt.is_none() {
                     sample_rtt = Some(sent_time.elapsed());
                 }
-                false // Sil
+                false 
             } else {
-                true // Tut
+                true 
             }
         });
 
@@ -156,8 +180,9 @@ impl ZtConnection {
                 self.cwnd += (self.mtu * self.mtu) / self.cwnd.max(self.mtu);
             }
             
-            // ÇÖZÜM: Backpressure'da bekleyen ZtStream send()'i uyandır.
-            self.window_opened.notify_waiters();
+            if let Some(stream) = self.streams.get(&acked_stream_id) {
+                stream.window_opened.notify_waiters();
+            }
         }
         
         self.remote_window = window_size;
@@ -166,5 +191,9 @@ impl ZtConnection {
     pub fn handle_loss(&mut self) {
         self.ssthresh = (self.cwnd / 2).max(self.mtu * 2);
         self.cwnd = self.ssthresh;
+    }
+
+    pub fn get_total_buffered_bytes(&self) -> usize {
+        self.streams.values().map(|s| s.buffered_bytes).sum()
     }
 }
