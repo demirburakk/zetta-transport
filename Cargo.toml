@@ -29,6 +29,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
 rand = "0.8"
-reed-solomon-erasure = "6.0.0"
 dashmap = "6.1.0"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }

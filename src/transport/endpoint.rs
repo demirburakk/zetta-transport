@@ -1,343 +1,256 @@
-use crate::transport::state::{ConnectionState, ZtConnection};
 use crate::crypto::CryptoContext;
 use crate::error::{Result, ZtError};
-use crate::fec::FecEngine;
 use crate::protocol::packet::{PacketHeader, PacketType};
+use crate::transport::actor::{ActorMessage, ZtConnectionActor};
+use crate::transport::state::{ConnectionState, ZtConnection};
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use rand::Rng;
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, mpsc};
-use tokio_util::sync::CancellationToken;
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use x25519_dalek::{PublicKey, StaticSecret};
-
-use super::worker;
-use super::handler;
-
-const RECV_BUFFER_SIZE: usize = 2048;
-
-#[derive(Debug)]
-pub struct ReceivedData {
-    pub cid: Vec<u8>,
-    pub data: Bytes,
-}
 
 pub struct ZtEndpoint {
     pub(crate) socket: Arc<UdpSocket>,
-    pub(crate) connections: Arc<DashMap<Vec<u8>, ZtConnection>>,
-    pub(crate) chaos_mode: Arc<AtomicBool>,
+    pub(crate) routing_table: Arc<DashMap<Vec<u8>, mpsc::Sender<ActorMessage>>>,
     pub(crate) static_secret: StaticSecret,
     pub public_key: PublicKey,
     pub psk: Option<[u8; 32]>,
-    app_rx: Mutex<mpsc::Receiver<ReceivedData>>,
-    pub(crate) app_tx: mpsc::Sender<ReceivedData>,
-    pub(crate) shutdown_token: CancellationToken,
+    pub cookie_key: [u8; 32], 
+    
+    incoming_rx: Mutex<mpsc::Receiver<crate::stream::ZtStream>>,
+    pub(crate) incoming_tx: mpsc::Sender<crate::stream::ZtStream>,
 }
 
 impl ZtEndpoint {
     pub async fn bind(addr: &str, psk: Option<[u8; 32]>) -> Result<Arc<Self>> {
         let (secret, public) = CryptoContext::generate_keypair();
-        let socket = UdpSocket::bind(addr).await?;
-        let (tx, rx) = mpsc::channel(RECV_BUFFER_SIZE);
-        let shutdown_token = CancellationToken::new();
+        let socket = Arc::new(UdpSocket::bind(addr).await?);
+        let (tx, rx) = mpsc::channel(1024);
+        let cookie_key = rand::thread_rng().r#gen::<[u8; 32]>();
 
         let endpoint = Arc::new(Self {
-            socket: Arc::new(socket),
-            connections: Arc::new(DashMap::new()),
-            chaos_mode: Arc::new(AtomicBool::new(false)),
+            socket,
+            routing_table: Arc::new(DashMap::new()),
             static_secret: secret,
             public_key: public,
             psk,
-            app_rx: Mutex::new(rx),
-            app_tx: tx,
-            shutdown_token: shutdown_token.clone(),
+            cookie_key,
+            incoming_rx: Mutex::new(rx),
+            incoming_tx: tx,
         });
 
-        worker::spawn_workers(endpoint.clone());
-
+        Self::start_router(endpoint.clone());
         Ok(endpoint)
     }
 
-    pub async fn get_connection_state(&self, cid: &[u8]) -> Option<(SocketAddr, Vec<u8>, Vec<u8>)> {
-        let conns = &self.connections;
-        conns
-            .get(cid)
-            .map(|c| (c.addr, c.scid.clone(), c.dcid.clone()))
+    fn start_router(endpoint: Arc<Self>) {
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1450];
+            loop {
+                if let Ok((len, addr)) = endpoint.socket.recv_from(&mut buf).await {
+                    let data = Bytes::copy_from_slice(&buf[..len]);
+
+                    if let Some(dcid) = Self::extract_dcid_fast(&data) {
+                        if let Some(tx) = endpoint.routing_table.get(&dcid) {
+                            if let Err(_e) = tx.try_send(ActorMessage::IncomingPacket { data, addr }) {
+                                tracing::trace!("Dropped packet for {:?}: queue full", dcid);
+                            }
+                        } else {
+                            let ep_clone = endpoint.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = ep_clone.clone().handle_handshake(data, addr).await {
+                                    tracing::debug!("Handshake failed: {:?}", e);
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        });
     }
 
-    pub async fn resume_connection(&self, addr: SocketAddr, scid: Vec<u8>, dcid: Vec<u8>) {
-        let conns = &self.connections;
-        let mut conn = ZtConnection::new(addr, scid.clone(), dcid);
-        conn.state = ConnectionState::Active;
-        conns.insert(scid, conn);
-    }
+    async fn handle_handshake(self: Arc<Self>, mut data: Bytes, addr: SocketAddr) -> Result<()> {
+        let header = PacketHeader::decode(&mut data)?;
 
-    pub(crate) async fn handle_packet(&self, data: &[u8], addr: SocketAddr) -> Result<()> {
-        handler::process_packet(self, data, addr).await
-    }
+        if !header.is_long || header.p_type != PacketType::Initial {
+            return Ok(());
+        }
 
-    pub(crate) async fn send_ack_internal(&self, cid: &[u8], pn: u64) -> Result<()> {
-        let (addr, local_window, has_crypto) = {
-            let conns = &self.connections;
-            let c = conns.get(cid).ok_or(ZtError::Unauthorized)?;
-            (c.addr, c.local_window, c.crypto.is_some())
-        };
+        let payload = data;
+        if payload.len() < 32 { return Ok(()); }
 
-        let header = PacketHeader {
-            p_type: PacketType::Ack,
-            is_long: false,
-            version: 0,
-            dcid: cid.to_vec(),
-            scid: vec![],
-            packet_number: pn,
-            window_size: local_window,
-            stream_id: 0,
-            offset: 0,
-        };
-        let mut buf = BytesMut::with_capacity(64);
-        header.encode(&mut buf);
-        let header_bytes = buf.freeze();
+        let mut pk_bytes = [0u8; 32];
+        pk_bytes.copy_from_slice(&payload[..32]);
 
-        let payload: &[u8] = &[];
-        let encrypted = if has_crypto {
-            let conns = &self.connections;
-            let conn = conns.get(cid).ok_or(ZtError::Unauthorized)?;
-            conn.crypto
-                .as_ref()
-                .ok_or_else(|| ZtError::Crypto("Crypto missing".into()))?
-                .encrypt(pn, payload, &header_bytes)?
+        let mut hasher = Sha256::new();
+        hasher.update(&self.cookie_key); 
+        hasher.update(addr.to_string().as_bytes());
+        hasher.update(&header.scid);
+        let expected_cookie = hasher.finalize();
+
+        if payload.len() >= 64 && payload[32..64] == expected_cookie[..] {
+            let shared = CryptoContext::compute_shared_secret(
+                self.static_secret.clone(),
+                PublicKey::from(pk_bytes),
+            );
+
+            let scid: Vec<u8> = (0..8).map(|_| rand::thread_rng().r#gen::<u8>()).collect();
+            let window_opened = Arc::new(Notify::new());
+            let mut new_conn = ZtConnection::new(addr, scid.clone(), header.scid.clone(), window_opened.clone());
+
+            let handshake_pn = new_conn.get_next_packet_number()?;
+            new_conn.mark_processed(header.packet_number);
+            new_conn.state = ConnectionState::Active;
+
+            new_conn.crypto = Some(CryptoContext::from_shared_secret(
+                shared, &new_conn.scid, &new_conn.dcid, self.psk,
+            ));
+
+            let (data_tx, data_rx) = mpsc::channel(2048);
+            let (actor_tx, actor_rx) = mpsc::channel(1024);
+
+            let actor = ZtConnectionActor {
+                socket: self.socket.clone(),
+                receiver: actor_rx,
+                state: new_conn,
+                app_tx: data_tx, 
+                pending_acks: 0,
+                public_key: self.public_key,
+                static_secret: self.static_secret.clone(),
+                psk: self.psk,
+                handshake_waiter: None,
+                routing_table: self.routing_table.clone(), 
+                scid: scid.clone(),
+            };
+
+            self.routing_table.insert(scid.clone(), actor_tx);
+            tokio::spawn(actor.run());
+
+            let stream = crate::stream::ZtStream::new(self.clone(), scid.clone(), data_rx, window_opened);
+
+            if let Err(_) = self.incoming_tx.try_send(stream) {
+                tracing::warn!("Server accept queue is full. Dropping incoming connection from {:?}", addr);
+                self.routing_table.remove(&scid);
+                return Ok(());
+            }
+
+            let hs_header = PacketHeader {
+                p_type: PacketType::Handshake,
+                is_long: true,
+                version: 1,
+                dcid: header.scid.clone(),
+                scid,
+                packet_number: handshake_pn,
+                window_size: 1024 * 1024,
+                stream_id: 0,
+                offset: 0,
+            };
+            let mut buf = BytesMut::with_capacity(128);
+            hs_header.encode(&mut buf);
+            buf.extend_from_slice(self.public_key.as_bytes());
+            let _ = self.socket.try_send_to(&buf, addr);
+
         } else {
-            payload.to_vec()
-        };
-
-        let mut full_packet = BytesMut::from(&header_bytes[..]);
-        full_packet.extend_from_slice(&encrypted);
-
-        self.socket.send_to(&full_packet.freeze(), addr).await?;
+            let retry_header = PacketHeader {
+                p_type: PacketType::Retry,
+                is_long: true,
+                version: 1,
+                dcid: header.scid.clone(),
+                scid: vec![],
+                packet_number: header.packet_number,
+                window_size: 0,
+                stream_id: 0,
+                offset: 0,
+            };
+            let mut buf = BytesMut::with_capacity(128);
+            retry_header.encode(&mut buf);
+            buf.extend_from_slice(&expected_cookie);
+            let _ = self.socket.try_send_to(&buf, addr);
+        }
         Ok(())
     }
 
-    pub(crate) async fn send_handshake_internal(&self, cid: &[u8]) -> Result<()> {
-        let (addr, scid, dcid, pn, local_window) = {
-            let conns = &self.connections;
-            let mut c = conns.get_mut(cid).ok_or(ZtError::Unauthorized)?;
-            (
-                c.addr,
-                c.scid.clone(),
-                c.dcid.clone(),
-                c.get_next_packet_number()?,
-                c.local_window,
-            )
-        };
+    fn extract_dcid_fast(data: &[u8]) -> Option<Vec<u8>> {
+        if data.is_empty() { return None; }
+        let is_long = (data[0] & 0x80) != 0;
 
-        let header = PacketHeader {
-            p_type: PacketType::Handshake,
-            is_long: true,
-            version: 1,
-            dcid,
-            scid,
-            packet_number: pn,
-            window_size: local_window,
-            stream_id: 0,
-            offset: 0,
-        };
-        let mut buf = BytesMut::with_capacity(128);
-        header.encode(&mut buf);
-        buf.extend_from_slice(self.public_key.as_bytes());
-        self.socket.send_to(&buf, addr).await?;
-        Ok(())
-    }
-
-    pub async fn connect(&self, remote_addr: SocketAddr) -> Result<Vec<u8>> {
-        let scid: Vec<u8> = (0..8).map(|_| rand::thread_rng().r#gen::<u8>()).collect();
-        let mut conn = ZtConnection::new(remote_addr, scid.clone(), vec![0; 8]);
-        let pn = conn.get_next_packet_number()?;
-
-        let header = PacketHeader {
-            p_type: PacketType::Initial,
-            is_long: true,
-            version: 1,
-            dcid: vec![0; 8],
-            scid: scid.clone(),
-            packet_number: pn,
-            window_size: conn.local_window,
-            stream_id: 0,
-            offset: 0,
-        };
-
-        let mut buf = BytesMut::with_capacity(128);
-        header.encode(&mut buf);
-        buf.extend_from_slice(self.public_key.as_bytes());
-
-        self.socket.send_to(&buf, remote_addr).await?;
-
-        let conns = &self.connections;
-        conns.insert(scid.clone(), conn);
-        Ok(scid)
+        if is_long {
+            if data.len() < 6 { return None; }
+            let dcid_len = data[5] as usize;
+            if data.len() < 6 + dcid_len { return None; }
+            Some(data[6..6 + dcid_len].to_vec())
+        } else {
+            if data.len() < 2 { return None; }
+            let dcid_len = data[1] as usize;
+            if data.len() < 2 + dcid_len { return None; }
+            Some(data[2..2 + dcid_len].to_vec())
+        }
     }
 
     pub async fn send(&self, cid: &[u8], data: &[u8]) -> Result<()> {
-        let (addr, pn, header_bytes, has_crypto) = {
-            let conns = &self.connections;
-            let mut conn = conns.get_mut(cid).ok_or(ZtError::Unauthorized)?;
-
-            if conn.remote_window < data.len() as u32 {
-                return Err(ZtError::Io(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "Flow control (Window Exhausted)",
-                )));
-            }
-
-            if conn.bytes_in_flight + data.len() > conn.cwnd {
-                return Err(ZtError::Io(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "Congestion control (CWND Exhausted)",
-                )));
-            }
-
-            let pn = conn.get_next_packet_number()?;
-            let header = PacketHeader {
-                p_type: PacketType::Data,
-                is_long: false,
-                version: 0,
-                dcid: conn.dcid.clone(),
-                scid: vec![],
-                packet_number: pn,
-                window_size: conn.local_window,
-                stream_id: 0,
-                offset: 0,
-            };
-            let mut buf = BytesMut::with_capacity(64);
-            header.encode(&mut buf);
-            (conn.addr, pn, buf.freeze(), conn.crypto.is_some())
-        };
-
-        let encrypted = if has_crypto {
-            let conns = &self.connections;
-            let conn = conns.get(cid).ok_or(ZtError::Unauthorized)?;
-            conn.crypto
-                .as_ref()
-                .ok_or_else(|| ZtError::Crypto("Crypto missing".into()))?
-                .encrypt(pn, data, &header_bytes)?
-        } else {
-            data.to_vec()
-        };
-
-        let mut full_packet = BytesMut::from(&header_bytes[..]);
-        full_packet.extend_from_slice(&encrypted);
-        let frozen_packet = full_packet.freeze();
-
-        self.socket.send_to(&frozen_packet, addr).await?;
-
-        let mut fec_packet_to_send = None;
-        let conns = &self.connections;
-        if let Some(mut conn) = conns.get_mut(cid) {
-            conn.unacked_packets
-                .insert(pn, (frozen_packet, Instant::now(), 0));
-            conn.bytes_in_flight += data.len();
-            conn.remote_window -= data.len() as u32;
-
-            if has_crypto {
-                conn.sent_shards.push(Bytes::from(encrypted));
-                conn.last_fec_shard_added = Some(Instant::now());
-                if conn.sent_shards.len() == 4 {
-                    let parity = FecEngine::build_parity(&conn.sent_shards);
-                    conn.sent_shards.clear();
-                    conn.last_fec_shard_added = None;
-
-                    let fec_pn = conn.get_next_packet_number()?;
-                    let fec_header = PacketHeader {
-                        p_type: PacketType::Fec,
-                        is_long: false,
-                        version: 0,
-                        dcid: conn.dcid.clone(),
-                        scid: vec![],
-                        packet_number: fec_pn,
-                        window_size: conn.local_window,
-                        stream_id: 0,
-                        offset: 0,
-                    };
-                    let mut buf = bytes::BytesMut::with_capacity(64);
-                    fec_header.encode(&mut buf);
-                    let mut full_fec = buf;
-                    full_fec.extend_from_slice(&parity);
-                    fec_packet_to_send = Some((conn.addr, full_fec.freeze()));
-                }
-            }
+        if let Some(tx) = self.routing_table.get(cid) {
+            let (resp_tx, resp_rx) = oneshot::channel();
+            tx.send(ActorMessage::OutgoingData {
+                data: Bytes::copy_from_slice(data),
+                respond_to: resp_tx
+            }).await.map_err(|_| ZtError::Unknown)?;
+            return resp_rx.await.unwrap_or(Err(ZtError::Unknown));
         }
-
-        if let Some((addr, packet)) = fec_packet_to_send {
-            self.socket.send_to(&packet, addr).await?;
-        }
-
-        Ok(())
+        Err(ZtError::Unknown)
     }
 
     pub async fn close(&self, cid: &[u8]) -> Result<()> {
-        let (addr, pn, header_bytes, has_crypto) = {
-            let conns = &self.connections;
-            let mut conn = conns.get_mut(cid).ok_or(ZtError::Unauthorized)?;
-            let pn = conn.get_next_packet_number()?;
-            let header = PacketHeader {
-                p_type: PacketType::Close,
-                is_long: false,
-                version: 0,
-                dcid: conn.dcid.clone(),
-                scid: vec![],
-                packet_number: pn,
-                window_size: conn.local_window,
-                stream_id: 0,
-                offset: 0,
-            };
-            let mut buf = BytesMut::with_capacity(64);
-            header.encode(&mut buf);
-            conn.state = ConnectionState::Closed;
-            (conn.addr, pn, buf.freeze(), conn.crypto.is_some())
-        };
-
-        let payload: &[u8] = &[];
-        let encrypted = if has_crypto {
-            let conns = &self.connections;
-            let conn = conns.get(cid).ok_or(ZtError::Unauthorized)?;
-            conn.crypto
-                .as_ref()
-                .ok_or_else(|| ZtError::Crypto("Crypto missing".into()))?
-                .encrypt(pn, payload, &header_bytes)?
-        } else {
-            payload.to_vec()
-        };
-
-        let mut full_packet = BytesMut::from(&header_bytes[..]);
-        full_packet.extend_from_slice(&encrypted);
-        self.socket.send_to(&full_packet.freeze(), addr).await?;
-
-        // ZOMBIE PROTECTION: Don't remove immediately. Mark as Closed and let Pruner clean it up later.
-        // let conns = &self.connections;
-        // conns.remove(cid);
-
+        if let Some((_, tx)) = self.routing_table.remove(cid) {
+            let _ = tx.send(ActorMessage::Close).await;
+        }
         Ok(())
     }
 
-    pub async fn recv(&self) -> Option<ReceivedData> {
-        let mut rx = self.app_rx.lock().await;
+    pub async fn accept(&self) -> Option<crate::stream::ZtStream> {
+        let mut rx = self.incoming_rx.lock().await;
         rx.recv().await
     }
 
-    pub fn set_chaos_mode(&self, enabled: bool) {
-        self.chaos_mode.store(enabled, Ordering::Relaxed);
-    }
+    pub async fn connect(self: &Arc<Self>, addr: SocketAddr) -> Result<crate::stream::ZtStream> {
+        let scid: Vec<u8> = (0..8).map(|_| rand::thread_rng().r#gen::<u8>()).collect();
+        let dcid = vec![0u8; 8]; 
+        
+        let window_opened = Arc::new(Notify::new());
+        let mut conn = ZtConnection::new(addr, scid.clone(), dcid, window_opened.clone());
+        conn.state = ConnectionState::Handshaking;
 
-    pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.socket.local_addr().map_err(ZtError::Io)
-    }
-}
+        let (data_tx, data_rx) = mpsc::channel(2048);
+        let (actor_tx, actor_rx) = mpsc::channel(1024);
+        
+        let (wait_tx, wait_rx) = oneshot::channel();
 
-impl Drop for ZtEndpoint {
-    fn drop(&mut self) {
-        self.shutdown_token.cancel();
+        let actor = ZtConnectionActor {
+            socket: self.socket.clone(),
+            receiver: actor_rx,
+            state: conn,
+            app_tx: data_tx,
+            pending_acks: 0,
+            public_key: self.public_key,
+            static_secret: self.static_secret.clone(),
+            psk: self.psk,
+            handshake_waiter: Some(wait_tx),
+            routing_table: self.routing_table.clone(),
+            scid: scid.clone(),
+        };
+
+        self.routing_table.insert(scid.clone(), actor_tx);
+        tokio::spawn(actor.run());
+
+        match tokio::time::timeout(std::time::Duration::from_secs(5), wait_rx).await {
+            Ok(Ok(_)) => Ok(crate::stream::ZtStream::new(self.clone(), scid, data_rx, window_opened)),
+            _ => {
+                self.routing_table.remove(&scid);
+                Err(ZtError::Timeout)
+            }
+        }
     }
 }

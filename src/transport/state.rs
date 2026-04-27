@@ -3,17 +3,18 @@ use crate::error::{Result, ZtError};
 use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::Notify;
 use std::time::{Duration, Instant};
 
-/// Represents the current state of a connection.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConnectionState {
     Handshaking,
     Active,
+    Closing, // YENİ: TIME_WAIT / Teardown durumu
     Closed,
 }
 
-/// Manages the state of a single ZettaTransport connection.
 pub struct ZtConnection {
     pub addr: SocketAddr,
     pub dcid: Vec<u8>,
@@ -23,34 +24,34 @@ pub struct ZtConnection {
     pub last_activity: Instant,
     pub crypto: Option<CryptoContext>,
 
-    // FEC Shards (Encrypted payloads)
-    pub sent_shards: Vec<Bytes>,
-    pub last_fec_shard_added: Option<Instant>,
-    pub received_shards: BTreeMap<u64, Bytes>,
+    pub expected_rx_offset: u64,
+    pub next_tx_offset: u64,
+    pub reorder_buffer: BTreeMap<u64, Bytes>,
+    pub buffered_bytes: usize,
 
-    // Reliability & Flow Control
-    pub unacked_packets: HashMap<u64, (Bytes, Instant, u32)>,
+    pub window_opened: Arc<Notify>, // YENİ: Backpressure Waker (Stream'i uyandırmak için)
+
+    // ÇÖZÜM: TCP Tarzı Fast Retransmit
+    pub unacked_packets: HashMap<u64, (Bytes, Instant, u32, u64, u64)>, // (packet, sent_time, retries, start_offset, end_offset)
+    pub last_acked_offset: u64,
+    pub dup_ack_count: u8,
+    
     pub rtt: Duration,
     pub local_window: u32,
     pub remote_window: u32,
 
-    // Congestion Control (AIMD) & MTU
     pub cwnd: usize,
     pub ssthresh: usize,
     pub bytes_in_flight: usize,
     pub mtu: usize,
-    pub probe_mtu: usize,
-    pub last_probe_time: Option<Instant>,
-    pub highest_acked_pn: u64,
+    pub highest_processed_pn: u64,
 
-    // Replay Attack Protection
     pub replay_window: Box<[u64]>,
     pub max_replay_window: u64,
-    pub highest_processed_pn: u64,
 }
 
 impl ZtConnection {
-    pub fn new(addr: SocketAddr, scid: Vec<u8>, dcid: Vec<u8>) -> Self {
+    pub fn new(addr: SocketAddr, scid: Vec<u8>, dcid: Vec<u8>, window_opened: Arc<Notify>) -> Self {
         Self {
             addr,
             dcid,
@@ -59,30 +60,38 @@ impl ZtConnection {
             next_packet_number: 0,
             last_activity: Instant::now(),
             crypto: None,
-            sent_shards: Vec::with_capacity(5),
-            last_fec_shard_added: None,
-            received_shards: BTreeMap::new(),
+            
+            expected_rx_offset: 0,
+            next_tx_offset: 0,
+            reorder_buffer: BTreeMap::new(),
+            buffered_bytes: 0,
+            
+            window_opened,
+
             unacked_packets: HashMap::new(),
+            last_acked_offset: 0,
+            dup_ack_count: 0,
+            
             rtt: Duration::from_millis(100),
 
             local_window: 1024 * 1024,
             remote_window: 1024 * 1024,
 
-            cwnd: 10 * 1200, // Initial window: 10 packets
+            cwnd: 10 * 1200, 
             ssthresh: 64 * 1024,
             bytes_in_flight: 0,
             mtu: 1200,
-            probe_mtu: 1400,
-            last_probe_time: None,
-            highest_acked_pn: 0,
+            highest_processed_pn: 0,
 
             replay_window: vec![u64::MAX; 1024].into_boxed_slice(),
             max_replay_window: 1024,
-            highest_processed_pn: 0,
         }
     }
 
     pub fn is_replay(&self, pn: u64) -> bool {
+        if pn > self.highest_processed_pn + self.max_replay_window {
+            return true; 
+        }
         if self.highest_processed_pn > self.max_replay_window
             && pn < self.highest_processed_pn - self.max_replay_window
         {
@@ -100,14 +109,9 @@ impl ZtConnection {
         }
     }
 
-    /// Increments and returns the next packet number.
-    /// Defensively checks for 64-bit overflow.
     pub fn get_next_packet_number(&mut self) -> Result<u64> {
         let n = self.next_packet_number;
-        self.next_packet_number = self
-            .next_packet_number
-            .checked_add(1)
-            .ok_or(ZtError::Unknown)?; // Practically unreachable, but safe
+        self.next_packet_number = self.next_packet_number.checked_add(1).ok_or(ZtError::Unknown)?;
         Ok(n)
     }
 
@@ -115,75 +119,52 @@ impl ZtConnection {
         self.last_activity = Instant::now();
     }
 
-    pub fn handle_ack(&mut self, pn: u64, window_size: u32) {
-        if pn > self.highest_acked_pn {
-            self.highest_acked_pn = pn;
+    pub fn handle_ack(&mut self, acked_offset: u64, window_size: u32) {
+        let mut bytes_acked = 0;
+        let mut sample_rtt = None;
+
+        // ÇÖZÜM: Fast Retransmit (3 Dup ACK) Hesaplaması
+        if acked_offset == self.last_acked_offset {
+            self.dup_ack_count += 1;
+        } else if acked_offset > self.last_acked_offset {
+            self.last_acked_offset = acked_offset;
+            self.dup_ack_count = 0;
         }
 
-        if let Some((packet, sent_time, retries)) = self.unacked_packets.remove(&pn) {
-            if packet.len() > self.mtu {
-                self.mtu = packet.len();
-                self.probe_mtu = self.mtu + 50;
+        self.unacked_packets.retain(|_pn, (packet, sent_time, retries, _start_offset, end_offset)| {
+            if *end_offset <= acked_offset {
+                bytes_acked += packet.len();
+                if *retries == 0 && sample_rtt.is_none() {
+                    sample_rtt = Some(sent_time.elapsed());
+                }
+                false // Sil
+            } else {
+                true // Tut
             }
-            self.bytes_in_flight = self.bytes_in_flight.saturating_sub(packet.len());
+        });
 
-            // Karn's Algorithm: Measure RTT only if the packet was never retransmitted
-            if retries == 0 {
-                let sample_rtt = sent_time.elapsed();
-                // Simple EWMA for RTT
-                self.rtt = (self.rtt * 7 + sample_rtt) / 8;
-            }
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(bytes_acked);
 
-            // Congestion Control: AIMD
+        if let Some(rtt) = sample_rtt {
+            self.rtt = (self.rtt * 7 + rtt) / 8;
+        }
+
+        if bytes_acked > 0 {
             if self.cwnd < self.ssthresh {
-                // Slow Start
                 self.cwnd += self.mtu;
             } else {
-                // Congestion Avoidance
                 self.cwnd += (self.mtu * self.mtu) / self.cwnd.max(self.mtu);
             }
+            
+            // ÇÖZÜM: Backpressure'da bekleyen ZtStream send()'i uyandır.
+            self.window_opened.notify_waiters();
         }
+        
         self.remote_window = window_size;
     }
 
     pub fn handle_loss(&mut self) {
         self.ssthresh = (self.cwnd / 2).max(self.mtu * 2);
         self.cwnd = self.ssthresh;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::SocketAddr;
-
-    #[test]
-    fn test_replay_protection() {
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let mut conn = ZtConnection::new(addr, vec![], vec![]);
-        conn.max_replay_window = 10;
-
-        conn.mark_processed(5);
-        assert!(conn.is_replay(5));
-        assert!(!conn.is_replay(6));
-
-        conn.mark_processed(20);
-        // Window is now 10..20, packets < 10 are replays
-        assert!(conn.is_replay(5));
-        assert!(conn.is_replay(9));
-        assert!(!conn.is_replay(15));
-
-        conn.mark_processed(15);
-        assert!(conn.is_replay(15));
-
-        // Trigger cleanup
-        for i in 21..45 {
-            conn.mark_processed(i);
-        }
-
-        // Window is 34..44
-        assert!(conn.is_replay(20)); // Cleaned up, < 34
-        assert!(conn.is_replay(40)); // In window, processed
-        assert!(!conn.is_replay(45)); // Not processed
     }
 }

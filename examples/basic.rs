@@ -1,35 +1,39 @@
 use zetta_transport::transport::endpoint::ZtEndpoint;
 use std::net::SocketAddr;
-use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Start the Server
+    // 1. SUNUCU TARAFI
     let server_addr = "127.0.0.1:8080";
     let server = ZtEndpoint::bind(server_addr, None).await?;
-    println!("📡 Server listening on {}", server_addr);
+    println!("Sunucu başlatıldı: {}", server_addr);
 
-    // 2. Start the Client
+    // Sunucu gelen bağlantıları kabul eden bir döngüde çalışır
+    tokio::spawn(async move {
+        while let Some(mut stream) = server.accept().await {
+            println!("Yeni bir istemci bağlandı!");
+            tokio::spawn(async move {
+                while let Some(data) = stream.recv().await {
+                    println!("Sunucu aldı: {:?}", String::from_utf8_lossy(&data));
+                    let _ = stream.send(b"Mesajiniz alindi!").await;
+                }
+            });
+        }
+    });
+
+    // 2. İSTEMCİ TARAFI
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let client = ZtEndpoint::bind("127.0.0.1:0", None).await?;
-    let server_socket_addr: SocketAddr = server_addr.parse()?;
-
-    // 3. Client connects to Server
-    println!("🔗 Client connecting to server...");
-    let scid = client.connect(server_socket_addr).await?;
+    let target: SocketAddr = server_addr.parse()?;
     
-    // Wait for handshake to complete in the background
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut stream = client.connect(target).await?;
+    println!("Sunucuya baglaniliyor...");
 
-    // 4. Client sends a message
-    let message = b"Hello, ZettaTransport! This is a learning experiment.";
-    client.send(&scid, message).await?;
-    println!("📤 Client sent: {:?}", String::from_utf8_lossy(message));
-
-    // 5. Server receives the message
-    if let Some(received) = server.recv().await {
-        println!("📥 Server received from {:?}: {:?}", received.cid, String::from_utf8_lossy(&received.data));
+    stream.send(b"Merhaba ZettaTransport!").await?;
+    
+    if let Some(reply) = stream.recv().await {
+        println!("İstemci yanit aldi: {:?}", String::from_utf8_lossy(&reply));
     }
 
-    println!("✅ Experiment successful!");
     Ok(())
 }

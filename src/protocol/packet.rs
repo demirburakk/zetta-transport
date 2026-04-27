@@ -9,7 +9,6 @@ pub enum PacketType {
     Handshake = 0x01,
     Data = 0x02,
     Ack = 0x03,
-    Fec = 0x04,
     Close = 0x05,
     MtuProbe = 0x06,
     Retry = 0x07,
@@ -47,6 +46,7 @@ impl PacketHeader {
             dst.put_u64(self.packet_number);
             if self.p_type == PacketType::Ack {
                 dst.put_u32(self.window_size);
+                dst.put_u64(self.offset); // ÇÖZÜM: ACK offset taşıyor
             }
             if self.p_type == PacketType::Data {
                 dst.put_u32(self.stream_id);
@@ -70,12 +70,10 @@ impl PacketHeader {
                 0x01 => PacketType::Handshake,
                 0x02 => PacketType::Data,
                 0x03 => PacketType::Ack,
-                0x04 => PacketType::Fec,
                 0x07 => PacketType::Retry,
                 _ => return Err(ZtError::InvalidPacket("Invalid long packet type".into())),
             };
 
-            // BOUNDS CHECK: version(4) + dcid_len(1) + scid_len(1) + pn(8) = 14 bytes minimum
             if src.remaining() < 14 {
                 return Err(ZtError::InvalidPacket(
                     "Packet too short for long header".into(),
@@ -117,13 +115,11 @@ impl PacketHeader {
             let p_type = match p_type_val {
                 0x02 => PacketType::Data,
                 0x03 => PacketType::Ack,
-                0x04 => PacketType::Fec,
                 0x05 => PacketType::Close,
                 0x06 => PacketType::MtuProbe,
                 _ => return Err(ZtError::InvalidPacket("Invalid short packet type".into())),
             };
 
-            // BOUNDS CHECK: dcid_len(1) + pn(8) = 9 bytes minimum
             if src.remaining() < 9 {
                 return Err(ZtError::InvalidPacket(
                     "Packet too short for short header".into(),
@@ -140,15 +136,17 @@ impl PacketHeader {
             let packet_number = src.get_u64();
 
             let mut window_size = 0;
+            let mut offset = 0;
+            
             if p_type == PacketType::Ack {
-                if src.remaining() < 4 {
-                    return Err(ZtError::InvalidPacket("Missing window size in ACK".into()));
+                if src.remaining() < 12 {
+                    return Err(ZtError::InvalidPacket("Missing window size or offset in ACK".into()));
                 }
                 window_size = src.get_u32();
+                offset = src.get_u64();
             }
 
             let mut stream_id = 0;
-            let mut offset = 0;
             if p_type == PacketType::Data {
                 if src.remaining() < 12 {
                     return Err(ZtError::InvalidPacket(
