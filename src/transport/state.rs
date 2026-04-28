@@ -24,6 +24,7 @@ pub struct StreamState {
     pub last_acked_offset: u64,
     pub dup_ack_count: u8,
     pub app_tx: mpsc::Sender<Bytes>,
+    pub unacked_pns: BTreeMap<u64, u64>,
 }
 
 impl StreamState {
@@ -37,6 +38,7 @@ impl StreamState {
             last_acked_offset: 0,
             dup_ack_count: 0,
             app_tx,
+            unacked_pns: BTreeMap::new(),
         }
     }
 }
@@ -56,6 +58,7 @@ pub struct ZtConnection {
     pub unacked_packets: HashMap<u64, (Bytes, Instant, u32, u32, u64, u64)>, 
     
     pub rtt: Duration,
+    pub rttvar: Duration,
     pub local_window: u32,
     pub remote_window: u32,
 
@@ -72,6 +75,8 @@ pub struct ZtConnection {
 }
 
 impl ZtConnection {
+    pub const MAX_CONCURRENT_STREAMS: usize = 100;
+
     pub fn new(addr: SocketAddr, scid: Vec<u8>, dcid: Vec<u8>) -> Self {
         Self {
             addr,
@@ -87,6 +92,7 @@ impl ZtConnection {
             unacked_packets: HashMap::new(),
             
             rtt: Duration::from_millis(100),
+            rttvar: Duration::from_millis(0),
 
             local_window: 1024 * 1024,
             remote_window: 1024 * 1024,
@@ -97,8 +103,8 @@ impl ZtConnection {
             mtu: 1200,
             highest_processed_pn: 0,
 
-            replay_window: vec![u64::MAX; 1024].into_boxed_slice(),
-            max_replay_window: 1024,
+            replay_window: vec![u64::MAX; 8192].into_boxed_slice(),
+            max_replay_window: 8192,
 
             current_key_epoch: 0,
         }
@@ -106,7 +112,7 @@ impl ZtConnection {
 
     pub fn is_replay(&self, pn: u64) -> bool {
         if pn > self.highest_processed_pn + self.max_replay_window {
-            return true; 
+            return true;
         }
         if self.highest_processed_pn > self.max_replay_window
             && pn < self.highest_processed_pn - self.max_replay_window
@@ -153,24 +159,39 @@ impl ZtConnection {
                 stream.last_acked_offset = acked_offset;
                 stream.dup_ack_count = 0;
             }
-        }
 
-        self.unacked_packets.retain(|_pn, (packet, sent_time, retries, stream_id, _start_offset, end_offset)| {
-            if *stream_id == acked_stream_id && *end_offset <= acked_offset {
-                bytes_acked += packet.len();
-                if *retries == 0 && sample_rtt.is_none() {
-                    sample_rtt = Some(sent_time.elapsed());
+            let mut acked_offsets = Vec::new();
+            for (&start_offset, &_pn) in stream.unacked_pns.iter() {
+                if start_offset < acked_offset {
+                    acked_offsets.push(start_offset);
+                } else {
+                    break;
                 }
-                false 
-            } else {
-                true 
             }
-        });
+
+            for offset in acked_offsets {
+                if let Some(pn) = stream.unacked_pns.remove(&offset) {
+                    if let Some((packet, sent_time, retries, _, _, _)) = self.unacked_packets.remove(&pn) {
+                        bytes_acked += packet.len();
+                        if retries == 0 && sample_rtt.is_none() {
+                            sample_rtt = Some(sent_time.elapsed());
+                        }
+                    }
+                }
+            }
+        }
 
         self.bytes_in_flight = self.bytes_in_flight.saturating_sub(bytes_acked);
 
         if let Some(rtt) = sample_rtt {
-            self.rtt = (self.rtt * 7 + rtt) / 8;
+            if self.rtt == Duration::from_millis(100) && self.rttvar == Duration::from_millis(0) {
+                self.rtt = rtt;
+                self.rttvar = rtt / 2;
+            } else {
+                let error = if self.rtt > rtt { self.rtt - rtt } else { rtt - self.rtt };
+                self.rttvar = (self.rttvar * 3 + error) / 4;
+                self.rtt = (self.rtt * 7 + rtt) / 8;
+            }
         }
 
         if bytes_acked > 0 {
@@ -190,7 +211,7 @@ impl ZtConnection {
 
     pub fn handle_loss(&mut self) {
         self.ssthresh = (self.cwnd / 2).max(self.mtu * 2);
-        self.cwnd = self.ssthresh;
+        self.cwnd = self.ssthresh + 3 * self.mtu;
     }
 
     pub fn get_total_buffered_bytes(&self) -> usize {

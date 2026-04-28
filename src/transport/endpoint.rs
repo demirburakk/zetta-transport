@@ -77,6 +77,18 @@ impl ZtEndpoint {
         if data.len() < 1200 {
             return Ok(()); // Anti-amplification drop
         }
+        
+        let mut mutable_packet = data.to_vec();
+        // Remove Header Protection from the incoming Initial packet
+        if let Some(offset) = PacketHeader::get_pn_offset(&mutable_packet) {
+            let dcid_opt = Self::extract_dcid_fast(&mutable_packet);
+            if let Some(dcid) = dcid_opt {
+                let crypto = CryptoContext::initial(&dcid);
+                crypto.remove_header_protection(&mut mutable_packet, offset)?;
+            }
+        }
+        data = Bytes::from(mutable_packet);
+        
         let header = PacketHeader::decode(&mut data)?;
 
         if !header.is_long || header.p_type != PacketType::Initial {
@@ -89,19 +101,42 @@ impl ZtEndpoint {
         let mut pk_bytes = [0u8; 32];
         pk_bytes.copy_from_slice(&payload[..32]);
 
-        let mut hasher = Sha256::new();
-        hasher.update(&self.cookie_key); 
-        hasher.update(addr.to_string().as_bytes());
-        hasher.update(&header.scid);
-        let expected_cookie = hasher.finalize();
+        let current_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
 
-        if payload.len() >= 64 && payload[32..64] == expected_cookie[..] {
+        let mut is_cookie_valid = false;
+        if payload.len() >= 72 {
+            let mut timestamp_bytes = [0u8; 8];
+            timestamp_bytes.copy_from_slice(&payload[32..40]);
+            let timestamp = u64::from_be_bytes(timestamp_bytes);
+            
+            if current_time >= timestamp && current_time - timestamp <= 5 {
+                let mut hasher = Sha256::new();
+                hasher.update(&self.cookie_key);
+                match addr.ip() {
+                    std::net::IpAddr::V4(v4) => hasher.update(&v4.octets()),
+                    std::net::IpAddr::V6(v6) => hasher.update(&v6.octets()),
+                }
+                hasher.update(&addr.port().to_be_bytes());
+                hasher.update(&header.scid);
+                hasher.update(&timestamp_bytes);
+                let expected_hash = hasher.finalize();
+
+                if payload[40..72] == expected_hash[..] {
+                    is_cookie_valid = true;
+                }
+            }
+        }
+
+        if is_cookie_valid {
             let shared = CryptoContext::compute_shared_secret(
                 self.static_secret.clone(),
                 PublicKey::from(pk_bytes),
             );
 
-            let scid: Vec<u8> = (0..8).map(|_| rand::thread_rng().r#gen::<u8>()).collect();
+            let mut scid: Vec<u8> = (0..8).map(|_| rand::thread_rng().r#gen::<u8>()).collect();
+            while self.routing_table.contains_key(&scid) {
+                scid = (0..8).map(|_| rand::thread_rng().r#gen::<u8>()).collect();
+            }
             let mut new_conn = ZtConnection::new(addr, scid.clone(), header.scid.clone());
             
             let (data_tx, data_rx) = mpsc::channel(2048);
@@ -158,9 +193,31 @@ impl ZtEndpoint {
             let mut buf = BytesMut::with_capacity(128);
             hs_header.encode(&mut buf);
             buf.extend_from_slice(self.public_key.as_bytes());
-            let _ = self.socket.try_send_to(&buf, addr);
-
+            let mut buf_vec = buf.to_vec();
+            if let Some(offset) = PacketHeader::get_pn_offset(&buf_vec) {
+                let crypto = CryptoContext::initial(&header.dcid);
+                crypto.apply_header_protection(&mut buf_vec, offset)?;
+            }
+            if let Err(e) = self.socket.try_send_to(&buf_vec, addr) {
+                tracing::debug!("Failed to send: {}", e);
+            }
         } else {
+            let mut hasher = Sha256::new();
+            hasher.update(&self.cookie_key);
+            match addr.ip() {
+                std::net::IpAddr::V4(v4) => hasher.update(&v4.octets()),
+                std::net::IpAddr::V6(v6) => hasher.update(&v6.octets()),
+            }
+            hasher.update(&addr.port().to_be_bytes());
+            hasher.update(&header.scid);
+            let time_bytes = current_time.to_be_bytes();
+            hasher.update(&time_bytes);
+            let cookie_hash = hasher.finalize();
+
+            let mut new_cookie = vec![0u8; 40];
+            new_cookie[0..8].copy_from_slice(&time_bytes);
+            new_cookie[8..40].copy_from_slice(&cookie_hash);
+
             let retry_header = PacketHeader {
                 p_type: PacketType::Retry,
                 is_long: true,
@@ -175,8 +232,15 @@ impl ZtEndpoint {
             };
             let mut buf = BytesMut::with_capacity(128);
             retry_header.encode(&mut buf);
-            buf.extend_from_slice(&expected_cookie);
-            let _ = self.socket.try_send_to(&buf, addr);
+            buf.extend_from_slice(&new_cookie);
+            let mut buf_vec = buf.to_vec();
+            if let Some(offset) = PacketHeader::get_pn_offset(&buf_vec) {
+                let crypto = CryptoContext::initial(&header.dcid);
+                crypto.apply_header_protection(&mut buf_vec, offset)?;
+            }
+            if let Err(e) = self.socket.try_send_to(&buf_vec, addr) {
+                tracing::debug!("Failed to send: {}", e);
+            }
         }
         Ok(())
     }
@@ -198,6 +262,17 @@ impl ZtEndpoint {
         }
     }
 
+    /// Fetches the dynamic MTU of a specific connection.
+    pub async fn get_mtu(&self, cid: &[u8]) -> usize {
+        if let Some(tx) = self.routing_table.get(cid) {
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+            if tx.send(ActorMessage::GetMtu { respond_to: resp_tx }).await.is_ok() {
+                return resp_rx.await.unwrap_or(1200);
+            }
+        }
+        1200
+    }
+
     /// Internal method used by ZtStream to send data to the remote endpoint.
     pub async fn send(&self, cid: &[u8], stream_id: u32, data: &[u8]) -> Result<()> {
         if let Some(tx) = self.routing_table.get(cid) {
@@ -210,6 +285,14 @@ impl ZtEndpoint {
             return resp_rx.await.unwrap_or(Err(ZtError::Unknown));
         }
         Err(ZtError::Unknown)
+    }
+
+    /// Gracefully closes a stream within a connection.
+    pub async fn close_stream(&self, cid: &[u8], stream_id: u32) -> Result<()> {
+        if let Some(tx) = self.routing_table.get(cid) {
+            let _ = tx.send(ActorMessage::CloseStream { stream_id }).await;
+        }
+        Ok(())
     }
 
     /// Gracefully closes a connection associated with the given Connection ID (CID).

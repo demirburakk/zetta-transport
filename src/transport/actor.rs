@@ -14,6 +14,8 @@ use x25519_dalek::{PublicKey, StaticSecret};
 pub enum ActorMessage {
     IncomingPacket { data: Bytes, addr: SocketAddr },
     OutgoingData { stream_id: u32, data: Bytes, respond_to: oneshot::Sender<Result<()>> },
+    GetMtu { respond_to: oneshot::Sender<usize> },
+    CloseStream { stream_id: u32 },
     Close,
 }
 
@@ -85,6 +87,17 @@ impl ZtConnectionActor {
                             keep_alive_deadline = Instant::now() + Duration::from_secs(20);
                             keep_alive_timer.as_mut().reset(keep_alive_deadline);
                         }
+                        ActorMessage::GetMtu { respond_to } => {
+                            let _ = respond_to.send(self.state.mtu);
+                        }
+                        ActorMessage::CloseStream { stream_id } => {
+                            self.state.streams.remove(&stream_id);
+                            if self.state.streams.is_empty() {
+                                let _ = self.initiate_close();
+                                idle_deadline = Instant::now() + Duration::from_secs(5);
+                                idle_timer.as_mut().reset(idle_deadline);
+                            }
+                        }
                         ActorMessage::Close => {
                             let _ = self.initiate_close();
                             idle_deadline = Instant::now() + Duration::from_secs(5);
@@ -102,8 +115,12 @@ impl ZtConnectionActor {
                 }
 
                 _ = &mut rto_timer => {
-                    self.handle_retransmits();
-                    rto_deadline = Instant::now() + self.state.rtt.saturating_mul(4).max(Duration::from_millis(50));
+                    if self.handle_retransmits().is_err() {
+                        tracing::warn!("Max retries reached. Dropping connection.");
+                        break;
+                    }
+                    let rto = self.state.rtt + self.state.rttvar * 4;
+                    rto_deadline = Instant::now() + rto.max(Duration::from_millis(50));
                     rto_timer.as_mut().reset(rto_deadline);
                 }
 
@@ -171,12 +188,41 @@ impl ZtConnectionActor {
         let mut full_packet = BytesMut::from(&header_bytes[..]);
         full_packet.extend_from_slice(&payload);
         full_packet.extend_from_slice(&tag);
+        
+        let mut mutable_packet: Vec<u8> = full_packet.to_vec();
+        if let Some(offset) = PacketHeader::get_pn_offset(&mutable_packet) {
+            crypto.apply_header_protection(&mut mutable_packet, offset)?;
+        }
 
-        let _ = self.socket.try_send_to(&full_packet.freeze(), self.state.addr);
+        if let Err(e) = self.socket.try_send_to(&mutable_packet, self.state.addr) {
+            tracing::debug!("Failed to send: {}", e);
+        }
         Ok(())
     }
 
-    fn process_incoming_packet(&mut self, original_data: Bytes, addr: SocketAddr) -> Result<()> {
+    fn process_incoming_packet(&mut self, mut original_data: Bytes, addr: SocketAddr) -> Result<()> {
+        let is_short_header = original_data.len() > 0 && (original_data[0] & 0x80) == 0;
+        
+        if is_short_header {
+            if let Some(crypto) = self.state.crypto.as_ref() {
+                let mut data_mut = original_data.to_vec();
+                if let Some(offset) = PacketHeader::get_pn_offset(&data_mut) {
+                    crypto.remove_header_protection(&mut data_mut, offset)?;
+                    original_data = Bytes::from(data_mut);
+                }
+            } else {
+                return Err(ZtError::Unauthorized);
+            }
+        } else {
+            // Apply Initial HP to Long Headers (Handshake/Retry etc.)
+            let mut data_mut = original_data.to_vec();
+            if let Some(offset) = PacketHeader::get_pn_offset(&data_mut) {
+                let crypto = crate::crypto::CryptoContext::initial(&self.state.dcid);
+                crypto.remove_header_protection(&mut data_mut, offset)?;
+                original_data = Bytes::from(data_mut);
+            }
+        }
+
         let mut data_cursor = original_data.clone();
         let initial_len = data_cursor.remaining();
         let header = PacketHeader::decode(&mut data_cursor)?;
@@ -229,7 +275,12 @@ impl ZtConnectionActor {
         self.state.local_window = (1024u32 * 1024u32).saturating_sub(self.state.get_total_buffered_bytes() as u32);
 
         if !self.state.streams.contains_key(&header.stream_id) {
-            return Ok(());
+            if self.state.streams.len() >= ZtConnection::MAX_CONCURRENT_STREAMS {
+                return Err(ZtError::InvalidPacket("Max concurrent streams exceeded".into()));
+            }
+            let (data_tx, _data_rx) = mpsc::channel(2048);
+            let window_opened = Arc::new(tokio::sync::Notify::new());
+            self.state.streams.insert(header.stream_id, crate::transport::state::StreamState::new(data_tx, window_opened));
         }
 
         let stream = self.state.streams.get_mut(&header.stream_id).unwrap();
@@ -240,7 +291,7 @@ impl ZtConnectionActor {
         }
 
         if !payload_mut.is_empty() {
-            if stream.reorder_buffer.len() > 1024 {
+            if stream.buffered_bytes > self.state.local_window as usize {
                 return Err(ZtError::InvalidPacket("Reorder buffer full. Dropping.".into()));
             }
             stream.buffered_bytes += payload_mut.len();
@@ -291,17 +342,18 @@ impl ZtConnectionActor {
             if stream.dup_ack_count == 3 {
                 let expected_offset = stream.last_acked_offset;
                 let mut to_retransmit = None;
-                for (_pn, (packet, sent_time, retries, sid, start_offset, _end_offset)) in self.state.unacked_packets.iter_mut() {
-                    if *sid == header.stream_id && *start_offset == expected_offset {
+                if let Some(&pn) = stream.unacked_pns.get(&expected_offset) {
+                    if let Some((packet, sent_time, retries, _, _, _)) = self.state.unacked_packets.get_mut(&pn) {
                         *sent_time = std::time::Instant::now();
                         *retries += 1;
                         to_retransmit = Some(packet.clone());
-                        break;
                     }
                 }
                 if let Some(packet) = to_retransmit {
                     tracing::debug!("Fast Retransmit triggered for stream {} offset {}", header.stream_id, expected_offset);
-                    let _ = self.socket.try_send_to(&packet, self.state.addr);
+                    if let Err(e) = self.socket.try_send_to(&packet, self.state.addr) {
+            tracing::debug!("Failed to send: {}", e);
+        }
                     self.state.handle_loss();
                 }
             }
@@ -377,14 +429,22 @@ impl ZtConnectionActor {
         header.encode(&mut buf);
         let header_bytes = buf.freeze();
         
-        let mut payload = vec![]; 
+        let mut payload = vec![0u8; 16]; 
         let crypto = self.state.crypto.as_ref().ok_or(ZtError::Unauthorized)?;
         let tag = crypto.encrypt_in_place(ack_pn, &header_bytes, &mut payload)?;
 
         let mut full_packet = BytesMut::from(&header_bytes[..]);
+        full_packet.extend_from_slice(&payload);
         full_packet.extend_from_slice(&tag);
+        
+        let mut mutable_packet: Vec<u8> = full_packet.to_vec();
+        if let Some(offset) = PacketHeader::get_pn_offset(&mutable_packet) {
+            crypto.apply_header_protection(&mut mutable_packet, offset)?;
+        }
 
-        let _ = self.socket.try_send_to(&full_packet.freeze(), self.state.addr);
+        if let Err(e) = self.socket.try_send_to(&mutable_packet, self.state.addr) {
+            tracing::debug!("Failed to send: {}", e);
+        }
         self.pending_acks = 0;
         Ok(())
     }
@@ -429,9 +489,16 @@ impl ZtConnectionActor {
         let mut full_packet = BytesMut::from(&header_bytes[..]);
         full_packet.extend_from_slice(&payload);
         full_packet.extend_from_slice(&tag);
-        let frozen_packet = full_packet.freeze();
+        
+        let mut mutable_packet: Vec<u8> = full_packet.to_vec();
+        if let Some(offset) = PacketHeader::get_pn_offset(&mutable_packet) {
+            crypto.apply_header_protection(&mut mutable_packet, offset)?;
+        }
+        let frozen_packet = Bytes::from(mutable_packet.clone());
 
-        let _ = self.socket.try_send_to(&frozen_packet, self.state.addr);
+        if let Err(e) = self.socket.try_send_to(&mutable_packet, self.state.addr) {
+            tracing::debug!("Failed to send: {}", e);
+        }
 
         self.state.unacked_packets.insert(pn, (frozen_packet, std::time::Instant::now(), 0, stream_id, start_offset, end_offset));
         self.state.bytes_in_flight += data.len();
@@ -440,19 +507,20 @@ impl ZtConnectionActor {
         Ok(())
     }
 
-    fn handle_retransmits(&mut self) {
+    fn handle_retransmits(&mut self) -> Result<()> {
         let now = std::time::Instant::now();
         let mut to_send = Vec::new();
-        let mut to_remove = Vec::new();
+        let mut to_drop = Vec::new();
         let mut loss_occurred = false;
 
-        let rto = self.state.rtt.saturating_mul(4).max(Duration::from_millis(50));
+        let rto = self.state.rtt + self.state.rttvar * 4;
+        let rto = rto.max(Duration::from_millis(50));
 
         for (pn, (packet, sent_time, retries, _, _, _)) in self.state.unacked_packets.iter_mut() {
             if now.duration_since(*sent_time) > rto {
                 loss_occurred = true;
                 if *retries > 10 {
-                    to_remove.push(*pn);
+                    to_drop.push(*pn);
                 } else {
                     *sent_time = now;
                     *retries += 1;
@@ -461,22 +529,34 @@ impl ZtConnectionActor {
             }
         }
 
+        for pn in to_drop.iter() {
+            if let Some((_, _, _, _, start_offset, end_offset)) = self.state.unacked_packets.remove(pn) {
+                if end_offset != u64::MAX {
+                    let len = (end_offset - start_offset) as usize;
+                    self.state.bytes_in_flight = self.state.bytes_in_flight.saturating_sub(len);
+                }
+                tracing::warn!("Packet {} dropped after exceeding max retries", pn);
+            }
+        }
+
+        if !to_drop.is_empty() {
+            return Err(ZtError::Timeout);
+        }
+
         if loss_occurred {
             self.state.handle_loss();
         }
 
-        for pn in to_remove {
-            if let Some((packet, _, _, _, _, _)) = self.state.unacked_packets.remove(&pn) {
-                self.state.bytes_in_flight = self.state.bytes_in_flight.saturating_sub(packet.len());
+        for packet in to_send {
+            if let Err(e) = self.socket.try_send_to(&packet, self.state.addr) {
+                tracing::debug!("Failed to send retransmit: {}", e);
             }
         }
 
-        for packet in to_send {
-            let _ = self.socket.try_send_to(&packet, self.state.addr);
-        }
+        Ok(())
     }
-
     fn initiate_close(&mut self) -> Result<()> {
+        self.state.streams.clear(); // Drop streams to signal EOF to app consumers
         self.state.state = ConnectionState::Closing;
         let pn = self.state.get_next_packet_number()?;
         self.check_key_rotation(pn);
@@ -497,15 +577,23 @@ impl ZtConnectionActor {
         header.encode(&mut buf);
         let header_bytes = buf.freeze();
 
-        let mut payload = vec![];
+        let mut payload = vec![0u8; 16];
         let crypto = self.state.crypto.as_ref().ok_or(ZtError::Unauthorized)?;
         let tag = crypto.encrypt_in_place(pn, &header_bytes, &mut payload)?;
 
         let mut full_packet = BytesMut::from(&header_bytes[..]);
+        full_packet.extend_from_slice(&payload);
         full_packet.extend_from_slice(&tag);
-        let frozen = full_packet.freeze();
+        
+        let mut mutable_packet: Vec<u8> = full_packet.to_vec();
+        if let Some(offset) = PacketHeader::get_pn_offset(&mutable_packet) {
+            crypto.apply_header_protection(&mut mutable_packet, offset)?;
+        }
+        let frozen = Bytes::from(mutable_packet.clone());
 
-        let _ = self.socket.try_send_to(&frozen, self.state.addr);
+        if let Err(e) = self.socket.try_send_to(&mutable_packet, self.state.addr) {
+            tracing::debug!("Failed to send: {}", e);
+        }
         
         self.state.unacked_packets.insert(pn, (frozen, std::time::Instant::now(), 0, 0, u64::MAX, u64::MAX));
         Ok(())
@@ -535,7 +623,15 @@ impl ZtConnectionActor {
             buf.put_u8(0);
         }
 
-        let _ = self.socket.try_send_to(&buf, self.state.addr);
+        let mut mutable_packet = buf.to_vec();
+        if let Some(offset) = PacketHeader::get_pn_offset(&mutable_packet) {
+            let crypto = crate::crypto::CryptoContext::initial(&self.state.dcid);
+            crypto.apply_header_protection(&mut mutable_packet, offset)?;
+        }
+
+        if let Err(e) = self.socket.try_send_to(&mutable_packet, self.state.addr) {
+            tracing::debug!("Failed to send: {}", e);
+        }
         Ok(())
     }
 
@@ -585,7 +681,9 @@ impl ZtConnectionActor {
             buf.put_u8(0);
         }
 
-        let _ = self.socket.try_send_to(&buf, self.state.addr);
+        if let Err(e) = self.socket.try_send_to(&buf, self.state.addr) {
+            tracing::debug!("Failed to send: {}", e);
+        }
         Ok(())
     }
 }

@@ -29,6 +29,27 @@ pub struct PacketHeader {
 }
 
 impl PacketHeader {
+    pub fn get_pn_offset(data: &[u8]) -> Option<usize> {
+        if data.is_empty() { return None; }
+        let is_long = (data[0] & 0x80) != 0;
+        if is_long {
+            let mut offset = 6;
+            if data.len() < offset { return None; }
+            let dcid_len = data[5] as usize;
+            offset += dcid_len;
+            if data.len() < offset + 1 { return None; }
+            let scid_len = data[offset] as usize;
+            offset += 1 + scid_len;
+            Some(offset)
+        } else {
+            let mut offset = 2;
+            if data.len() < offset { return None; }
+            let dcid_len = data[1] as usize;
+            offset += dcid_len;
+            Some(offset)
+        }
+    }
+
     pub fn encode(&self, dst: &mut BytesMut) {
         if self.is_long {
             let first_byte = 0x80 | (self.p_type as u8);

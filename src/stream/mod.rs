@@ -23,15 +23,20 @@ impl ZtStream {
     /// Automatically handles backpressure if the congestion or flow window is full
     /// by yielding execution until space becomes available.
     pub async fn send(&self, data: &[u8]) -> Result<()> {
-        loop {
-            match self.endpoint.send(&self.cid, self.stream_id, data).await {
-                Ok(_) => return Ok(()),
-                Err(crate::error::ZtError::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    self.window_opened.notified().await;
+        let mtu = self.endpoint.get_mtu(&self.cid).await;
+        let chunk_size = mtu.saturating_sub(64).max(512); // Safe payload size accounting for UDP/IP/ZT headers
+        for chunk in data.chunks(chunk_size) {
+            loop {
+                match self.endpoint.send(&self.cid, self.stream_id, chunk).await {
+                    Ok(_) => break,
+                    Err(crate::error::ZtError::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        self.window_opened.notified().await;
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
         }
+        Ok(())
     }
 
     /// Receives a decrypted, in-order chunk of data from the remote peer.
@@ -40,18 +45,8 @@ impl ZtStream {
         self.receiver.recv().await
     }
 
-    /// Gracefully closes the stream and tears down the underlying connection.
+    /// Gracefully closes the stream and tears down the underlying connection if it's the last one.
     pub async fn close(&self) -> Result<()> {
-        self.endpoint.close(&self.cid).await
-    }
-}
-
-impl Drop for ZtStream {
-    fn drop(&mut self) {
-        let endpoint = self.endpoint.clone();
-        let cid = self.cid.clone();
-        tokio::spawn(async move {
-            let _ = endpoint.close(&cid).await;
-        });
+        self.endpoint.close_stream(&self.cid, self.stream_id).await
     }
 }
