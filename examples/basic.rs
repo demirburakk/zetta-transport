@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
     // 1. SERVER SIDE
     let server_addr = "127.0.0.1:8080";
     let server = ZtEndpoint::bind(server_addr, None).await?;

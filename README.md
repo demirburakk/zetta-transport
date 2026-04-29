@@ -14,7 +14,7 @@ ZettaTransport (ZT) is a research-oriented transport protocol built entirely in 
 
 *   **Multiplexed Streams:** Transfer multiple independent data streams over a single UDP connection. This is implemented to study solutions to the Head-of-Line blocking problem found in TCP.
 *   **In-Place Cryptography:** Payload encryption and decryption are performed directly in place to minimize memory allocations and understand zero-copy data paths.
-*   **Congestion Control & Loss Recovery:** Experimenting with AIMD (Additive Increase/Multiplicative Decrease) along with 3-Duplicate ACK detection to recover lost packets without relying solely on timeouts.
+*   **Congestion Control & Loss Recovery:** Experimenting with AIMD (Additive Increase/Multiplicative Decrease) with timeout-based loss recovery.
 *   **Cryptographic Key Rotation:** Implementing epoch-based key rotation for ChaCha20 to study how protocols prevent key exhaustion on long-lived connections.
 *   **DoS Mitigation Concepts:** Enforcing a 1200-byte padding requirement for initial handshake packets to explore anti-amplification techniques against IP spoofing.
 *   **Path MTU Discovery (PMTUD):** Probing the network with inflated packets to dynamically adjust the MTU size based on the current network path.
@@ -25,7 +25,7 @@ Add ZettaTransport to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-zetta-transport = "0.1.3"
+zetta-transport = "0.1.5"
 tokio = { version = "1.52", features = ["full"] }
 ```
 

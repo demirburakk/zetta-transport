@@ -1,6 +1,6 @@
 [package]
 name = "zetta-transport"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 authors = ["Burak Demir <demirburak8338@gmail.com>"]
 description = "A high-performance, secure, and fault-tolerant UDP-based transport protocol written in Rust 2024."
@@ -32,3 +32,4 @@ rand = "0.8"
 dashmap = "6.1.0"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 chacha20 = "0.10.0"
+libc = "0.2.186"

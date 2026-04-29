@@ -18,7 +18,9 @@ pub enum ConnectionState {
 pub struct StreamState {
     pub expected_rx_offset: u64,
     pub next_tx_offset: u64,
-    pub reorder_buffer: BTreeMap<u64, Bytes>,
+    pub ring_buffer: Box<[u8]>,
+    pub received_ranges: Vec<(u64, u64)>,
+    pub window_size: u64,
     pub buffered_bytes: usize,
     pub window_opened: Arc<Notify>,
     pub last_acked_offset: u64,
@@ -32,7 +34,9 @@ impl StreamState {
         Self {
             expected_rx_offset: 0,
             next_tx_offset: 0,
-            reorder_buffer: BTreeMap::new(),
+            ring_buffer: vec![0u8; 1024 * 1024].into_boxed_slice(),
+            received_ranges: Vec::new(),
+            window_size: 1024 * 1024,
             buffered_bytes: 0,
             window_opened,
             last_acked_offset: 0,
@@ -67,9 +71,10 @@ pub struct ZtConnection {
     pub bytes_in_flight: usize,
     pub mtu: usize,
     pub highest_processed_pn: u64,
+    pub bytes_received: usize,
+    pub bytes_sent: usize,
 
-    pub replay_window: Box<[u64]>,
-    pub max_replay_window: u64,
+    pub replay_bitmask: u64,
 
     pub current_key_epoch: u64,
 }
@@ -102,32 +107,40 @@ impl ZtConnection {
             bytes_in_flight: 0,
             mtu: 1200,
             highest_processed_pn: 0,
+            bytes_received: 0,
+            bytes_sent: 0,
 
-            replay_window: vec![u64::MAX; 8192].into_boxed_slice(),
-            max_replay_window: 8192,
+            replay_bitmask: 0,
 
             current_key_epoch: 0,
         }
     }
 
     pub fn is_replay(&self, pn: u64) -> bool {
-        if pn > self.highest_processed_pn + self.max_replay_window {
-            return true;
+        if pn <= self.highest_processed_pn {
+            let diff = self.highest_processed_pn - pn;
+            if diff >= 64 {
+                return true;
+            }
+            return (self.replay_bitmask & (1 << diff)) != 0;
         }
-        if self.highest_processed_pn > self.max_replay_window
-            && pn < self.highest_processed_pn - self.max_replay_window
-        {
-            return true;
-        }
-        let idx = (pn % self.max_replay_window) as usize;
-        self.replay_window[idx] == pn
+        false
     }
 
     pub fn mark_processed(&mut self, pn: u64) {
-        let idx = (pn % self.max_replay_window) as usize;
-        self.replay_window[idx] = pn;
         if pn > self.highest_processed_pn {
+            let diff = pn - self.highest_processed_pn;
+            if diff >= 64 {
+                self.replay_bitmask = 1;
+            } else {
+                self.replay_bitmask = (self.replay_bitmask << diff) | 1;
+            }
             self.highest_processed_pn = pn;
+        } else {
+            let diff = self.highest_processed_pn - pn;
+            if diff < 64 {
+                self.replay_bitmask |= 1 << diff;
+            }
         }
     }
 
@@ -141,42 +154,43 @@ impl ZtConnection {
         self.last_activity = Instant::now();
     }
 
-    pub fn handle_ack(&mut self, acked_pn: u64, acked_stream_id: u32, acked_offset: u64, window_size: u32) {
-        let mut bytes_acked = 0;
+    pub fn handle_ack(&mut self, largest_acked_pn: u64, window_size: u32) {
+        let mut bytes_acked = 0usize;
         let mut sample_rtt = None;
 
-        if let Some(probe_size) = self.mtu_probes.remove(&acked_pn) {
-            if probe_size > self.mtu {
+        // PMTUD: if any probe packet number is cumulatively acked, it's safe to upgrade.
+        let mut acked_probe_pns: Vec<u64> = self
+            .mtu_probes
+            .keys()
+            .copied()
+            .filter(|pn| *pn <= largest_acked_pn)
+            .collect();
+        acked_probe_pns.sort_unstable();
+        for pn in acked_probe_pns {
+            if let Some(probe_size) = self.mtu_probes.remove(&pn)
+                && probe_size > self.mtu
+            {
                 self.mtu = probe_size;
                 tracing::info!("MTU upgraded to {} via PMTUD", self.mtu);
             }
         }
 
-        if let Some(stream) = self.streams.get_mut(&acked_stream_id) {
-            if acked_offset == stream.last_acked_offset {
-                stream.dup_ack_count += 1;
-            } else if acked_offset > stream.last_acked_offset {
-                stream.last_acked_offset = acked_offset;
-                stream.dup_ack_count = 0;
-            }
+        // Cumulative ACK by packet number: remove all unacked packets up to largest_acked_pn.
+        let mut acked_pns: Vec<u64> = self
+            .unacked_packets
+            .keys()
+            .copied()
+            .filter(|pn| *pn <= largest_acked_pn)
+            .collect();
+        acked_pns.sort_unstable();
 
-            let mut acked_offsets = Vec::new();
-            for (&start_offset, &_pn) in stream.unacked_pns.iter() {
-                if start_offset < acked_offset {
-                    acked_offsets.push(start_offset);
-                } else {
-                    break;
-                }
-            }
-
-            for offset in acked_offsets {
-                if let Some(pn) = stream.unacked_pns.remove(&offset) {
-                    if let Some((packet, sent_time, retries, _, _, _)) = self.unacked_packets.remove(&pn) {
-                        bytes_acked += packet.len();
-                        if retries == 0 && sample_rtt.is_none() {
-                            sample_rtt = Some(sent_time.elapsed());
-                        }
-                    }
+        for pn in acked_pns {
+            if let Some((packet, sent_time, retries, _stream_id, _start_offset, _end_offset)) =
+                self.unacked_packets.remove(&pn)
+            {
+                bytes_acked += packet.len();
+                if retries == 0 && sample_rtt.is_none() {
+                    sample_rtt = Some(sent_time.elapsed());
                 }
             }
         }
@@ -188,7 +202,7 @@ impl ZtConnection {
                 self.rtt = rtt;
                 self.rttvar = rtt / 2;
             } else {
-                let error = if self.rtt > rtt { self.rtt - rtt } else { rtt - self.rtt };
+                let error = self.rtt.abs_diff(rtt);
                 self.rttvar = (self.rttvar * 3 + error) / 4;
                 self.rtt = (self.rtt * 7 + rtt) / 8;
             }
@@ -196,17 +210,18 @@ impl ZtConnection {
 
         if bytes_acked > 0 {
             if self.cwnd < self.ssthresh {
-                self.cwnd += self.mtu;
+                self.cwnd += bytes_acked;
             } else {
-                self.cwnd += (self.mtu * self.mtu) / self.cwnd.max(self.mtu);
-            }
-            
-            if let Some(stream) = self.streams.get(&acked_stream_id) {
-                stream.window_opened.notify_waiters();
+                self.cwnd += (self.mtu * bytes_acked) / self.cwnd.max(self.mtu);
             }
         }
-        
+
         self.remote_window = window_size;
+
+        // Unblock senders that are waiting on flow/cwnd to open.
+        for stream in self.streams.values() {
+            stream.window_opened.notify_waiters();
+        }
     }
 
     pub fn handle_loss(&mut self) {

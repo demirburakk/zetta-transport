@@ -1,15 +1,18 @@
 use crate::transport::state::{ConnectionState, ZtConnection};
 use crate::error::{Result, ZtError};
 use crate::protocol::packet::{PacketHeader, PacketType};
+use crate::protocol::frame::Frame;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use std::time::Duration;
+use std::io::IoSlice;
 use tokio::time::{sleep_until, Instant};
 use dashmap::DashMap;
 use x25519_dalek::{PublicKey, StaticSecret};
+use ed25519_dalek::{SigningKey, Signer, VerifyingKey, Signature, Verifier};
 
 pub enum ActorMessage {
     IncomingPacket { data: Bytes, addr: SocketAddr },
@@ -26,6 +29,8 @@ pub struct ZtConnectionActor {
     pub(crate) pending_acks: u32,
     pub(crate) public_key: PublicKey,
     pub(crate) static_secret: StaticSecret,
+    pub(crate) ed_signing_key: SigningKey,
+    pub(crate) ed_public_key: VerifyingKey,
     pub(crate) psk: Option<[u8; 32]>,
     pub(crate) handshake_waiter: Option<oneshot::Sender<()>>,
     pub(crate) routing_table: Arc<DashMap<Vec<u8>, mpsc::Sender<ActorMessage>>>,
@@ -36,6 +41,116 @@ pub struct ZtConnectionActor {
 const SLEEP_FOREVER: Duration = Duration::from_secs(86400 * 365);
 
 impl ZtConnectionActor {
+    fn extract_dcid_fast(data: &[u8]) -> Option<Vec<u8>> {
+        if data.is_empty() {
+            return None;
+        }
+        let is_long = (data[0] & 0x80) != 0;
+
+        if is_long {
+            if data.len() < 6 {
+                return None;
+            }
+            let dcid_len = data[5] as usize;
+            if data.len() < 6 + dcid_len {
+                return None;
+            }
+            Some(data[6..6 + dcid_len].to_vec())
+        } else {
+            if data.len() < 2 {
+                return None;
+            }
+            let dcid_len = data[1] as usize;
+            if data.len() < 2 + dcid_len {
+                return None;
+            }
+            Some(data[2..2 + dcid_len].to_vec())
+        }
+    }
+
+    #[cfg(unix)]
+    fn sendmsg_vectored(&mut self, iov: &[IoSlice]) -> Result<()> {
+        let total_len: usize = iov.iter().map(|s| s.len()).sum();
+        if self.state.state == ConnectionState::Handshaking
+            && self.state.bytes_sent + total_len > 3 * self.state.bytes_received.max(1)
+        {
+            tracing::warn!("Amplification limit reached, dropping packet");
+            return Ok(());
+        }
+        
+        use std::os::unix::io::AsRawFd;
+        use libc::{sendmsg, msghdr, iovec, sockaddr_in, sockaddr_in6, c_void};
+        
+        let fd = self.socket.as_raw_fd();
+        
+        let mut msg: msghdr = unsafe { std::mem::zeroed() };
+
+        // Avoid relying on `IoSlice` ABI layout by constructing `libc::iovec` explicitly.
+        let mut iovecs: Vec<iovec> = iov
+            .iter()
+            .map(|s| iovec {
+                iov_base: s.as_ptr() as *mut c_void,
+                iov_len: s.len(),
+            })
+            .collect();
+        msg.msg_iov = iovecs.as_mut_ptr();
+        msg.msg_iovlen = iovecs.len() as _;
+        
+        let mut addr_v4: sockaddr_in = unsafe { std::mem::zeroed() };
+        let mut addr_v6: sockaddr_in6 = unsafe { std::mem::zeroed() };
+        
+        match self.state.addr {
+            SocketAddr::V4(v4) => {
+                addr_v4.sin_family = libc::AF_INET as _;
+                addr_v4.sin_port = v4.port().to_be();
+                addr_v4.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+                msg.msg_name = &mut addr_v4 as *mut _ as *mut c_void;
+                msg.msg_namelen = std::mem::size_of::<sockaddr_in>() as _;
+            }
+            SocketAddr::V6(v6) => {
+                addr_v6.sin6_family = libc::AF_INET6 as _;
+                addr_v6.sin6_port = v6.port().to_be();
+                addr_v6.sin6_addr.s6_addr = v6.ip().octets();
+                msg.msg_name = &mut addr_v6 as *mut _ as *mut c_void;
+                msg.msg_namelen = std::mem::size_of::<sockaddr_in6>() as _;
+            }
+        }
+        
+        let res = unsafe { sendmsg(fd, &msg, 0) };
+        if res < 0 {
+            tracing::debug!("Failed to send vectored: {}", std::io::Error::last_os_error());
+        } else {
+            self.state.bytes_sent += total_len;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn sendmsg_vectored(&mut self, iov: &[IoSlice]) -> Result<()> {
+        // Fallback for non-unix
+        let mut buf = Vec::new();
+        for slice in iov {
+            buf.extend_from_slice(slice);
+        }
+        self.send_to_socket(&buf)
+    }
+
+    #[cfg(not(unix))]
+    fn send_to_socket(&mut self, packet: &[u8]) -> Result<()> {
+        if self.state.state == ConnectionState::Handshaking
+            && self.state.bytes_sent + packet.len() > 3 * self.state.bytes_received.max(1)
+        {
+            tracing::warn!("Amplification limit reached, dropping packet");
+            return Ok(());
+        }
+        if let Err(e) = self.socket.try_send_to(packet, self.state.addr) {
+            tracing::debug!("Failed to send: {}", e);
+        } else {
+            self.state.bytes_sent += packet.len();
+        }
+        Ok(())
+    }
+
     pub async fn run(mut self) {
         let mut rto_deadline = Instant::now() + self.state.rtt;
         let mut idle_deadline = Instant::now() + Duration::from_secs(60);
@@ -55,7 +170,7 @@ impl ZtConnectionActor {
         tracing::info!("Actor spawned for CID: {:?}", self.state.dcid);
 
         if self.state.state == ConnectionState::Handshaking {
-            let _ = self.send_initial_packet();
+            let _ = self.send_initial_packet(None);
         }
 
         loop {
@@ -141,21 +256,25 @@ impl ZtConnectionActor {
         tracing::info!("Actor for CID {:?} terminated and cleaned up.", self.scid);
     }
 
-    fn check_key_rotation(&mut self, pn: u64) {
+    fn check_key_rotation(&mut self, pn: u64, _tx: bool) -> bool {
         let epoch = pn / 16_000_000;
-        if epoch > self.state.current_key_epoch {
-            if let Some(crypto) = self.state.crypto.as_mut() {
-                crypto.rotate_keys();
-                self.state.current_key_epoch = epoch;
-                tracing::info!("Keys rotated successfully for epoch {}", epoch);
-            }
+        let key_phase = !epoch.is_multiple_of(2);
+
+        if epoch > self.state.current_key_epoch
+            && let Some(crypto) = self.state.crypto.as_mut()
+        {
+            crypto.rotate_keys();
+            self.state.current_key_epoch = epoch;
+            tracing::info!("Keys rotated successfully for epoch {}", epoch);
         }
+
+        key_phase
     }
 
     fn send_keep_alive(&mut self) -> Result<()> {
         if self.state.state != ConnectionState::Active { return Ok(()); }
         let pn = self.state.get_next_packet_number()?;
-        self.check_key_rotation(pn);
+        let key_phase = self.check_key_rotation(pn, true);
         
         let total_buffered = self.state.get_total_buffered_bytes();
         self.state.local_window = (1024u32 * 1024u32).saturating_sub(total_buffered as u32);
@@ -166,59 +285,69 @@ impl ZtConnectionActor {
             dcid: self.state.dcid.clone(),
             scid: vec![],
             packet_number: pn,
-            window_size: self.state.local_window,
-            stream_id: 0,
-            offset: 0,
-            acked_pn: 0,
+            key_phase,
         };
 
         let target_size = if self.state.mtu < 1450 { 1450 } else { 64 };
         self.state.mtu_probes.insert(pn, target_size);
 
-        let mut buf = BytesMut::with_capacity(target_size);
-        header.encode(&mut buf);
-        let header_bytes = buf.freeze();
+        let mut packet = BytesMut::with_capacity(target_size + 32);
+        header.encode(&mut packet);
+        let header_len = packet.len();
         
-        let payload_len = target_size.saturating_sub(header_bytes.len() + 16);
-        let mut payload = vec![0u8; payload_len];
-
+        let frame = Frame::Padding(target_size.saturating_sub(header_len + 16));
+        frame.encode(&mut packet);
+        let payload_len = packet.len() - header_len;
+        
+        packet.put_bytes(0, 16); // tag space
+        
         let crypto = self.state.crypto.as_mut().ok_or(ZtError::Unauthorized)?;
-        let tag = crypto.encrypt_in_place(pn, &header_bytes, &mut payload)?;
-
-        let mut full_packet = BytesMut::from(&header_bytes[..]);
-        full_packet.extend_from_slice(&payload);
-        full_packet.extend_from_slice(&tag);
-        
-        let mut mutable_packet: Vec<u8> = full_packet.to_vec();
-        if let Some(offset) = PacketHeader::get_pn_offset(&mutable_packet) {
-            crypto.apply_header_protection(&mut mutable_packet, offset)?;
+        {
+            let packet_slice = packet.as_mut();
+            let (aad, rest) = packet_slice.split_at_mut(header_len);
+            let (payload, tag_space) = rest.split_at_mut(payload_len);
+            let tag = crypto.encrypt_in_place(pn, aad, payload)?;
+            tag_space.copy_from_slice(&tag);
         }
 
-        if let Err(e) = self.socket.try_send_to(&mutable_packet, self.state.addr) {
-            tracing::debug!("Failed to send: {}", e);
+        let packet_slice = packet.as_mut();
+        if let Some(offset) = PacketHeader::get_pn_offset(packet_slice) {
+            let (header_part, payload_part) = packet_slice.split_at_mut(header_len);
+            crypto.apply_header_protection(header_part, payload_part, offset)?;
         }
+
+        let _ = self.sendmsg_vectored(&[IoSlice::new(packet_slice)]);
         Ok(())
     }
 
     fn process_incoming_packet(&mut self, mut original_data: Bytes, addr: SocketAddr) -> Result<()> {
-        let is_short_header = original_data.len() > 0 && (original_data[0] & 0x80) == 0;
+        self.state.bytes_received += original_data.len();
+        let is_short_header = !original_data.is_empty() && (original_data[0] & 0x80) == 0;
         
+        let mut use_prev_key = false;
         if is_short_header {
+            let key_phase = (original_data[0] & 0x40) != 0;
+            let expected_kp = !self.state.current_key_epoch.is_multiple_of(2);
+            if key_phase != expected_kp {
+                use_prev_key = true;
+            }
+
             if let Some(crypto) = self.state.crypto.as_ref() {
                 let mut data_mut = original_data.to_vec();
                 if let Some(offset) = PacketHeader::get_pn_offset(&data_mut) {
-                    crypto.remove_header_protection(&mut data_mut, offset)?;
+                    crypto.remove_header_protection(&mut data_mut, offset, use_prev_key)?;
                     original_data = Bytes::from(data_mut);
                 }
             } else {
                 return Err(ZtError::Unauthorized);
             }
         } else {
-            // Apply Initial HP to Long Headers (Handshake/Retry etc.)
             let mut data_mut = original_data.to_vec();
             if let Some(offset) = PacketHeader::get_pn_offset(&data_mut) {
-                let crypto = crate::crypto::CryptoContext::initial(&self.state.dcid);
-                crypto.remove_header_protection(&mut data_mut, offset)?;
+                if let Some(dcid) = Self::extract_dcid_fast(&data_mut) {
+                    let crypto = crate::crypto::CryptoContext::initial(&dcid, true);
+                    crypto.remove_header_protection(&mut data_mut, offset, false)?;
+                }
                 original_data = Bytes::from(data_mut);
             }
         }
@@ -234,7 +363,18 @@ impl ZtConnectionActor {
             return Err(ZtError::InvalidPacket("Replay attack or duplicate".into()));
         }
 
-        self.check_key_rotation(header.packet_number);
+        // Check if key phase flipped and it's a NEW packet (trigger rotate)
+        let expected_kp = !self.state.current_key_epoch.is_multiple_of(2);
+        if is_short_header
+            && header.key_phase != expected_kp
+            && header.packet_number >= self.state.highest_processed_pn
+            && let Some(crypto) = self.state.crypto.as_mut()
+        {
+            crypto.rotate_keys();
+            self.state.current_key_epoch += 1;
+            use_prev_key = false; // It was a new epoch, not prev
+            tracing::info!("Rx trigger key rotate");
+        }
 
         match header.p_type {
             PacketType::Handshake if self.state.state == ConnectionState::Handshaking => {
@@ -243,160 +383,135 @@ impl ZtConnectionActor {
             PacketType::Retry if self.state.state == ConnectionState::Handshaking => {
                 self.handle_retry_packet(header, payload, addr)
             }
-            PacketType::Data if self.state.state == ConnectionState::Active => {
-                self.handle_data_packet(header, payload, aad, addr)
-            }
-            PacketType::Ack => {
-                self.handle_ack_packet(header, payload, aad, addr)
-            }
-            PacketType::MtuProbe if self.state.state == ConnectionState::Active => {
-                self.handle_mtu_probe(header, payload, aad, addr)
-            }
-            PacketType::Close => {
-                self.handle_close_packet(header, payload, aad, addr)
+            PacketType::Data | PacketType::MtuProbe | PacketType::Close if self.state.state == ConnectionState::Active => {
+                let crypto = self.state.crypto.as_ref().ok_or(ZtError::Unauthorized)?;
+                if payload.len() < 16 { return Err(ZtError::InvalidPacket("Too short for tag".into())); }
+                let tag_bytes = payload.slice(payload.len() - 16..);
+                let mut tag = [0u8; 16];
+                tag.copy_from_slice(&tag_bytes[..]);
+                let mut payload_mut = payload.slice(..payload.len() - 16).to_vec();
+                crypto.decrypt_in_place(header.packet_number, aad, &mut payload_mut, &tag, use_prev_key)?;
+                
+                self.state.addr = addr;
+                self.state.mark_processed(header.packet_number);
+                
+                let mut payload_bytes = Bytes::from(payload_mut);
+                while payload_bytes.remaining() > 0 {
+                    match Frame::decode(&mut payload_bytes) {
+                        Ok(frame) => self.handle_frame(frame, header.packet_number)?,
+                        Err(_) => break, // skip corrupted frames
+                    }
+                }
+                Ok(())
             }
             _ => Ok(()),
         }
     }
+    
+    fn handle_frame(&mut self, frame: Frame, _pn: u64) -> Result<()> {
+        match frame {
+            Frame::Padding(_) => {
+                self.pending_acks += 1;
+            },
+            Frame::Stream { id, offset, data } => {
+                self.last_active_stream_id = id;
+                self.state.local_window = (1024u32 * 1024u32).saturating_sub(self.state.get_total_buffered_bytes() as u32);
 
-    fn handle_data_packet(&mut self, header: PacketHeader, mut payload: Bytes, aad: &[u8], addr: SocketAddr) -> Result<()> {
-        let crypto = self.state.crypto.as_ref().ok_or(ZtError::Unauthorized)?;
-        if payload.len() < 16 { return Err(ZtError::InvalidPacket("Too short for tag".into())); }
-        let tag_bytes = payload.split_off(payload.len() - 16);
-        let mut tag = [0u8; 16];
-        tag.copy_from_slice(&tag_bytes);
-        let mut payload_mut = payload.to_vec();
-        crypto.decrypt_in_place(header.packet_number, aad, &mut payload_mut, &tag)?;
-        
-        self.state.addr = addr;
-        self.state.mark_processed(header.packet_number);
-        self.last_active_stream_id = header.stream_id;
+                // Current public API exposes only the initially-created stream(s).
+                // Remote-initiated streams are ignored for now.
+                let Some(stream) = self.state.streams.get_mut(&id) else {
+                    return Ok(());
+                };
 
-        self.state.local_window = (1024u32 * 1024u32).saturating_sub(self.state.get_total_buffered_bytes() as u32);
-
-        if !self.state.streams.contains_key(&header.stream_id) {
-            if self.state.streams.len() >= ZtConnection::MAX_CONCURRENT_STREAMS {
-                return Err(ZtError::InvalidPacket("Max concurrent streams exceeded".into()));
-            }
-            let (data_tx, _data_rx) = mpsc::channel(2048);
-            let window_opened = Arc::new(tokio::sync::Notify::new());
-            self.state.streams.insert(header.stream_id, crate::transport::state::StreamState::new(data_tx, window_opened));
-        }
-
-        let stream = self.state.streams.get_mut(&header.stream_id).unwrap();
-
-        if header.offset < stream.expected_rx_offset {
-            self.pending_acks += 1;
-            return Ok(());
-        }
-
-        if !payload_mut.is_empty() {
-            if stream.buffered_bytes > self.state.local_window as usize {
-                return Err(ZtError::InvalidPacket("Reorder buffer full. Dropping.".into()));
-            }
-            stream.buffered_bytes += payload_mut.len();
-            stream.reorder_buffer.insert(header.offset, Bytes::from(payload_mut));
-        }
-
-        loop {
-            if let Some(data) = stream.reorder_buffer.remove(&stream.expected_rx_offset) {
-                let data_len = data.len();
-                match stream.app_tx.try_send(data) {
-                    Ok(_) => {
-                        stream.expected_rx_offset += data_len as u64;
-                        stream.buffered_bytes = stream.buffered_bytes.saturating_sub(data_len);
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(returned_data)) => {
-                        stream.reorder_buffer.insert(stream.expected_rx_offset, returned_data);
-                        break; 
-                    }
-                    Err(_) => break, 
+                if offset < stream.expected_rx_offset {
+                    self.pending_acks += 1;
+                    return Ok(());
                 }
-            } else {
-                break;
-            }
-        }
 
-        self.pending_acks += 1;
-        if self.pending_acks >= 10 {
-            let _ = self.flush_acks();
-        }
-
-        Ok(())
-    }
-
-    fn handle_ack_packet(&mut self, header: PacketHeader, mut payload: Bytes, aad: &[u8], addr: SocketAddr) -> Result<()> {
-        let crypto = self.state.crypto.as_ref().ok_or(ZtError::Unauthorized)?;
-        if payload.len() < 16 { return Err(ZtError::InvalidPacket("Too short for tag".into())); }
-        let tag_bytes = payload.split_off(payload.len() - 16);
-        let mut tag = [0u8; 16];
-        tag.copy_from_slice(&tag_bytes);
-        let mut payload_mut = payload.to_vec();
-        crypto.decrypt_in_place(header.packet_number, aad, &mut payload_mut, &tag)?;
-        
-        self.state.addr = addr;
-        
-        self.state.handle_ack(header.acked_pn, header.stream_id, header.offset, header.window_size);
-
-        if let Some(stream) = self.state.streams.get(&header.stream_id) {
-            if stream.dup_ack_count == 3 {
-                let expected_offset = stream.last_acked_offset;
-                let mut to_retransmit = None;
-                if let Some(&pn) = stream.unacked_pns.get(&expected_offset) {
-                    if let Some((packet, sent_time, retries, _, _, _)) = self.state.unacked_packets.get_mut(&pn) {
-                        *sent_time = std::time::Instant::now();
-                        *retries += 1;
-                        to_retransmit = Some(packet.clone());
+                if !data.is_empty() {
+                    let end_offset = offset + data.len() as u64;
+                    if end_offset > stream.expected_rx_offset + stream.window_size {
+                        return Ok(());
                     }
-                }
-                if let Some(packet) = to_retransmit {
-                    tracing::debug!("Fast Retransmit triggered for stream {} offset {}", header.stream_id, expected_offset);
-                    if let Err(e) = self.socket.try_send_to(&packet, self.state.addr) {
-            tracing::debug!("Failed to send: {}", e);
-        }
-                    self.state.handle_loss();
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn handle_mtu_probe(&mut self, header: PacketHeader, mut payload: Bytes, aad: &[u8], addr: SocketAddr) -> Result<()> {
-        let crypto = self.state.crypto.as_ref().ok_or(ZtError::Unauthorized)?;
-        if payload.len() < 16 { return Err(ZtError::InvalidPacket("Too short for tag".into())); }
-        let tag_bytes = payload.split_off(payload.len() - 16);
-        let mut tag = [0u8; 16];
-        tag.copy_from_slice(&tag_bytes);
-        let mut payload_mut = payload.to_vec();
-        crypto.decrypt_in_place(header.packet_number, aad, &mut payload_mut, &tag)?;
-        
-        self.state.addr = addr;
-        self.state.mark_processed(header.packet_number);
-        self.pending_acks += 1;
-        let _ = self.flush_acks();
-        Ok(())
-    }
-
-    fn handle_close_packet(&mut self, header: PacketHeader, mut payload: Bytes, aad: &[u8], addr: SocketAddr) -> Result<()> {
-        if let Some(crypto) = self.state.crypto.as_ref() {
-            if payload.len() >= 16 {
-                let tag_bytes = payload.split_off(payload.len() - 16);
-        let mut tag = [0u8; 16];
-        tag.copy_from_slice(&tag_bytes);
-                let mut payload_mut = payload.to_vec();
-                if crypto.decrypt_in_place(header.packet_number, aad, &mut payload_mut, &tag).is_ok() {
-                    self.state.addr = addr;
-                    self.state.mark_processed(header.packet_number);
                     
-                    if self.state.state == ConnectionState::Closing {
-                        self.state.state = ConnectionState::Closed;
+                    for (i, byte) in data.iter().enumerate() {
+                        let buf_idx = ((offset + i as u64) % stream.window_size) as usize;
+                        stream.ring_buffer[buf_idx] = *byte;
+                    }
+                    
+                    let mut insert_idx = stream.received_ranges.len();
+                    for (i, r) in stream.received_ranges.iter().enumerate() {
+                        if offset < r.0 {
+                            insert_idx = i;
+                            break;
+                        }
+                    }
+                    stream.received_ranges.insert(insert_idx, (offset, end_offset));
+                    let mut merged: Vec<(u64, u64)> = Vec::new();
+                    for r in stream.received_ranges.drain(..) {
+                        if merged.is_empty() {
+                            merged.push(r);
+                        } else {
+                            let last = merged.last_mut().unwrap();
+                            if r.0 <= last.1 {
+                                last.1 = last.1.max(r.1);
+                            } else {
+                                merged.push(r);
+                            }
+                        }
+                    }
+                    stream.received_ranges = merged;
+                    stream.buffered_bytes += data.len(); 
+                }
+
+                loop {
+                    let mut extracted = None;
+                    if let Some(r) = stream.received_ranges.first()
+                        && r.0 <= stream.expected_rx_offset
+                        && r.1 > stream.expected_rx_offset
+                    {
+                        let available = (r.1 - stream.expected_rx_offset) as usize;
+                        let mut buf = vec![0u8; available];
+                        for (i, out) in buf.iter_mut().enumerate() {
+                            let buf_idx = ((stream.expected_rx_offset + i as u64) % stream.window_size) as usize;
+                            *out = stream.ring_buffer[buf_idx];
+                        }
+                        extracted = Some((buf, available));
+                    }
+                    
+                    if let Some((d, available)) = extracted {
+                        match stream.app_tx.try_send(Bytes::from(d)) {
+                            Ok(_) => {
+                                stream.expected_rx_offset += available as u64;
+                                stream.buffered_bytes = stream.buffered_bytes.saturating_sub(available);
+                                if stream.received_ranges[0].1 <= stream.expected_rx_offset {
+                                    stream.received_ranges.remove(0);
+                                }
+                            }
+                            Err(_) => break, 
+                        }
                     } else {
-                        let _ = self.initiate_close();
-                        self.state.state = ConnectionState::Closed;
+                        break;
                     }
                 }
-            }
+
+                self.pending_acks += 1;
+                if self.pending_acks >= 10 {
+                    let _ = self.flush_acks();
+                }
+            },
+            Frame::Ack { largest_acked, window_size } => {
+                self.state.handle_ack(largest_acked, window_size);
+            },
+            Frame::ConnectionClose => {
+                if self.state.state == ConnectionState::Closing {
+                    self.state.state = ConnectionState::Closed;
+                } else {
+                    let _ = self.initiate_close();
+                    self.state.state = ConnectionState::Closed;
+                }
+            },
+            _ => {}
         }
         Ok(())
     }
@@ -405,46 +520,49 @@ impl ZtConnectionActor {
         if self.pending_acks == 0 { return Ok(()); }
         
         let ack_pn = self.state.get_next_packet_number()?; 
-        self.check_key_rotation(ack_pn);
+        let key_phase = self.check_key_rotation(ack_pn, true);
 
         self.state.local_window = (1024u32 * 1024u32).saturating_sub(self.state.get_total_buffered_bytes() as u32);
 
-        let stream_id = self.last_active_stream_id;
-        let offset = self.state.streams.get(&stream_id).map(|s| s.expected_rx_offset).unwrap_or(0);
-
         let header = PacketHeader {
-            p_type: PacketType::Ack,
+            p_type: PacketType::Data,
             is_long: false,
             version: 0,
             dcid: self.state.dcid.clone(),
             scid: vec![],
             packet_number: ack_pn,
-            window_size: self.state.local_window,
-            stream_id,
-            offset,
-            acked_pn: self.state.highest_processed_pn, 
+            key_phase,
         };
 
-        let mut buf = BytesMut::with_capacity(64);
-        header.encode(&mut buf);
-        let header_bytes = buf.freeze();
+        let mut packet = BytesMut::with_capacity(128);
+        header.encode(&mut packet);
+        let header_len = packet.len();
         
-        let mut payload = vec![0u8; 16]; 
+        let frame = Frame::Ack {
+            largest_acked: self.state.highest_processed_pn,
+            window_size: self.state.local_window,
+        };
+        frame.encode(&mut packet);
+        let payload_len = packet.len() - header_len;
+        
+        packet.put_bytes(0, 16); 
         let crypto = self.state.crypto.as_ref().ok_or(ZtError::Unauthorized)?;
-        let tag = crypto.encrypt_in_place(ack_pn, &header_bytes, &mut payload)?;
-
-        let mut full_packet = BytesMut::from(&header_bytes[..]);
-        full_packet.extend_from_slice(&payload);
-        full_packet.extend_from_slice(&tag);
         
-        let mut mutable_packet: Vec<u8> = full_packet.to_vec();
-        if let Some(offset) = PacketHeader::get_pn_offset(&mutable_packet) {
-            crypto.apply_header_protection(&mut mutable_packet, offset)?;
+        {
+            let packet_slice = packet.as_mut();
+            let (aad, rest) = packet_slice.split_at_mut(header_len);
+            let (payload, tag_space) = rest.split_at_mut(payload_len);
+            let tag = crypto.encrypt_in_place(ack_pn, aad, payload)?;
+            tag_space.copy_from_slice(&tag);
         }
 
-        if let Err(e) = self.socket.try_send_to(&mutable_packet, self.state.addr) {
-            tracing::debug!("Failed to send: {}", e);
+        let packet_slice = packet.as_mut();
+        if let Some(offset) = PacketHeader::get_pn_offset(packet_slice) {
+            let (header_part, payload_part) = packet_slice.split_at_mut(header_len);
+            crypto.apply_header_protection(header_part, payload_part, offset)?;
         }
+
+        let _ = self.sendmsg_vectored(&[IoSlice::new(packet_slice)]);
         self.pending_acks = 0;
         Ok(())
     }
@@ -453,7 +571,12 @@ impl ZtConnectionActor {
         if self.state.remote_window < data.len() as u32 {
             return Err(ZtError::Io(std::io::Error::new(std::io::ErrorKind::WouldBlock, "Remote window exhausted")));
         }
-        if self.state.bytes_in_flight + data.len() > self.state.cwnd {
+
+        // Estimate on-wire bytes before allocating a packet number.
+        let short_header_len = 1 + 1 + self.state.dcid.len() + 8;
+        let stream_frame_overhead = 1 + 4 + 8 + 2;
+        let estimated_on_wire = short_header_len + stream_frame_overhead + data.len() + 16;
+        if self.state.bytes_in_flight + estimated_on_wire > self.state.cwnd {
             return Err(ZtError::Io(std::io::Error::new(std::io::ErrorKind::WouldBlock, "CWND exhausted")));
         }
 
@@ -463,7 +586,7 @@ impl ZtConnectionActor {
         let end_offset = stream.next_tx_offset;
 
         let pn = self.state.get_next_packet_number()?;
-        self.check_key_rotation(pn);
+        let key_phase = self.check_key_rotation(pn, true);
         
         let header = PacketHeader {
             p_type: PacketType::Data,
@@ -472,36 +595,47 @@ impl ZtConnectionActor {
             dcid: self.state.dcid.clone(),
             scid: vec![],
             packet_number: pn,
-            window_size: self.state.local_window,
-            stream_id,
-            offset: start_offset,
-            acked_pn: 0,
+            key_phase,
         };
 
-        let mut buf = BytesMut::with_capacity(64);
-        header.encode(&mut buf);
-        let header_bytes = buf.freeze();
+        let mut header_buf = BytesMut::with_capacity(64);
+        header.encode(&mut header_buf);
 
-        let mut payload = data.to_vec();
-        let crypto = self.state.crypto.as_ref().ok_or(ZtError::Unauthorized)?;
-        let tag = crypto.encrypt_in_place(pn, &header_bytes, &mut payload)?;
-
-        let mut full_packet = BytesMut::from(&header_bytes[..]);
-        full_packet.extend_from_slice(&payload);
-        full_packet.extend_from_slice(&tag);
+        let mut payload_buf = BytesMut::with_capacity(32);
+        payload_buf.put_u8(0x01); // Stream frame
+        payload_buf.put_u32(stream_id);
+        payload_buf.put_u64(start_offset);
+        payload_buf.put_u16(data.len() as u16);
         
-        let mut mutable_packet: Vec<u8> = full_packet.to_vec();
-        if let Some(offset) = PacketHeader::get_pn_offset(&mutable_packet) {
-            crypto.apply_header_protection(&mut mutable_packet, offset)?;
-        }
-        let frozen_packet = Bytes::from(mutable_packet.clone());
+        let mut combined_payload = BytesMut::with_capacity(payload_buf.len() + data.len());
+        combined_payload.put_slice(&payload_buf);
+        combined_payload.put_slice(&data);
+        
+        let crypto = self.state.crypto.as_ref().ok_or(ZtError::Unauthorized)?;
+        let tag = crypto.encrypt_in_place(pn, &header_buf, &mut combined_payload)?;
 
-        if let Err(e) = self.socket.try_send_to(&mutable_packet, self.state.addr) {
-            tracing::debug!("Failed to send: {}", e);
+        if let Some(offset) = PacketHeader::get_pn_offset(&header_buf) {
+            crypto.apply_header_protection(&mut header_buf, &combined_payload, offset)?;
         }
 
-        self.state.unacked_packets.insert(pn, (frozen_packet, std::time::Instant::now(), 0, stream_id, start_offset, end_offset));
-        self.state.bytes_in_flight += data.len();
+        let frozen_header = header_buf.freeze();
+        let frozen_payload = combined_payload.freeze();
+
+        let mut full_packet = BytesMut::with_capacity(frozen_header.len() + frozen_payload.len() + 16);
+        full_packet.put_slice(&frozen_header);
+        full_packet.put_slice(&frozen_payload);
+        full_packet.put_slice(&tag);
+
+        let iov = [
+            IoSlice::new(&frozen_header),
+            IoSlice::new(&frozen_payload),
+            IoSlice::new(&tag),
+        ];
+
+        let _ = self.sendmsg_vectored(&iov);
+
+        self.state.unacked_packets.insert(pn, (full_packet.freeze(), std::time::Instant::now(), 0, stream_id, start_offset, end_offset));
+        self.state.bytes_in_flight += estimated_on_wire;
         self.state.remote_window -= data.len() as u32;
 
         Ok(())
@@ -530,11 +664,8 @@ impl ZtConnectionActor {
         }
 
         for pn in to_drop.iter() {
-            if let Some((_, _, _, _, start_offset, end_offset)) = self.state.unacked_packets.remove(pn) {
-                if end_offset != u64::MAX {
-                    let len = (end_offset - start_offset) as usize;
-                    self.state.bytes_in_flight = self.state.bytes_in_flight.saturating_sub(len);
-                }
+            if let Some((packet, _, _, _, _start_offset, _end_offset)) = self.state.unacked_packets.remove(pn) {
+                self.state.bytes_in_flight = self.state.bytes_in_flight.saturating_sub(packet.len());
                 tracing::warn!("Packet {} dropped after exceeding max retries", pn);
             }
         }
@@ -548,18 +679,17 @@ impl ZtConnectionActor {
         }
 
         for packet in to_send {
-            if let Err(e) = self.socket.try_send_to(&packet, self.state.addr) {
-                tracing::debug!("Failed to send retransmit: {}", e);
-            }
+            let _ = self.sendmsg_vectored(&[IoSlice::new(&packet)]);
         }
 
         Ok(())
     }
+    
     fn initiate_close(&mut self) -> Result<()> {
-        self.state.streams.clear(); // Drop streams to signal EOF to app consumers
+        self.state.streams.clear(); 
         self.state.state = ConnectionState::Closing;
         let pn = self.state.get_next_packet_number()?;
-        self.check_key_rotation(pn);
+        let key_phase = self.check_key_rotation(pn, true);
 
         let header = PacketHeader {
             p_type: PacketType::Close,
@@ -568,38 +698,43 @@ impl ZtConnectionActor {
             dcid: self.state.dcid.clone(),
             scid: vec![],
             packet_number: pn,
-            window_size: self.state.local_window,
-            stream_id: 0,
-            offset: 0,
-            acked_pn: 0,
+            key_phase,
         };
-        let mut buf = BytesMut::with_capacity(64);
-        header.encode(&mut buf);
-        let header_bytes = buf.freeze();
+        let mut packet = BytesMut::with_capacity(128);
+        header.encode(&mut packet);
+        let header_len = packet.len();
 
-        let mut payload = vec![0u8; 16];
+        let frame = Frame::ConnectionClose;
+        frame.encode(&mut packet);
+        let payload_len = packet.len() - header_len;
+
+        packet.put_bytes(0, 16);
         let crypto = self.state.crypto.as_ref().ok_or(ZtError::Unauthorized)?;
-        let tag = crypto.encrypt_in_place(pn, &header_bytes, &mut payload)?;
-
-        let mut full_packet = BytesMut::from(&header_bytes[..]);
-        full_packet.extend_from_slice(&payload);
-        full_packet.extend_from_slice(&tag);
         
-        let mut mutable_packet: Vec<u8> = full_packet.to_vec();
-        if let Some(offset) = PacketHeader::get_pn_offset(&mutable_packet) {
-            crypto.apply_header_protection(&mut mutable_packet, offset)?;
+        {
+            let packet_slice = packet.as_mut();
+            let (aad, rest) = packet_slice.split_at_mut(header_len);
+            let (payload, tag_space) = rest.split_at_mut(payload_len);
+            let tag = crypto.encrypt_in_place(pn, aad, payload)?;
+            tag_space.copy_from_slice(&tag);
         }
-        let frozen = Bytes::from(mutable_packet.clone());
 
-        if let Err(e) = self.socket.try_send_to(&mutable_packet, self.state.addr) {
-            tracing::debug!("Failed to send: {}", e);
+        let packet_slice = packet.as_mut();
+        if let Some(offset) = PacketHeader::get_pn_offset(packet_slice) {
+            let (header_part, payload_part) = packet_slice.split_at_mut(header_len);
+            crypto.apply_header_protection(header_part, payload_part, offset)?;
         }
+        let frozen = packet.freeze();
+
+        let _ = self.sendmsg_vectored(&[IoSlice::new(&frozen)]);
         
+        let close_len = frozen.len();
         self.state.unacked_packets.insert(pn, (frozen, std::time::Instant::now(), 0, 0, u64::MAX, u64::MAX));
+        self.state.bytes_in_flight += close_len;
         Ok(())
     }
 
-    fn send_initial_packet(&mut self) -> Result<()> {
+    fn send_initial_packet(&mut self, cookie: Option<Bytes>) -> Result<()> {
         let pn = self.state.get_next_packet_number()?;
         let header = PacketHeader {
             p_type: PacketType::Initial,
@@ -608,37 +743,86 @@ impl ZtConnectionActor {
             dcid: self.state.dcid.clone(),
             scid: self.state.scid.clone(),
             packet_number: pn,
-            window_size: self.state.local_window,
-            stream_id: 0,
-            offset: 0,
-            acked_pn: 0,
+            key_phase: false,
         };
 
-        // Enforce 1200 padding for initial
-        let mut buf = BytesMut::with_capacity(1200);
-        header.encode(&mut buf);
-        buf.extend_from_slice(self.public_key.as_bytes());
+        let mut packet = BytesMut::with_capacity(1200);
+        header.encode(&mut packet);
+        let header_len = packet.len();
+        
+        let frame = Frame::Handshake {
+            public_key: *self.public_key.as_bytes(),
+            ed_public_key: *self.ed_public_key.as_bytes(),
+            signature: self.ed_signing_key.sign(self.public_key.as_bytes()).to_bytes(),
+        };
+        frame.encode(&mut packet);
 
-        while buf.len() < 1200 {
-            buf.put_u8(0);
+        if let Some(cookie) = cookie {
+            Frame::Cookie { cookie }.encode(&mut packet);
+        }
+        
+        // Pad to 1200
+        let padding_len = 1200usize.saturating_sub(packet.len() + 16);
+        if padding_len > 0 {
+            let pad_frame = Frame::Padding(padding_len);
+            pad_frame.encode(&mut packet);
+        }
+        
+        let total_payload_len = packet.len() - header_len;
+        packet.put_bytes(0, 16);
+
+        let crypto = crate::crypto::CryptoContext::initial(&self.state.dcid, true);
+        {
+            let packet_slice = packet.as_mut();
+            let (aad, rest) = packet_slice.split_at_mut(header_len);
+            let (payload, tag_space) = rest.split_at_mut(total_payload_len);
+            let tag = crypto.encrypt_in_place(pn, aad, payload)?;
+            tag_space.copy_from_slice(&tag);
         }
 
-        let mut mutable_packet = buf.to_vec();
-        if let Some(offset) = PacketHeader::get_pn_offset(&mutable_packet) {
-            let crypto = crate::crypto::CryptoContext::initial(&self.state.dcid);
-            crypto.apply_header_protection(&mut mutable_packet, offset)?;
+        let packet_slice = packet.as_mut();
+        if let Some(offset) = PacketHeader::get_pn_offset(packet_slice) {
+            let (header_part, payload_part) = packet_slice.split_at_mut(header_len);
+            crypto.apply_header_protection(header_part, payload_part, offset)?;
         }
 
-        if let Err(e) = self.socket.try_send_to(&mutable_packet, self.state.addr) {
-            tracing::debug!("Failed to send: {}", e);
-        }
+        let _ = self.sendmsg_vectored(&[IoSlice::new(packet_slice)]);
         Ok(())
     }
 
-    fn handle_handshake_response(&mut self, header: PacketHeader, payload: Bytes, _aad: &[u8], addr: SocketAddr) -> Result<()> {
-        if payload.len() < 32 { return Ok(()); }
-        let mut pk_bytes = [0u8; 32];
-        pk_bytes.copy_from_slice(&payload[..32]);
+    fn handle_handshake_response(&mut self, header: PacketHeader, mut payload: Bytes, aad: &[u8], addr: SocketAddr) -> Result<()> {
+        let crypto = crate::crypto::CryptoContext::initial(&header.dcid, true);
+        if payload.len() < 16 { return Ok(()); }
+        let tag_bytes = payload.split_off(payload.len() - 16);
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&tag_bytes);
+        let mut payload_mut = payload.to_vec();
+        crypto.decrypt_in_place(header.packet_number, aad, &mut payload_mut, &tag, false)?;
+        
+        let mut payload_bytes = Bytes::from(payload_mut);
+        let mut handshake = None;
+
+        while payload_bytes.remaining() > 0 {
+            match Frame::decode(&mut payload_bytes) {
+                Ok(Frame::Handshake { public_key, ed_public_key, signature }) => {
+                    handshake = Some((public_key, ed_public_key, signature));
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        let Some((pk_bytes, remote_ed_pk_bytes, remote_sig_bytes)) = handshake else {
+            return Ok(());
+        };
+
+        let remote_ed_pk = VerifyingKey::from_bytes(&remote_ed_pk_bytes)
+            .map_err(|_| ZtError::Crypto("Invalid Ed25519 Public Key".into()))?;
+        let remote_sig = Signature::from_bytes(&remote_sig_bytes);
+        
+        remote_ed_pk.verify(&pk_bytes, &remote_sig)
+            .map_err(|_| ZtError::Crypto("Invalid Handshake Signature".into()))?;
+
 
         let shared = crate::crypto::CryptoContext::compute_shared_secret(
             self.static_secret.clone(),
@@ -646,7 +830,7 @@ impl ZtConnectionActor {
         );
         self.state.dcid = header.scid.clone();
         self.state.crypto = Some(crate::crypto::CryptoContext::from_shared_secret(
-            shared, &self.state.scid, &self.state.dcid, self.psk,
+            shared, &self.state.scid, &self.state.dcid, self.psk, true,
         ));
         self.state.addr = addr;
         self.state.state = ConnectionState::Active;
@@ -657,33 +841,7 @@ impl ZtConnectionActor {
         Ok(())
     }
     
-    fn handle_retry_packet(&mut self, header: PacketHeader, payload: Bytes, _addr: SocketAddr) -> Result<()> {
-        let pn = self.state.get_next_packet_number()?;
-        let init_header = PacketHeader {
-            p_type: PacketType::Initial,
-            is_long: true,
-            version: 1,
-            dcid: header.scid.clone(),
-            scid: self.state.scid.clone(),
-            packet_number: pn,
-            window_size: self.state.local_window,
-            stream_id: 0,
-            offset: 0,
-            acked_pn: 0,
-        };
-
-        let mut buf = BytesMut::with_capacity(1200);
-        init_header.encode(&mut buf);
-        buf.extend_from_slice(self.public_key.as_bytes());
-        buf.extend_from_slice(&payload); 
-
-        while buf.len() < 1200 {
-            buf.put_u8(0);
-        }
-
-        if let Err(e) = self.socket.try_send_to(&buf, self.state.addr) {
-            tracing::debug!("Failed to send: {}", e);
-        }
-        Ok(())
+    fn handle_retry_packet(&mut self, _header: PacketHeader, payload: Bytes, _addr: SocketAddr) -> Result<()> {
+        self.send_initial_packet(Some(payload))
     }
 }

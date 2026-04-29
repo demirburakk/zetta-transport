@@ -955,7 +955,7 @@ dependencies = [
 
 [[package]]
 name = "zetta-transport"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bytes",
  "chacha20 0.10.0",
@@ -963,6 +963,7 @@ dependencies = [
  "dashmap",
  "ed25519-dalek",
  "futures-util",
+ "libc",
  "rand",
  "sha2",
  "thiserror",
