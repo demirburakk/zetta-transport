@@ -397,7 +397,7 @@ impl ZtEndpoint {
 
         let mut buf = BytesMut::with_capacity(128);
         retry_header.encode(&mut buf);
-        let header_len = buf.len();
+        let _header_len = buf.len();
         buf.extend_from_slice(cookie);
 
         let mut buf_vec = buf.to_vec();

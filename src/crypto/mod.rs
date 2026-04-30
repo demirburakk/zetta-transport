@@ -1,6 +1,6 @@
 use crate::error::{Result, ZtError};
 use chacha20::ChaCha20;
-use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
     aead::{AeadInPlace, KeyInit},
