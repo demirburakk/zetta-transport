@@ -23,9 +23,17 @@ pub enum ZtError {
     #[error("Unauthorized access")]
     Unauthorized,
 
-    /// Generic catch-all error for unknown issues.
-    #[error("Unknown error")]
-    Unknown,
+    /// Packet number overflowed its bounds.
+    #[error("Packet number overflow")]
+    PacketNumberOverflow,
+
+    /// Connection ID allocation failed/exhausted.
+    #[error("Connection ID exhausted")]
+    ConnectionIdExhausted,
+
+    /// Actor task failed or channel closed.
+    #[error("Actor task failed")]
+    ActorFailed,
 }
 
 /// A specialized Result type for ZettaTransport operations.

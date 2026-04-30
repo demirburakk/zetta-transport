@@ -4,8 +4,8 @@ use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Notify};
 use std::time::{Duration, Instant};
+use tokio::sync::{Notify, mpsc};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConnectionState {
@@ -18,8 +18,8 @@ pub enum ConnectionState {
 pub struct StreamState {
     pub expected_rx_offset: u64,
     pub next_tx_offset: u64,
-    pub ring_buffer: Box<[u8]>,
-    pub received_ranges: Vec<(u64, u64)>,
+    pub ring_buffer: Option<Box<[u8]>>,
+    pub received_ranges: BTreeMap<u64, u64>, // start -> end
     pub window_size: u64,
     pub buffered_bytes: usize,
     pub window_opened: Arc<Notify>,
@@ -34,8 +34,8 @@ impl StreamState {
         Self {
             expected_rx_offset: 0,
             next_tx_offset: 0,
-            ring_buffer: vec![0u8; 1024 * 1024].into_boxed_slice(),
-            received_ranges: Vec::new(),
+            ring_buffer: None, // Lazy allocation
+            received_ranges: BTreeMap::new(),
             window_size: 1024 * 1024,
             buffered_bytes: 0,
             window_opened,
@@ -45,6 +45,23 @@ impl StreamState {
             unacked_pns: BTreeMap::new(),
         }
     }
+
+    pub fn ensure_buffer(&mut self) -> &mut [u8] {
+        if self.ring_buffer.is_none() {
+            self.ring_buffer = Some(vec![0u8; self.window_size as usize].into_boxed_slice());
+        }
+        self.ring_buffer.as_mut().unwrap()
+    }
+}
+
+pub struct UnackedPacket {
+    pub data: Bytes,
+    pub sent_at: Instant,
+    pub retries: u32,
+    pub stream_id: u32,
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub is_mtu_probe: bool,
 }
 
 pub struct ZtConnection {
@@ -58,11 +75,12 @@ pub struct ZtConnection {
 
     pub streams: HashMap<u32, StreamState>,
     pub mtu_probes: HashMap<u64, usize>,
-    
-    pub unacked_packets: HashMap<u64, (Bytes, Instant, u32, u32, u64, u64)>, 
-    
+
+    pub unacked_packets: BTreeMap<u64, UnackedPacket>,
+
     pub rtt: Duration,
     pub rttvar: Duration,
+    pub rtt_initialized: bool,
     pub local_window: u32,
     pub remote_window: u32,
 
@@ -70,16 +88,18 @@ pub struct ZtConnection {
     pub ssthresh: usize,
     pub bytes_in_flight: usize,
     pub mtu: usize,
-    pub highest_processed_pn: u64,
+    pub highest_processed_pn: Option<u64>,
     pub bytes_received: usize,
     pub bytes_sent: usize,
 
-    pub replay_bitmask: u64,
+    pub replay_bitmask: u128,
 
     pub current_key_epoch: u64,
 }
 
 impl ZtConnection {
+    // Maximum concurrent streams allowed. With 1MB window_size, this limits total
+    // stream buffer memory to ~100MB max per connection.
     pub const MAX_CONCURRENT_STREAMS: usize = 100;
 
     pub fn new(addr: SocketAddr, scid: Vec<u8>, dcid: Vec<u8>) -> Self {
@@ -91,22 +111,23 @@ impl ZtConnection {
             next_packet_number: 0,
             last_activity: Instant::now(),
             crypto: None,
-            
+
             streams: HashMap::new(),
             mtu_probes: HashMap::new(),
-            unacked_packets: HashMap::new(),
-            
-            rtt: Duration::from_millis(100),
-            rttvar: Duration::from_millis(0),
+            unacked_packets: BTreeMap::new(),
+
+            rtt: Duration::from_millis(333),
+            rttvar: Duration::from_millis(166),
+            rtt_initialized: false,
 
             local_window: 1024 * 1024,
             remote_window: 1024 * 1024,
 
-            cwnd: 10 * 1200, 
+            cwnd: 10 * 1200,
             ssthresh: 64 * 1024,
             bytes_in_flight: 0,
             mtu: 1200,
-            highest_processed_pn: 0,
+            highest_processed_pn: None,
             bytes_received: 0,
             bytes_sent: 0,
 
@@ -117,9 +138,12 @@ impl ZtConnection {
     }
 
     pub fn is_replay(&self, pn: u64) -> bool {
-        if pn <= self.highest_processed_pn {
-            let diff = self.highest_processed_pn - pn;
-            if diff >= 64 {
+        let Some(highest) = self.highest_processed_pn else {
+            return false;
+        };
+        if pn <= highest {
+            let diff = highest - pn;
+            if diff >= 128 {
                 return true;
             }
             return (self.replay_bitmask & (1 << diff)) != 0;
@@ -128,25 +152,69 @@ impl ZtConnection {
     }
 
     pub fn mark_processed(&mut self, pn: u64) {
-        if pn > self.highest_processed_pn {
-            let diff = pn - self.highest_processed_pn;
-            if diff >= 64 {
+        let Some(highest) = self.highest_processed_pn else {
+            self.highest_processed_pn = Some(pn);
+            self.replay_bitmask = 1;
+            return;
+        };
+
+        if pn > highest {
+            let diff = pn - highest;
+            if diff >= 128 {
                 self.replay_bitmask = 1;
             } else {
                 self.replay_bitmask = (self.replay_bitmask << diff) | 1;
             }
-            self.highest_processed_pn = pn;
+            self.highest_processed_pn = Some(pn);
         } else {
-            let diff = self.highest_processed_pn - pn;
-            if diff < 64 {
+            let diff = highest - pn;
+            if diff < 128 {
                 self.replay_bitmask |= 1 << diff;
             }
         }
     }
 
+    pub fn get_ack_ranges(&self) -> Vec<(u64, u64)> {
+        let Some(highest) = self.highest_processed_pn else {
+            return vec![];
+        };
+        let mut ranges = Vec::new();
+
+        let mut in_range = false;
+        let mut current_end = 0;
+
+        for i in 1..128 {
+            if highest < i {
+                break;
+            }
+            let pn = highest - i;
+            let received = (self.replay_bitmask & (1 << i)) != 0;
+
+            if received {
+                if !in_range {
+                    in_range = true;
+                    current_end = pn;
+                }
+            } else {
+                if in_range {
+                    ranges.push((pn + 1, current_end));
+                    in_range = false;
+                }
+            }
+        }
+        if in_range {
+            let lowest_checked = highest.saturating_sub(127);
+            ranges.push((lowest_checked, current_end));
+        }
+
+        ranges
+    }
     pub fn get_next_packet_number(&mut self) -> Result<u64> {
         let n = self.next_packet_number;
-        self.next_packet_number = self.next_packet_number.checked_add(1).ok_or(ZtError::Unknown)?;
+        self.next_packet_number = self
+            .next_packet_number
+            .checked_add(1)
+            .ok_or(ZtError::PacketNumberOverflow)?;
         Ok(n)
     }
 
@@ -154,43 +222,59 @@ impl ZtConnection {
         self.last_activity = Instant::now();
     }
 
-    pub fn handle_ack(&mut self, largest_acked_pn: u64, window_size: u32) {
+    pub fn handle_ack(
+        &mut self,
+        largest_acked_pn: u64,
+        window_size: u32,
+        sack_ranges: &[(u64, u64)],
+    ) {
         let mut bytes_acked = 0usize;
         let mut sample_rtt = None;
 
-        // PMTUD: if any probe packet number is cumulatively acked, it's safe to upgrade.
-        let mut acked_probe_pns: Vec<u64> = self
-            .mtu_probes
-            .keys()
-            .copied()
-            .filter(|pn| *pn <= largest_acked_pn)
-            .collect();
-        acked_probe_pns.sort_unstable();
-        for pn in acked_probe_pns {
-            if let Some(probe_size) = self.mtu_probes.remove(&pn)
-                && probe_size > self.mtu
-            {
-                self.mtu = probe_size;
-                tracing::info!("MTU upgraded to {} via PMTUD", self.mtu);
+        // 1. Process SACK ranges first (Selective ACK)
+        for &(start, end) in sack_ranges {
+            let range = self
+                .unacked_packets
+                .range(start..=end)
+                .map(|(&pn, _)| pn)
+                .collect::<Vec<_>>();
+            for pn in range {
+                if let Some(up) = self.unacked_packets.remove(&pn) {
+                    bytes_acked += up.data.len();
+                    if up.retries == 0 && sample_rtt.is_none() {
+                        sample_rtt = Some(up.sent_at.elapsed());
+                    }
+                    if up.is_mtu_probe
+                        && self.mtu_probes.remove(&pn).is_some()
+                        && up.data.len() > self.mtu
+                    {
+                        self.mtu = up.data.len();
+                        tracing::info!("MTU upgraded to {} via SACK'd PMTUD", self.mtu);
+                    }
+                }
             }
         }
 
-        // Cumulative ACK by packet number: remove all unacked packets up to largest_acked_pn.
-        let mut acked_pns: Vec<u64> = self
+        // 2. Process cumulative ACK (everything <= largest_acked_pn)
+        let acked_pns: Vec<u64> = self
             .unacked_packets
             .keys()
             .copied()
-            .filter(|pn| *pn <= largest_acked_pn)
+            .take_while(|&pn| pn <= largest_acked_pn)
             .collect();
-        acked_pns.sort_unstable();
 
         for pn in acked_pns {
-            if let Some((packet, sent_time, retries, _stream_id, _start_offset, _end_offset)) =
-                self.unacked_packets.remove(&pn)
-            {
-                bytes_acked += packet.len();
-                if retries == 0 && sample_rtt.is_none() {
-                    sample_rtt = Some(sent_time.elapsed());
+            if let Some(up) = self.unacked_packets.remove(&pn) {
+                bytes_acked += up.data.len();
+                if up.retries == 0 && sample_rtt.is_none() {
+                    sample_rtt = Some(up.sent_at.elapsed());
+                }
+                if up.is_mtu_probe
+                    && self.mtu_probes.remove(&pn).is_some()
+                    && up.data.len() > self.mtu
+                {
+                    self.mtu = up.data.len();
+                    tracing::info!("MTU upgraded to {} via PMTUD", self.mtu);
                 }
             }
         }
@@ -198,9 +282,10 @@ impl ZtConnection {
         self.bytes_in_flight = self.bytes_in_flight.saturating_sub(bytes_acked);
 
         if let Some(rtt) = sample_rtt {
-            if self.rtt == Duration::from_millis(100) && self.rttvar == Duration::from_millis(0) {
+            if !self.rtt_initialized {
                 self.rtt = rtt;
                 self.rttvar = rtt / 2;
+                self.rtt_initialized = true;
             } else {
                 let error = self.rtt.abs_diff(rtt);
                 self.rttvar = (self.rttvar * 3 + error) / 4;
@@ -218,7 +303,6 @@ impl ZtConnection {
 
         self.remote_window = window_size;
 
-        // Unblock senders that are waiting on flow/cwnd to open.
         for stream in self.streams.values() {
             stream.window_opened.notify_waiters();
         }

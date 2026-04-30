@@ -2,9 +2,9 @@
 //!
 //! **An Experimental, Multiplexed UDP-Based Transport Protocol**
 //!
-//! > **Note:** ZettaTransport is primarily a **hobby and learning project**. It is an 
-//! > experimental playground for exploring network protocol design, congestion control, 
-//! > multiplexing, and cryptographic transport. It is **not** intended for mission-critical 
+//! > **Note:** ZettaTransport is primarily a **hobby and learning project**. It is an
+//! > experimental playground for exploring network protocol design, congestion control,
+//! > multiplexing, and cryptographic transport. It is **not** intended for mission-critical
 //! > or production use.
 //!
 //! ZettaTransport is a research-oriented transport protocol built in Rust. It operates
@@ -37,11 +37,13 @@
 //!     let server = ZtEndpoint::bind("127.0.0.1:8080", None).await?;
 //!     
 //!     // Listen for incoming connections
-//!     while let Some(mut stream) = server.accept().await {
+//!     while let Some(mut conn) = server.accept().await {
 //!         tokio::spawn(async move {
-//!             while let Some(data) = stream.recv().await {
-//!                 println!("Received: {:?}", String::from_utf8_lossy(&data));
-//!                 let _ = stream.send(b"ACK").await;
+//!             while let Some(mut stream) = conn.accept_stream().await {
+//!                 while let Some(data) = stream.recv().await {
+//!                     println!("Received: {:?}", String::from_utf8_lossy(&data));
+//!                     let _ = stream.send(b"ACK").await;
+//!                 }
 //!             }
 //!         });
 //!     }
@@ -61,7 +63,8 @@
 //!     
 //!     // Connect to the remote server
 //!     let target = "127.0.0.1:8080".parse()?;
-//!     let mut stream = client.connect(target).await?;
+//!     let mut conn = client.connect(target).await?;
+//!     let mut stream = conn.accept_stream().await.unwrap();
 //!     
 //!     // Send data reliably over the multiplexed stream
 //!     stream.send(b"Hello Zetta!").await?;
@@ -75,3 +78,4 @@ pub mod error;
 pub mod protocol;
 pub mod stream;
 pub mod transport;
+pub mod util;

@@ -14,10 +14,12 @@ async fn echo_roundtrip_large_payload() {
     tokio::spawn({
         let server = server.clone();
         async move {
-            if let Some(mut stream) = server.accept().await {
-                while let Some(data) = stream.recv().await {
-                    // Echo what we got.
-                    let _ = stream.send(&data).await;
+            if let Some(mut conn) = server.accept().await {
+                if let Some(mut stream) = conn.accept_stream().await {
+                    while let Some(data) = stream.recv().await {
+                        // Echo what we got.
+                        let _ = stream.send(&data).await;
+                    }
                 }
             }
         }
@@ -27,10 +29,11 @@ async fn echo_roundtrip_large_payload() {
         .await
         .expect("client bind");
 
-    let mut stream = client
-        .connect(server_addr)
-        .await
-        .expect("client connect");
+    let mut conn = client.connect(server_addr).await.expect("client connect");
+
+    // The stream is pre-allocated by the client locally. We could call `open_stream()`
+    // to match normal flow, or wait for stream 0. Since `connect` emits stream 0 internally:
+    let mut stream = conn.accept_stream().await.expect("stream 0");
 
     // Large enough to exercise backpressure and cumulative ACK handling.
     let payload = vec![0x42u8; 200 * 1024];

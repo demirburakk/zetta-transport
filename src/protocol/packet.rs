@@ -3,6 +3,9 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 pub const MAX_PACKET_SIZE: usize = 1450;
 
+/// Packet types for ZettaTransport.
+/// Note: Packet types and Frame types exist in separate namespaces.
+/// E.g., PacketType::MtuProbe (0x06) is distinct from Frame::StreamClose (0x06).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PacketType {
     Initial = 0x00,
@@ -26,20 +29,28 @@ pub struct PacketHeader {
 
 impl PacketHeader {
     pub fn get_pn_offset(data: &[u8]) -> Option<usize> {
-        if data.is_empty() { return None; }
+        if data.is_empty() {
+            return None;
+        }
         let is_long = (data[0] & 0x80) != 0;
         if is_long {
             let mut offset = 6;
-            if data.len() < offset { return None; }
+            if data.len() < offset {
+                return None;
+            }
             let dcid_len = data[5] as usize;
             offset += dcid_len;
-            if data.len() < offset + 1 { return None; }
+            if data.len() < offset + 1 {
+                return None;
+            }
             let scid_len = data[offset] as usize;
             offset += 1 + scid_len;
             Some(offset)
         } else {
             let mut offset = 2;
-            if data.len() < offset { return None; }
+            if data.len() < offset {
+                return None;
+            }
             let dcid_len = data[1] as usize;
             offset += dcid_len;
             Some(offset)
@@ -75,7 +86,7 @@ impl PacketHeader {
 
         let first_byte = src.get_u8();
         let is_long = (first_byte & 0x80) != 0;
-        
+
         if is_long {
             let p_type_val = first_byte & 0x0F;
             let p_type = match p_type_val {
