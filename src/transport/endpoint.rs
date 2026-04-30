@@ -18,17 +18,20 @@ use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 type HmacSha256 = Hmac<Sha256>;
+/// Type alias for the optional peer key verification callback.
+pub type PeerKeyVerifier = Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>;
 
 pub struct ZtEndpoint {
     pub(crate) socket: Arc<UdpSocket>,
     pub(crate) routing_table: Arc<DashMap<Vec<u8>, mpsc::Sender<ActorMessage>>>,
     pub(crate) static_secret: StaticSecret,
     pub public_key: PublicKey,
-    pub ed_signing_key: SigningKey,
+    // Signing key must stay private; only the verifying key is shared.
+    pub(crate) ed_signing_key: SigningKey,
     pub ed_public_key: VerifyingKey,
-    pub psk: Option<[u8; 32]>,
-    pub cookie_key: [u8; 32],
-    pub verify_peer_key: Option<Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>>,
+    pub(crate) psk: Option<[u8; 32]>,
+    pub(crate) cookie_key: [u8; 32],
+    pub verify_peer_key: Option<PeerKeyVerifier>,
     handshake_semaphore: Arc<Semaphore>,
 
     incoming_rx: Mutex<mpsc::Receiver<ZtConnectionHandle>>,
@@ -208,10 +211,10 @@ impl ZtEndpoint {
                 .verify(&pk_bytes, &remote_sig)
                 .map_err(|_| ZtError::Crypto("Invalid Handshake Signature".into()))?;
 
-            if let Some(verifier) = &self.verify_peer_key {
-                if !verifier(&remote_ed_pk_bytes) {
-                    return Err(ZtError::Unauthorized);
-                }
+            if let Some(verifier) = &self.verify_peer_key
+                && !verifier(&remote_ed_pk_bytes)
+            {
+                return Err(ZtError::Unauthorized);
             }
 
             let shared = CryptoContext::compute_shared_secret(
@@ -382,32 +385,32 @@ impl ZtEndpoint {
         &self,
         addr: SocketAddr,
         client_scid: &[u8],
-        packet_number: u64,
+        _packet_number: u64,
         cookie: &[u8; 40],
     ) -> Result<()> {
+        // Retry packets carry a plaintext (HMAC-authenticated) token and have
+        // no encrypted payload, so applying header protection would use the
+        // cookie bytes as the "sample" — producing garbage output and wasting
+        // CPU.  Skip HP for Retry; integrity is provided by the HMAC in the
+        // cookie itself.
         let retry_header = PacketHeader {
             p_type: PacketType::Retry,
             is_long: true,
             version: 1,
             dcid: client_scid.to_vec(),
             scid: vec![],
-            packet_number,
+            // Retry packets do not carry a meaningful packet number on wire;
+            // encode 0 to minimise confusion.
+            packet_number: 0,
             key_phase: false,
         };
 
         let mut buf = BytesMut::with_capacity(128);
         retry_header.encode(&mut buf);
-        let _header_len = buf.len();
         buf.extend_from_slice(cookie);
 
-        let mut buf_vec = buf.to_vec();
-        if let Some(offset) = PacketHeader::get_pn_offset(&buf_vec) {
-            let crypto = CryptoContext::initial(client_scid, false);
-            crypto.apply_header_protection(&mut buf_vec, offset)?;
-        }
-
-        if let Err(e) = self.socket.try_send_to(&buf_vec, addr) {
-            tracing::debug!("Failed to send: {}", e);
+        if let Err(e) = self.socket.try_send_to(&buf, addr) {
+            tracing::debug!("Failed to send retry: {}", e);
         }
         Ok(())
     }
@@ -438,8 +441,7 @@ impl ZtEndpoint {
             })
             .await
             .map_err(|e| {
-                ZtError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                ZtError::Io(std::io::Error::other(
                     format!("Actor send failed: {}", e),
                 ))
             })?;
@@ -476,8 +478,15 @@ impl ZtEndpoint {
         Ok(())
     }
 
+    /// Accepts an incoming connection.
+    ///
+    /// This method holds the `Mutex` lock for the lifetime of the `recv()`
+    /// call (i.e. until a connection arrives). Calling `accept()` from
+    /// multiple tasks is safe and sequential — each call will queue behind
+    /// the previous holder. Previously this used `try_lock`, which silently
+    /// dropped connections when two tasks raced.
     pub async fn accept(&self) -> Option<ZtConnectionHandle> {
-        let mut rx = self.incoming_rx.try_lock().ok()?;
+        let mut rx = self.incoming_rx.lock().await;
         rx.recv().await
     }
 
@@ -488,7 +497,11 @@ impl ZtEndpoint {
     pub async fn connect(self: &Arc<Self>, addr: SocketAddr) -> Result<ZtConnectionHandle> {
         let mut scid = vec![0u8; 8];
         rand::thread_rng().fill(&mut scid[..]);
-        let dcid = vec![0u8; 8];
+        // Use a random DCID instead of all-zeros so the server can distinguish
+        // multiple simultaneous Initial packets from the same client and route
+        // them correctly before the handshake completes.
+        let mut dcid = vec![0u8; 8];
+        rand::thread_rng().fill(&mut dcid[..]);
 
         let mut conn = ZtConnection::new(addr, scid.clone(), dcid);
         conn.bytes_received = 1000000; // Client is not subject to amplification limits

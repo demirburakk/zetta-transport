@@ -180,28 +180,33 @@ impl ZtConnection {
         };
         let mut ranges = Vec::new();
 
-        let mut in_range = false;
-        let mut current_end = 0;
+        // Bit 0 represents `highest` itself (always received, since we set it
+        // in mark_processed). Seed the scan in an open range starting at
+        // `highest` so contiguous runs are merged correctly.
+        let mut in_range = true; // highest is always received
+        let mut current_end = highest;
 
-        for i in 1..128 {
+        for i in 1..128u64 {
             if highest < i {
                 break;
             }
             let pn = highest - i;
-            let received = (self.replay_bitmask & (1 << i)) != 0;
+            // Bit `i` = 1 means packet `pn` was received.
+            let received = (self.replay_bitmask & (1u128 << i)) != 0;
 
             if received {
                 if !in_range {
                     in_range = true;
                     current_end = pn;
                 }
-            } else {
-                if in_range {
-                    ranges.push((pn + 1, current_end));
-                    in_range = false;
-                }
+            } else if in_range {
+                // Gap found: close the current range [pn+1 .. current_end].
+                ranges.push((pn + 1, current_end));
+                in_range = false;
             }
         }
+
+        // Close any range still open at the boundary of the bitmask.
         if in_range {
             let lowest_checked = highest.saturating_sub(127);
             ranges.push((lowest_checked, current_end));

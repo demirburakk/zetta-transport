@@ -68,18 +68,22 @@ impl ZtStream {
     }
 
     /// Sends a payload reliably to the remote peer.
-    /// Automatically handles backpressure if the congestion or flow window is full
-    /// by yielding execution until space becomes available.
+    ///
+    /// Automatically handles backpressure: if the peer's flow-control window
+    /// (`FlowControlBlocked`) or the local congestion window
+    /// (`CongestionWindowFull`) is exhausted, the call yields until the
+    /// respective window opens and then retries the chunk.
     pub async fn send(&self, data: &[u8]) -> Result<()> {
         let mtu = self.endpoint.get_mtu(&self.cid).await;
-        let chunk_size = mtu.saturating_sub(64).max(512); // Safe payload size accounting for UDP/IP/ZT headers
+        let chunk_size = mtu.saturating_sub(64).max(512);
         for chunk in data.chunks(chunk_size) {
             loop {
                 match self.endpoint.send(&self.cid, self.stream_id, chunk).await {
                     Ok(_) => break,
-                    Err(crate::error::ZtError::Io(ref e))
-                        if e.kind() == std::io::ErrorKind::WouldBlock =>
-                    {
+                    Err(crate::error::ZtError::FlowControlBlocked)
+                    | Err(crate::error::ZtError::CongestionWindowFull) => {
+                        // Wait until either the peer opens its window (ACK
+                        // received) or the congestion window grows.
                         self.window_opened.notified().await;
                     }
                     Err(e) => return Err(e),
@@ -88,6 +92,7 @@ impl ZtStream {
         }
         Ok(())
     }
+
 
     /// Receives a decrypted, in-order chunk of data from the remote peer.
     /// Returns `None` if the stream is closed.

@@ -34,6 +34,20 @@ pub enum ZtError {
     /// Actor task failed or channel closed.
     #[error("Actor task failed")]
     ActorFailed,
+
+    /// Send was blocked because the peer's flow control window is full.
+    /// The caller should retry after the window opens.
+    #[error("Flow control window is full")]
+    FlowControlBlocked,
+
+    /// Send was blocked because the local congestion window is full.
+    /// The caller should retry after in-flight bytes decrease.
+    #[error("Congestion window is full")]
+    CongestionWindowFull,
+
+    /// The connection has reached its maximum number of concurrent streams.
+    #[error("Too many concurrent streams (limit: {limit})")]
+    TooManyStreams { limit: usize },
 }
 
 /// A specialized Result type for ZettaTransport operations.

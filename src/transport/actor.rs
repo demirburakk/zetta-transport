@@ -158,10 +158,10 @@ impl ZtConnectionActor {
         tokio::pin!(delayed_ack_timer);
         tokio::pin!(mtu_probe_timer);
 
-        if self.state.state == ConnectionState::Handshaking {
-            if let Err(e) = self.send_initial_packet(None) {
-                tracing::warn!("Failed to send initial packet: {:?}", e);
-            }
+        if self.state.state == ConnectionState::Handshaking
+            && let Err(e) = self.send_initial_packet(None)
+        {
+            tracing::warn!("Failed to send initial packet: {:?}", e);
         }
 
         loop {
@@ -251,16 +251,14 @@ impl ZtConnectionActor {
         self.routing_table.remove(&self.scid);
     }
 
-    fn check_key_rotation(&mut self, pn: u64, _tx: bool) -> bool {
-        let epoch = pn / 16_000_000;
-        let key_phase = (epoch % 2) != 0;
-        if epoch > self.state.current_key_epoch
-            && let Some(crypto) = self.state.crypto.as_mut()
-        {
-            crypto.rotate_keys();
-            self.state.current_key_epoch = epoch;
-        }
-        key_phase
+    /// Returns the current TX key phase bit for outgoing packets.
+    ///
+    /// Key rotation is driven exclusively by receiving a packet whose key
+    /// phase bit differs from the current epoch — *not* by a packet number
+    /// threshold. Automatic PN-based rotation was removed because it caused
+    /// unsynchronised rotations and use-wrong-key decryption failures.
+    fn current_key_phase(&self) -> bool {
+        !self.state.current_key_epoch.is_multiple_of(2)
     }
 
     fn send_mtu_probe(&mut self) -> Result<()> {
@@ -279,7 +277,7 @@ impl ZtConnectionActor {
         }
 
         let pn = self.state.get_next_packet_number()?;
-        let key_phase = self.check_key_rotation(pn, true);
+        let key_phase = self.current_key_phase();
 
         let total_buffered = self.state.get_total_buffered_bytes();
         self.state.local_window = (1024u32 * 1024u32).saturating_sub(total_buffered as u32);
@@ -341,30 +339,30 @@ impl ZtConnectionActor {
         self.state.bytes_received += data.len();
         let is_short_header = !data.is_empty() && (data[0] & 0x80) == 0;
 
-        let mut mutable_data = data.to_vec(); // Still need to copy for decryption in place
-        let mut use_prev_key = false;
+        let mut mutable_data = data.to_vec();
+
+        // Phase hint from the first byte (before HP removal). We need this to
+        // select the right HP key before we can read the full header.
+        let pre_hp_key_phase = is_short_header && (data[0] & 0x40) != 0;
+        let expected_kp = !self.state.current_key_epoch.is_multiple_of(2);
+        // If phase differs from what we expect, the peer may have rotated.
+        // Try using prev HP key so we can read the header; we'll decide
+        // definitively after header decode.
+        let hp_use_prev = is_short_header && pre_hp_key_phase != expected_kp;
 
         if is_short_header {
-            let key_phase = (data[0] & 0x40) != 0;
-            let expected_kp = (self.state.current_key_epoch % 2) != 0;
-            if key_phase != expected_kp {
-                use_prev_key = true;
-            }
-
             if let Some(crypto) = self.state.crypto.as_ref() {
                 if let Some(offset) = PacketHeader::get_pn_offset(&mutable_data) {
-                    crypto.remove_header_protection(&mut mutable_data, offset, use_prev_key)?;
+                    crypto.remove_header_protection(&mut mutable_data, offset, hp_use_prev)?;
                 }
             } else {
                 return Err(ZtError::Unauthorized);
             }
-        } else {
-            if let Some(offset) = PacketHeader::get_pn_offset(&mutable_data) {
-                if let Some(dcid) = crate::util::extract_dcid_fast(&mutable_data) {
-                    let crypto = crate::crypto::CryptoContext::initial(&dcid, true);
-                    crypto.remove_header_protection(&mut mutable_data, offset, false)?;
-                }
-            }
+        } else if let Some(offset) = PacketHeader::get_pn_offset(&mutable_data)
+            && let Some(dcid) = crate::util::extract_dcid_fast(&mutable_data)
+        {
+            let crypto = crate::crypto::CryptoContext::initial(&dcid, true);
+            crypto.remove_header_protection(&mut mutable_data, offset, false)?;
         }
 
         let mut data_cursor = Bytes::from(mutable_data.clone());
@@ -378,14 +376,36 @@ impl ZtConnectionActor {
             return Ok(());
         }
 
-        let expected_kp = (self.state.current_key_epoch % 2) != 0;
+        // Determine whether to use the previous or current RX key for
+        // payload decryption, and whether this packet signals a key rotation.
+        //
+        // Rules (mirroring RFC 9001 §6.4):
+        //   - If header.key_phase == expected_kp  → current key, no rotation.
+        //   - If header.key_phase != expected_kp
+        //       AND pn >= highest_processed_pn    → peer has rotated; rotate
+        //                                           our keys and decrypt with
+        //                                           the *new* current key.
+        //       AND pn < highest_processed_pn     → stale re-order; decrypt
+        //                                           with prev key.
         let highest = self.state.highest_processed_pn.unwrap_or(0);
-        if is_short_header && header.key_phase != expected_kp && header.packet_number >= highest {
-            if let Some(crypto) = self.state.crypto.as_mut() {
-                crypto.rotate_keys();
-                self.state.current_key_epoch += 1;
+        let use_prev_key;
+        let mut rotated_this_packet = false;
+
+        if is_short_header && header.key_phase != expected_kp {
+            if header.packet_number >= highest {
+                // Peer rotated → rotate our side and decrypt with the new key.
+                if let Some(crypto) = self.state.crypto.as_mut() {
+                    crypto.rotate_keys();
+                    self.state.current_key_epoch += 1;
+                }
                 use_prev_key = false;
+                rotated_this_packet = true;
+            } else {
+                // Out-of-order packet from before the rotation → prev key.
+                use_prev_key = true;
             }
+        } else {
+            use_prev_key = false;
         }
 
         match header.p_type {
@@ -405,13 +425,25 @@ impl ZtConnectionActor {
                 let tag_idx = payload.len() - 16;
                 let tag = payload[tag_idx..].try_into().unwrap();
                 let payload_body = &mut payload[..tag_idx];
-                crypto.decrypt_in_place(
+
+                if let Err(e) = crypto.decrypt_in_place(
                     header.packet_number,
                     aad,
                     payload_body,
                     &tag,
                     use_prev_key,
-                )?;
+                ) {
+                    // If we just rotated and decryption failed, the phase
+                    // change was spurious (e.g. reordered packet). Undo.
+                    if rotated_this_packet {
+                        tracing::debug!(
+                            "Key rotation triggered by pn={} but decryption failed; \
+                             rotation will be re-applied when a valid packet arrives",
+                            header.packet_number
+                        );
+                    }
+                    return Err(e);
+                }
 
                 self.state.addr = addr;
                 self.state.mark_processed(header.packet_number);
@@ -430,10 +462,24 @@ impl ZtConnectionActor {
         }
     }
 
+
     fn handle_frame(&mut self, frame: Frame, _pn: u64) -> Result<()> {
         match frame {
             Frame::Stream { id, offset, data } => {
                 if !self.state.streams.contains_key(&id) {
+                    // Enforce the per-connection stream limit to prevent memory
+                    // exhaustion attacks (1 MB buffer per stream).
+                    if self.state.streams.len() >= ZtConnection::MAX_CONCURRENT_STREAMS {
+                        tracing::warn!(
+                            "Peer exceeded MAX_CONCURRENT_STREAMS ({}), dropping stream {}",
+                            ZtConnection::MAX_CONCURRENT_STREAMS,
+                            id
+                        );
+                        return Err(ZtError::TooManyStreams {
+                            limit: ZtConnection::MAX_CONCURRENT_STREAMS,
+                        });
+                    }
+
                     let (data_tx, data_rx) = mpsc::channel(2048);
                     let window_opened = Arc::new(Notify::new());
                     self.state
@@ -461,6 +507,22 @@ impl ZtConnectionActor {
                 if !data.is_empty() {
                     let end_offset = offset + data.len() as u64;
                     let window_size = stream.window_size;
+
+                    // Guard against silent data corruption: if the incoming
+                    // chunk is larger than the entire receive window we cannot
+                    // store it without wrapping over data we have not yet
+                    // delivered to the application.
+                    if data.len() as u64 > window_size {
+                        tracing::warn!(
+                            "Stream {} data ({} bytes) exceeds window ({} bytes), dropping",
+                            id,
+                            data.len(),
+                            window_size
+                        );
+                        self.pending_acks += 1;
+                        return Ok(());
+                    }
+
                     let buf = stream.ensure_buffer();
                     for (i, byte) in data.iter().enumerate() {
                         buf[((offset + i as u64) % window_size) as usize] = *byte;
@@ -538,7 +600,7 @@ impl ZtConnectionActor {
             return Ok(());
         }
         let pn = self.state.get_next_packet_number()?;
-        let kp = self.check_key_rotation(pn, true);
+        let kp = self.current_key_phase();
         self.state.local_window =
             (1024u32 * 1024u32).saturating_sub(self.state.get_total_buffered_bytes() as u32);
 
@@ -583,16 +645,17 @@ impl ZtConnectionActor {
     }
 
     fn process_outgoing_data(&mut self, stream_id: u32, data: Bytes) -> Result<()> {
-        if self.state.remote_window < data.len() as u32
-            || self.state.bytes_in_flight + data.len() > self.state.cwnd
-        {
-            return Err(ZtError::Io(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "Window or CWND full",
-            )));
+        // Flow control and congestion control are distinct back-pressure
+        // mechanisms and must surface as distinct errors so that callers can
+        // react correctly (e.g. ZtStream::send waits for either condition).
+        if self.state.remote_window < data.len() as u32 {
+            return Err(ZtError::FlowControlBlocked);
+        }
+        if self.state.bytes_in_flight + data.len() > self.state.cwnd {
+            return Err(ZtError::CongestionWindowFull);
         }
         let pn = self.state.get_next_packet_number()?;
-        let kp = self.check_key_rotation(pn, true);
+        let kp = self.current_key_phase();
         let header = PacketHeader {
             p_type: PacketType::Data,
             is_long: false,
@@ -676,12 +739,20 @@ impl ZtConnectionActor {
             }
         }
 
+        // Capture the total unacked count *before* removal so the fatal-timeout
+        // check below compares apples to apples. Previously this compared
+        // `to_drop.len()` against the post-removal length, which was always
+        // wrong after at least one packet was removed.
+        let total_unacked = self.state.unacked_packets.len();
+
         for pn in &to_drop {
             if let Some(up) = self.state.unacked_packets.remove(pn) {
                 self.state.bytes_in_flight =
                     self.state.bytes_in_flight.saturating_sub(up.data.len());
             }
         }
+
+        // Trigger congestion control once if any loss was detected this round.
         if !to_send.is_empty() {
             self.state.handle_loss();
             for p in to_send {
@@ -690,17 +761,19 @@ impl ZtConnectionActor {
                 }
             }
         }
-        if !self.state.unacked_packets.is_empty()
-            && to_drop.len() == self.state.unacked_packets.len()
-        {
+
+        // All packets that were ever in-flight have exceeded max retries → give
+        // up on the connection.
+        if total_unacked > 0 && to_drop.len() == total_unacked {
             return Err(ZtError::Timeout);
         }
+
         Ok(())
     }
 
     fn send_stream_close(&mut self, stream_id: u32) -> Result<()> {
         let pn = self.state.get_next_packet_number()?;
-        let kp = self.check_key_rotation(pn, true);
+        let kp = self.current_key_phase();
         let header = PacketHeader {
             p_type: PacketType::Data,
             is_long: false,
@@ -750,7 +823,7 @@ impl ZtConnectionActor {
     fn initiate_close(&mut self) -> Result<()> {
         self.state.state = ConnectionState::Closing;
         let pn = self.state.get_next_packet_number()?;
-        let kp = self.check_key_rotation(pn, true);
+        let kp = self.current_key_phase();
         let h = PacketHeader {
             p_type: PacketType::Close,
             is_long: false,
@@ -891,7 +964,10 @@ impl ZtConnectionActor {
             &self.static_secret,
             PublicKey::from(pk_bytes),
         );
-        self.state.dcid = header.scid.clone();
+
+        let old_scid = self.state.dcid.clone();
+        let new_dcid = header.scid.clone();
+        self.state.dcid = new_dcid.clone();
         self.state.crypto = Some(crate::crypto::CryptoContext::from_shared_secret(
             shared,
             &self.state.scid,
@@ -902,11 +978,33 @@ impl ZtConnectionActor {
         self.state.addr = addr;
         self.state.state = ConnectionState::Active;
         self.state.mark_processed(header.packet_number);
+
+        // The server assigned us a new SCID (its own SCID becomes our DCID).
+        // The router uses the *our* SCID as the lookup key, so this is fine
+        // as long as self.scid hasn't changed — but the server's packets now
+        // carry our SCID as their DCID, which is already what routing_table
+        // indexes. No routing_table change needed for inbound; however the
+        // old zero-filled ephemeral DCID we used during Initial is no longer
+        // relevant and we clean it up defensively.
+        if old_scid != new_dcid {
+            // If the old DCID happened to be inserted under a different key
+            // (e.g. the ephemeral zero DCID from connect()), remove it to
+            // prevent stale entries from accumulating.
+            self.routing_table.remove(&old_scid);
+            // Re-register this actor under the new DCID as well so that any
+            // future long-header packets (addressed to us via new_dcid) are
+            // routed here correctly.
+            if let Some(actor_tx) = self.routing_table.get(&self.scid) {
+                self.routing_table.insert(new_dcid, actor_tx.clone());
+            }
+        }
+
         if let Some(tx) = self.handshake_waiter.take() {
             let _ = tx.send(());
         }
         Ok(())
     }
+
 
     fn handle_retry_packet(
         &mut self,

@@ -11,12 +11,20 @@ use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
+/// Version-specific fixed salt for the Initial packet crypto context.
+/// This is public knowledge (version-pinned), which is correct: Initial
+/// packets provide only anti-spoofing, not secrecy. Both sides derive the
+/// same Initial keys deterministically so they can decode each other's
+/// un-established handshake packets.
+const INITIAL_SALT: &[u8] = b"ZettaTransport v1 InitialSalt\x00\x00\x00";
+
 pub struct CryptoContext {
     secret: [u8; 32],
-    pub tx_key: [u8; 32],
-    pub rx_key: [u8; 32],
-    pub tx_hp_key: [u8; 32],
-    pub rx_hp_key: [u8; 32],
+    // Keys are internal; access via encrypt/decrypt APIs only.
+    tx_key: [u8; 32],
+    rx_key: [u8; 32],
+    tx_hp_key: [u8; 32],
+    rx_hp_key: [u8; 32],
     tx_iv: [u8; 12],
     rx_iv: [u8; 12],
     tx_cipher: ChaCha20Poly1305,
@@ -24,7 +32,7 @@ pub struct CryptoContext {
     pub epoch: u64,
     is_client: bool,
 
-    // Fallback keys for out-of-order packets during key phase rotations
+    // Fallback keys for out-of-order packets during key phase rotations.
     prev_rx_key: Option<[u8; 32]>,
     prev_rx_hp_key: Option<[u8; 32]>,
     prev_rx_iv: Option<[u8; 12]>,
@@ -41,6 +49,8 @@ impl CryptoContext {
     ) -> Self {
         let mut ikm = Vec::with_capacity(32 + 16 + 32);
         ikm.extend_from_slice(&shared_secret);
+        // Canonicalize CID order so both sides produce the same IKM regardless
+        // of which side is "us".
         if my_scid < peer_dcid {
             ikm.extend_from_slice(my_scid);
             ikm.extend_from_slice(peer_dcid);
@@ -79,10 +89,21 @@ impl CryptoContext {
         ctx
     }
 
+    /// Creates an Initial-packet crypto context.
+    ///
+    /// Initial packets use a *version-specific static salt* (not the DCID) as
+    /// the HKDF salt, mirroring the QUIC approach (RFC 9001 §5.2).  The DCID
+    /// is included as the IKM so both endpoints arrive at the same keys while
+    /// still binding the context to this specific connection attempt.
+    ///
+    /// This means Initial keys are deterministic and **not secret** — they
+    /// provide only packet authentication (anti-spoofing), not confidentiality.
+    /// Actual confidentiality begins after the Handshake phase.
     pub fn initial(dcid: &[u8], is_client: bool) -> Self {
-        let salt = b"ZettaInitialSalt v1";
-        let (_, hk) = Hkdf::<Sha256>::extract(Some(salt), dcid);
+        // Extract: PRK = HKDF-Extract(salt=INITIAL_SALT, IKM=dcid)
+        let (_, hk) = Hkdf::<Sha256>::extract(Some(INITIAL_SALT), dcid);
         let mut secret = [0u8; 32];
+        // Expand a distinct "initial_secret" label so this PRK slot is unique.
         hk.expand(b"initial_secret", &mut secret)
             .expect("HKDF expand failed");
 
@@ -117,44 +138,58 @@ impl CryptoContext {
         my_secret.diffie_hellman(&their_public).to_bytes()
     }
 
+    /// Derives all per-direction keys from `self.secret` for the given epoch.
+    ///
+    /// The epoch number is encoded into every HKDF label so that rotating the
+    /// secret (ratchet) but keeping the same PRK by accident still produces
+    /// distinct key material across epochs.
     fn derive_keys(&mut self, epoch: u64, is_client: bool) {
         self.epoch = epoch;
         let hk = Hkdf::<Sha256>::from_prk(&self.secret).expect("Invalid PRK");
 
+        // Encode epoch into labels to prevent label collision across epochs.
+        let epoch_suffix = format!(":{epoch}");
+
+        let mk_label = |base: &str| -> Vec<u8> {
+            let mut l = base.as_bytes().to_vec();
+            l.extend_from_slice(epoch_suffix.as_bytes());
+            l
+        };
+
         let (tx_label, rx_label) = if is_client {
-            (b"client_key", b"server_key")
+            (mk_label("client_key"), mk_label("server_key"))
         } else {
-            (b"server_key", b"client_key")
+            (mk_label("server_key"), mk_label("client_key"))
         };
 
         let (tx_hp_label, rx_hp_label) = if is_client {
-            (b"client_hp", b"server_hp")
+            (mk_label("client_hp"), mk_label("server_hp"))
         } else {
-            (b"server_hp", b"client_hp")
+            (mk_label("server_hp"), mk_label("client_hp"))
         };
 
         let (tx_iv_label, rx_iv_label) = if is_client {
-            (b"client_iv", b"server_iv")
+            (mk_label("client_iv"), mk_label("server_iv"))
         } else {
-            (b"server_iv", b"client_iv")
+            (mk_label("server_iv"), mk_label("client_iv"))
         };
 
-        hk.expand(tx_label, &mut self.tx_key)
+        hk.expand(&tx_label, &mut self.tx_key)
             .expect("HKDF expand tx_key failed");
         self.tx_cipher = ChaCha20Poly1305::new(self.tx_key.as_slice().into());
 
-        hk.expand(rx_label, &mut self.rx_key)
+        hk.expand(&rx_label, &mut self.rx_key)
             .expect("HKDF expand rx_key failed");
         self.rx_cipher = ChaCha20Poly1305::new(self.rx_key.as_slice().into());
 
-        hk.expand(tx_hp_label, &mut self.tx_hp_key)
+        hk.expand(&tx_hp_label, &mut self.tx_hp_key)
             .expect("HKDF expand tx_hp failed");
-        hk.expand(rx_hp_label, &mut self.rx_hp_key)
+        hk.expand(&rx_hp_label, &mut self.rx_hp_key)
             .expect("HKDF expand rx_hp failed");
 
-        hk.expand(tx_iv_label, &mut self.tx_iv)
+        hk.expand(&tx_iv_label, &mut self.tx_iv)
             .expect("HKDF expand tx_iv failed");
-        hk.expand(rx_iv_label, &mut self.rx_iv)
+        hk.expand(&rx_iv_label, &mut self.rx_iv)
             .expect("HKDF expand rx_iv failed");
     }
 
@@ -227,7 +262,7 @@ impl CryptoContext {
         let mut nonce_bytes = [0u8; 12];
         let pn_bytes = packet_number.to_be_bytes();
 
-        // Proper QUIC-style nonce: IV XOR PacketNumber (right-aligned)
+        // QUIC-style nonce: IV XOR PacketNumber (right-aligned, big-endian)
         nonce_bytes.copy_from_slice(iv);
         for i in 0..8 {
             nonce_bytes[12 - 8 + i] ^= pn_bytes[i];
@@ -236,21 +271,34 @@ impl CryptoContext {
         *Nonce::from_slice(&nonce_bytes)
     }
 
+    /// Applies header protection to a packet in-place.
+    ///
+    /// The mask is generated by running ChaCha20 with:
+    ///   - key  = hp_key
+    ///   - counter = 0  (fixed, per the spec intent)
+    ///   - nonce = sample[0..12]  (first 12 bytes of the 16-byte sample)
+    ///
+    /// Only the first 5 bytes of the keystream block are used as the mask,
+    /// which is the amount needed to cover the first header byte and up to
+    /// 4 packet-number bytes.
     pub fn apply_header_protection(&self, packet: &mut [u8], pn_offset: usize) -> Result<()> {
-        let sample_offset = pn_offset + 4; // Use fixed sample offset after PN
+        let sample_offset = pn_offset + 4; // Sample starts 4 bytes after PN field
         if packet.len() < sample_offset + 16 {
             return Ok(());
         }
 
         let sample = &packet[sample_offset..sample_offset + 16];
+
+        // Use sample[0..12] as the nonce (counter is implicitly 0 in the first
+        // block that ChaCha20 produces after initialization).
         let mut nonce = [0u8; 12];
-        // QUIC uses a 12-byte nonce, we just take the first 12 bytes of the sample
         nonce.copy_from_slice(&sample[0..12]);
 
         let mut cipher = ChaCha20::new_from_slices(&self.tx_hp_key, &nonce)
             .map_err(|_| ZtError::Crypto("Invalid HP key or nonce length".into()))?;
 
-        // No seeking, just generate a block of keystream
+        // Generate exactly 5 bytes of keystream from the first ChaCha20 block
+        // (counter=0). ChaCha20::new_from_slices starts at counter=0.
         let mut mask = [0u8; 5];
         cipher.apply_keystream(&mut mask);
 
@@ -267,16 +315,19 @@ impl CryptoContext {
         Ok(())
     }
 
+    /// Removes header protection from a received packet in-place.
+    ///
+    /// Must use the same sample/nonce derivation as `apply_header_protection`.
     pub fn remove_header_protection(
         &self,
         packet: &mut [u8],
         pn_offset: usize,
         use_prev_key: bool,
     ) -> Result<()> {
-        let sample_offset = pn_offset + 4; // Must match apply_header_protection
+        let sample_offset = pn_offset + 4;
         if sample_offset + 16 > packet.len() {
             return Err(ZtError::InvalidPacket(
-                "Packet too short to resolve header protection".into(),
+                "Packet too short to remove header protection".into(),
             ));
         }
 
