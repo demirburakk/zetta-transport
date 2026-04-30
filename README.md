@@ -25,7 +25,7 @@ Add ZettaTransport to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-zetta-transport = "0.1.5"
+zetta-transport = "0.1.6"
 tokio = { version = "1.52", features = ["full"] }
 ```
 
