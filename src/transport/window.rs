@@ -63,6 +63,7 @@ impl UnackedWindow {
         self.len == 0
     }
 
+    #[allow(dead_code)]
     pub fn get_mut(&mut self, pn: u64) -> Option<&mut UnackedPacket> {
         if pn < self.base_pn {
             return None;

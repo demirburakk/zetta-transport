@@ -34,7 +34,7 @@ impl ZtConnectionActor {
         sha2::Digest::update(&mut hasher, &self.state.scid);
         sha2::Digest::update(&mut hasher, &header.scid);
         sha2::Digest::update(&mut hasher, self.public_key.as_bytes());
-        sha2::Digest::update(&mut hasher, &pk_bytes);
+        sha2::Digest::update(&mut hasher, pk_bytes);
         let expected_hash = sha2::Digest::finalize(hasher).to_vec();
 
         if expected_hash != transcript_hash {

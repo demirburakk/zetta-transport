@@ -6,7 +6,6 @@ use crate::stream::ZtStream;
 use crate::transport::connection::ZtConnection;
 use crate::transport::stream_state::{ConnectionState, StreamState};
 use bytes::{Buf, Bytes};
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};

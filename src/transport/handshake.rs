@@ -138,7 +138,7 @@ pub(crate) async fn handle_handshake(
         let mut hasher = sha2::Sha256::new();
         sha2::Digest::update(&mut hasher, &header.scid);
         sha2::Digest::update(&mut hasher, &header.dcid);
-        sha2::Digest::update(&mut hasher, &pk_bytes);
+        sha2::Digest::update(&mut hasher, pk_bytes);
         let expected_hash = sha2::Digest::finalize(hasher).to_vec();
 
         if expected_hash != remote_transcript_hash {
@@ -245,7 +245,7 @@ pub(crate) async fn handle_handshake(
         let mut hasher = sha2::Sha256::new();
         sha2::Digest::update(&mut hasher, &header.scid);
         sha2::Digest::update(&mut hasher, &scid);
-        sha2::Digest::update(&mut hasher, &pk_bytes);
+        sha2::Digest::update(&mut hasher, pk_bytes);
         sha2::Digest::update(&mut hasher, endpoint.public_key.as_bytes());
         let transcript_hash = sha2::Digest::finalize(hasher).to_vec();
 
