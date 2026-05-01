@@ -1,0 +1,130 @@
+use super::ActorMessage;
+use super::ZtConnectionActor;
+use crate::stream::ZtStream;
+use crate::transport::stream_state::{ConnectionState, StreamState};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{Notify, mpsc};
+use tokio::time::{Instant as TokioInstant, sleep_until};
+
+const SLEEP_FOREVER: Duration = Duration::from_secs(86400 * 365);
+
+impl ZtConnectionActor {
+    pub(crate) async fn run(mut self) {
+        let mut rto_deadline = TokioInstant::now() + self.state.rtt;
+        let mut idle_deadline = TokioInstant::now() + Duration::from_secs(60);
+        let mut ack_deadline = TokioInstant::now() + SLEEP_FOREVER;
+        let mut mtu_probe_deadline = TokioInstant::now() + Duration::from_secs(15);
+
+        let rto_timer = sleep_until(rto_deadline);
+        let idle_timer = sleep_until(idle_deadline);
+        let delayed_ack_timer = sleep_until(ack_deadline);
+        let mtu_probe_timer = sleep_until(mtu_probe_deadline);
+
+        tokio::pin!(rto_timer);
+        tokio::pin!(idle_timer);
+        tokio::pin!(delayed_ack_timer);
+        tokio::pin!(mtu_probe_timer);
+
+        if self.state.state == ConnectionState::Handshaking
+            && let Err(e) = self.send_initial_packet(None)
+        {
+            tracing::warn!("Failed to send initial packet: {:?}", e);
+        }
+
+        loop {
+            if self.state.state == ConnectionState::Closed {
+                break;
+            }
+
+            tokio::select! {
+                Some(msg) = self.receiver.recv() => {
+                    idle_deadline = TokioInstant::now() + Duration::from_secs(60);
+                    idle_timer.as_mut().reset(idle_deadline);
+
+                    match msg {
+                        ActorMessage::IncomingPacket { data, addr } => {
+                            let _ = self.process_incoming_packet(data, addr);
+                            if self.pending_acks > 0 {
+                                let next_ack = TokioInstant::now() + Duration::from_millis(25);
+                                if ack_deadline > next_ack {
+                                    ack_deadline = next_ack;
+                                    delayed_ack_timer.as_mut().reset(ack_deadline);
+                                }
+                            }
+                        }
+                        ActorMessage::OutgoingData { stream_id, data, respond_to } => {
+                            self.last_active_stream_id = stream_id;
+                            let result = self.process_outgoing_data(stream_id, data);
+                            let _ = respond_to.send(result);
+                        }
+                        ActorMessage::GetMtu { respond_to } => {
+                            let _ = respond_to.send(self.state.mtu);
+                        }
+                        ActorMessage::CloseStream { stream_id } => {
+                            if let Err(e) = self.send_stream_close(stream_id) {
+                                tracing::warn!("Failed to send StreamClose: {}", e);
+                            }
+                            self.state.streams.remove(&stream_id);
+
+                            if self.state.streams.is_empty() {
+                                let _ = self.initiate_close();
+                                idle_deadline = TokioInstant::now() + Duration::from_secs(5);
+                                idle_timer.as_mut().reset(idle_deadline);
+                            }
+                        }
+                        ActorMessage::OpenStream { respond_to } => {
+                            let stream_id = self.next_stream_id;
+                            self.next_stream_id += 1;
+
+                            let (data_tx, data_rx) = mpsc::channel(2048);
+                            let window_opened = Arc::new(Notify::new());
+                            self.state.streams.insert(
+                                stream_id,
+                                StreamState::new(data_tx, window_opened.clone()),
+                            );
+
+                            let stream = ZtStream::new(
+                                self.endpoint.clone(),
+                                self.scid.clone(),
+                                stream_id,
+                                data_rx,
+                                window_opened,
+                            );
+                            let _ = respond_to.send(Ok(stream));
+                        }
+                        ActorMessage::Close => {
+                            let _ = self.initiate_close();
+                            idle_deadline = TokioInstant::now() + Duration::from_secs(5);
+                            idle_timer.as_mut().reset(idle_deadline);
+                        }
+                    }
+                }
+
+                _ = &mut delayed_ack_timer => {
+                    if self.pending_acks > 0 { let _ = self.flush_acks(); }
+                    ack_deadline = TokioInstant::now() + SLEEP_FOREVER;
+                    delayed_ack_timer.as_mut().reset(ack_deadline);
+                }
+
+                _ = &mut rto_timer => {
+                    if self.handle_retransmits().is_err() { break; }
+                    let rto = self.state.rtt + self.state.rttvar * 4;
+                    rto_deadline = TokioInstant::now() + rto.max(Duration::from_millis(50));
+                    rto_timer.as_mut().reset(rto_deadline);
+                }
+
+                _ = &mut mtu_probe_timer => {
+                    if let Err(e) = self.send_mtu_probe() {
+                        tracing::debug!("Failed to send MTU probe: {}", e);
+                    }
+                    mtu_probe_deadline = TokioInstant::now() + Duration::from_secs(15);
+                    mtu_probe_timer.as_mut().reset(mtu_probe_deadline);
+                }
+
+                _ = &mut idle_timer => { break; }
+            }
+        }
+        self.routing_table.remove(&self.scid);
+    }
+}

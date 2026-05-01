@@ -1,8 +1,6 @@
 use crate::error::{Result, ZtError};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-pub const MAX_PACKET_SIZE: usize = 1450;
-
 /// Packet types for ZettaTransport.
 /// Note: Packet types and Frame types exist in separate namespaces.
 /// E.g., PacketType::MtuProbe (0x06) is distinct from Frame::StreamClose (0x06).
@@ -28,7 +26,7 @@ pub struct PacketHeader {
 }
 
 impl PacketHeader {
-    pub fn get_pn_offset(data: &[u8]) -> Option<usize> {
+    pub(crate) fn get_pn_offset(data: &[u8]) -> Option<usize> {
         if data.is_empty() {
             return None;
         }
@@ -57,7 +55,7 @@ impl PacketHeader {
         }
     }
 
-    pub fn encode(&self, dst: &mut BytesMut) {
+    pub(crate) fn encode(&self, dst: &mut BytesMut) {
         if self.is_long {
             let first_byte = 0x80 | (self.p_type as u8);
             dst.put_u8(first_byte);
@@ -79,7 +77,7 @@ impl PacketHeader {
         }
     }
 
-    pub fn decode(src: &mut Bytes) -> Result<Self> {
+    pub(crate) fn decode(src: &mut Bytes) -> Result<Self> {
         if src.remaining() < 1 {
             return Err(ZtError::InvalidPacket("Empty buffer".into()));
         }

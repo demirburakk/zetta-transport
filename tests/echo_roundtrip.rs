@@ -14,12 +14,12 @@ async fn echo_roundtrip_large_payload() {
     tokio::spawn({
         let server = server.clone();
         async move {
-            if let Some(mut conn) = server.accept().await {
-                if let Some(mut stream) = conn.accept_stream().await {
-                    while let Some(data) = stream.recv().await {
-                        // Echo what we got.
-                        let _ = stream.send(&data).await;
-                    }
+            if let Some(mut conn) = server.accept().await
+                && let Some(mut stream) = conn.accept_stream().await
+            {
+                while let Some(data) = stream.recv().await {
+                    // Echo what we got.
+                    let _ = stream.send(&data).await;
                 }
             }
         }

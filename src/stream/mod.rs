@@ -45,7 +45,7 @@ impl ZtConnectionHandle {
 pub struct ZtStream {
     endpoint: Arc<ZtEndpoint>,
     cid: Vec<u8>,
-    pub stream_id: u32,
+    pub(crate) stream_id: u32,
     receiver: mpsc::Receiver<Bytes>,
     window_opened: Arc<Notify>,
 }

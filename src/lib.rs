@@ -73,9 +73,8 @@
 //! }
 //! ```
 
-pub mod crypto;
+pub(crate) mod crypto;
 pub mod error;
-pub mod protocol;
+pub(crate) mod protocol;
 pub mod stream;
 pub mod transport;
-pub mod util;

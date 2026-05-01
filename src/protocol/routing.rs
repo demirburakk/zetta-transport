@@ -1,4 +1,9 @@
-pub fn extract_dcid_fast(data: &[u8]) -> Option<Vec<u8>> {
+/// Extracts the Destination Connection ID from a raw packet buffer
+/// without fully parsing the header.
+///
+/// This is a fast-path helper used by the router to dispatch incoming
+/// datagrams to the correct per-connection actor.
+pub(crate) fn extract_dcid_fast(data: &[u8]) -> Option<Vec<u8>> {
     if data.is_empty() {
         return None;
     }

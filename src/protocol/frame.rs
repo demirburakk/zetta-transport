@@ -21,6 +21,7 @@ pub enum Frame {
     Handshake {
         public_key: [u8; 32],
         ed_public_key: [u8; 32],
+        transcript_hash: Vec<u8>,
         signature: [u8; 64],
     },
     Cookie {
@@ -32,7 +33,7 @@ pub enum Frame {
 }
 
 impl Frame {
-    pub fn encode(&self, dst: &mut BytesMut) {
+    pub(crate) fn encode(&self, dst: &mut BytesMut) {
         match self {
             Frame::Padding(len) => {
                 for _ in 0..*len {
@@ -66,11 +67,14 @@ impl Frame {
             Frame::Handshake {
                 public_key,
                 ed_public_key,
+                transcript_hash,
                 signature,
             } => {
                 dst.put_u8(0x04);
                 dst.put_slice(public_key);
                 dst.put_slice(ed_public_key);
+                dst.put_u16(transcript_hash.len() as u16);
+                dst.put_slice(transcript_hash);
                 dst.put_slice(signature);
             }
             Frame::Cookie { cookie } => {
@@ -85,7 +89,7 @@ impl Frame {
         }
     }
 
-    pub fn decode(src: &mut Bytes) -> Result<Self> {
+    pub(crate) fn decode(src: &mut Bytes) -> Result<Self> {
         if src.remaining() < 1 {
             return Err(ZtError::InvalidPacket("Empty frame".into()));
         }
@@ -138,7 +142,7 @@ impl Frame {
             }
             0x03 => Ok(Frame::ConnectionClose),
             0x04 => {
-                if src.remaining() < 128 {
+                if src.remaining() < 130 {
                     return Err(ZtError::InvalidPacket("Handshake frame too short".into()));
                 }
                 let mut public_key = [0u8; 32];
@@ -147,12 +151,18 @@ impl Frame {
                 let mut ed_public_key = [0u8; 32];
                 ed_public_key.copy_from_slice(&src.chunk()[..32]);
                 src.advance(32);
+                let th_len = src.get_u16() as usize;
+                if src.remaining() < th_len + 64 {
+                    return Err(ZtError::InvalidPacket("Handshake frame truncated".into()));
+                }
+                let transcript_hash = src.copy_to_bytes(th_len).to_vec();
                 let mut signature = [0u8; 64];
                 signature.copy_from_slice(&src.chunk()[..64]);
                 src.advance(64);
                 Ok(Frame::Handshake {
                     public_key,
                     ed_public_key,
+                    transcript_hash,
                     signature,
                 })
             }
