@@ -1,352 +1,655 @@
-# ZettaTransport Protocol Specification (ZT-v0.1.9)
+# ZettaTransport — Technical Documentation
 
-**Author:** Burak Demir <demirburak8338@gmail.com>  
-**Status:** Experimental / Active Development  
-**Date:** April 2026
-
----
-
-## 1. Introduction
-
-ZettaTransport (ZT) is a transport layer protocol built over UDP. It defines packet structures, frame types, state machine transitions, cryptographic operations, and congestion control algorithms. This document serves as the normative specification for implementing a compatible ZT endpoint.
-
-ZT draws heavy inspiration from QUIC (RFC 9000/9001) while making deliberate simplifications for educational clarity.
+> This document covers the internal design and implementation details of ZettaTransport.
+> For a high-level overview and usage examples, see [README.md](README.md).
 
 ---
 
-## 2. Packet Types
+## Table of Contents
 
-ZT defines the following packet types (4-bit integer, lower nibble of the first byte):
-
-| Code | Name | Header | Description |
-|------|------|--------|-------------|
-| `0x00` | **Initial** | Long | Starts the cryptographic handshake. Must be ≥1200 bytes (anti-amplification). |
-| `0x01` | **Handshake** | Long | Server's handshake response. Completes key exchange and transitions to Active. |
-| `0x02` | **Data** | Short | Carries encrypted application data as a sequence of frames. |
-| `0x05` | **Close** | Short | Initiates graceful connection teardown. |
-| `0x06` | **MtuProbe** | Short | Probes the network path for MTU boundaries. Payload is zero-padding. The receiver MUST respond with an `Ack` frame for this Packet Number. |
-| `0x07` | **Retry** | Long | Stateless retry. Payload carries an opaque HMAC cookie that the client must echo back in a subsequent `Initial` using a `Cookie` frame. |
+1. [Module Overview](#module-overview)
+2. [Public API](#public-api)
+   - [ZtEndpoint](#ztendpoint)
+   - [ZtConnectionHandle](#ztconnectionhandle)
+   - [ZtStream](#ztstream)
+   - [ZtError](#zterror)
+3. [Packet Format](#packet-format)
+   - [Long Header](#long-header-packets)
+   - [Short Header](#short-header-packets)
+   - [Packet Types](#packet-types)
+4. [Frame Format](#frame-format)
+5. [Cryptographic Design](#cryptographic-design)
+   - [Handshake](#handshake-phase)
+   - [Key Derivation](#key-derivation)
+   - [Header Protection](#header-protection)
+   - [Key Rotation](#key-rotation)
+   - [Replay Protection](#replay-protection)
+6. [Connection Lifecycle](#connection-lifecycle)
+7. [Stream Multiplexing](#stream-multiplexing)
+8. [Flow Control](#flow-control)
+9. [Congestion Control](#congestion-control)
+10. [Path MTU Discovery](#path-mtu-discovery)
+11. [Actor Model](#actor-model)
+12. [Packet Routing](#packet-routing)
+13. [Timers](#timers)
 
 ---
 
-## 3. Packet Architecture & Header Formatting
+## Module Overview
 
-Packets use either **Long Headers** (unestablished connections) or **Short Headers** (established connections). All multi-byte integers are in **network byte order** (big-endian).
+```
+src/
+├── lib.rs                        # Crate root; re-exports public API
+├── error.rs                      # ZtError, Result<T>
+├── crypto/
+│   ├── mod.rs                    # Re-exports CryptoContext
+│   ├── keypair.rs                # X25519 keypair generation + DH
+│   ├── key_derivation.rs         # HKDF helpers, epoch key derivation, ratchet
+│   ├── header_protection.rs      # AES-128 apply/remove header protection
+│   └── context.rs                # CryptoContext (per-connection crypto state)
+├── protocol/
+│   ├── mod.rs
+│   ├── frame.rs                  # Frame enum + encode/decode
+│   ├── packet.rs                 # PacketHeader encode/decode, PacketType
+│   ├── packet_number.rs          # PN truncation and expansion
+│   └── routing.rs                # Fast DCID extraction
+├── stream/
+│   └── mod.rs                    # ZtStream, ZtConnectionHandle
+└── transport/
+    ├── mod.rs
+    ├── endpoint.rs               # ZtEndpoint — public entry point
+    ├── connection.rs             # ZtConnection — per-connection state struct
+    ├── handshake.rs              # Server-side handshake handler
+    ├── congestion.rs             # ACK/loss/RTT logic (impl on ZtConnection)
+    ├── cookie.rs                 # HMAC Retry cookie generation/verification
+    ├── stream_state.rs           # StreamState, UnackedPacket, ConnectionState
+    ├── window.rs                 # UnackedWindow (ring buffer), ReplayWindow (bitmask)
+    └── actor/
+        ├── mod.rs                # ZtConnectionActor, ActorMessage
+        ├── event_loop.rs         # Main select! loop
+        ├── incoming_handler.rs   # Decryption + frame dispatch
+        ├── handshake_handler.rs  # Client-side handshake + retry
+        └── packet_sender.rs      # Outgoing packet construction, RTO, MTU probe
+```
 
-### 3.1. Header Field Definitions
+---
 
-| Field | Width | Description |
-|-------|-------|-------------|
-| **Form** | 1 bit | `1` = Long Header, `0` = Short Header |
-| **Key Phase** | 1 bit | (Short Header only, bit 6) Signals the current key epoch parity for key rotation |
-| **Reserved** | 2-3 bits | Reserved for future use. Must be `0` |
-| **Type** | 4-6 bits | Packet type (see Section 2) |
-| **Version** | 32 bits | Protocol version. `1` for ZT-v1.0 (Long Header only) |
-| **DCID Len** | 8 bits | Length of Destination Connection ID in bytes |
-| **Destination CID** | Variable | The receiver's Connection ID (typically 8 bytes) |
-| **SCID Len** | 8 bits | Length of Source Connection ID (Long Header only) |
-| **Source CID** | Variable | The sender's Connection ID (Long Header only) |
-| **Packet Number** | 64 bits | Monotonically increasing, prevents replay |
+## Public API
 
-### 3.2. Long Header (Initial / Handshake / Retry)
+### `ZtEndpoint`
 
-```text
+The main entry point. Binds to a UDP socket and manages all connections.
+
+```rust
+pub struct ZtEndpoint {
+    pub ed_public_key: VerifyingKey,
+    pub verify_peer_key: Option<PeerKeyVerifier>,
+    // fields are otherwise private
+}
+```
+
+#### Methods
+
+```rust
+/// Bind to a local UDP address and start the packet router.
+/// Pass Some(psk) to require a pre-shared key on top of the X25519 handshake.
+pub async fn bind(addr: &str, psk: Option<[u8; 32]>) -> Result<Arc<Self>>
+
+/// Initiate an outgoing connection. Blocks until the handshake completes
+/// (or times out after 5 seconds).
+pub async fn connect(self: &Arc<Self>, addr: SocketAddr) -> Result<ZtConnectionHandle>
+
+/// Accept the next incoming connection. Returns None if the endpoint is dropped.
+pub async fn accept(&self) -> Option<ZtConnectionHandle>
+
+/// Return the local socket address this endpoint is bound to.
+pub fn local_addr(&self) -> Result<SocketAddr>
+```
+
+#### Internal methods (used by the actor layer)
+
+```rust
+pub async fn send(&self, cid: &[u8], stream_id: u32, data: &[u8]) -> Result<()>
+pub async fn close(&self, cid: &[u8]) -> Result<()>
+pub async fn close_stream(&self, cid: &[u8], stream_id: u32) -> Result<()>
+pub async fn open_stream(&self, cid: &[u8]) -> Result<ZtStream>
+pub async fn get_mtu(&self, cid: &[u8]) -> usize
+```
+
+#### `PeerKeyVerifier`
+
+An optional callback used to pin or allowlist remote peer keys:
+
+```rust
+pub type PeerKeyVerifier = Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>;
+```
+
+If set, the callback receives the remote peer's Ed25519 public key during the server-side handshake. Returning `false` causes the handshake to fail with `ZtError::Unauthorized`.
+
+---
+
+### `ZtConnectionHandle`
+
+A handle to an established connection. Returned by both `connect()` and `accept()`.
+
+```rust
+pub struct ZtConnectionHandle { /* private */ }
+```
+
+#### Methods
+
+```rust
+/// Open a new outgoing stream to the peer.
+pub async fn open_stream(&self) -> Result<ZtStream>
+
+/// Wait for the peer to open an incoming stream.
+/// Returns None when the connection is closed.
+pub async fn accept_stream(&mut self) -> Option<ZtStream>
+
+/// Gracefully close the connection.
+pub async fn close(&self) -> Result<()>
+```
+
+Stream IDs follow a parity convention: clients use even IDs (0, 2, 4, …) and servers use odd IDs (1, 3, 5, …). Stream 0 is always pre-created during the handshake and available on both sides immediately after connection.
+
+---
+
+### `ZtStream`
+
+Represents a single reliable, ordered, encrypted stream within a connection.
+
+```rust
+pub struct ZtStream { /* private */ }
+```
+
+#### Methods
+
+```rust
+/// Send data to the peer. Automatically chunks data to fit the current MTU.
+/// Blocks transparently under flow control or congestion pressure.
+pub async fn send(&self, data: &[u8]) -> Result<()>
+
+/// Receive the next in-order chunk of data from the peer.
+/// Returns None when the stream is closed.
+pub async fn recv(&mut self) -> Option<Bytes>
+
+/// Send a StreamClose frame and remove stream state.
+pub async fn close(&self) -> Result<()>
+```
+
+`send()` chunks data into MTU-sized segments (MTU − 64 bytes overhead, minimum 512 bytes). When the peer's flow control window or the local congestion window is exhausted, `send()` yields and retries automatically after a window-open notification.
+
+---
+
+### `ZtError`
+
+```rust
+pub enum ZtError {
+    Io(std::io::Error),           // Underlying socket error
+    Crypto(String),               // AEAD failure, bad keys, invalid signatures
+    InvalidPacket(String),        // Malformed or truncated packet/frame
+    Timeout,                      // Connection or retransmit timeout
+    Unauthorized,                 // CID mismatch or peer key rejected
+    PacketNumberOverflow,         // u64 PN space exhausted
+    ConnectionIdExhausted,        // Could not allocate a unique CID
+    ActorFailed,                  // Actor task dropped or channel closed
+    FlowControlBlocked,           // Peer's receive window is full
+    CongestionWindowFull,         // Local CWND is full
+    TooManyStreams { limit: usize }, // Peer exceeded MAX_CONCURRENT_STREAMS
+}
+```
+
+---
+
+## Packet Format
+
+All packets are UDP datagrams. The first byte determines whether the packet has a long header (MSB = 1) or a short header (MSB = 0).
+
+### Long Header Packets
+
+Used for Initial, Handshake, and Retry packets.
+
+```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|1| Rsvd| Type  |             Version (Top 24 bits)             |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-| Version (Bot 8) | DCID Length |    Destination CID (var) ...  |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-| SCID Length   |      Source CID (Variable Bytes) ...          |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                                                               |
-+                    Packet Number (64 bits)                    +
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+├─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┤
+│1│  Packet Type  │  PN Len   │          Version (32-bit)          │
+├─┴───────────────┴───────────┼─────────────────────────────────────┤
+│  DCID Length (8-bit)        │  DCID (variable)                   │
+├─────────────────────────────┤                                     │
+│  SCID Length (8-bit)        │  SCID (variable)                   │
+├─────────────────────────────┴─────────────────────────────────────┤
+│  Packet Number (1–4 bytes, truncated)                             │
+├───────────────────────────────────────────────────────────────────┤
+│  Payload (encrypted)                                              │
+├───────────────────────────────────────────────────────────────────┤
+│  AEAD Tag (16 bytes)                                              │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
-**First byte encoding:** `0x80 | packet_type`
+- **First byte:** `1 | (packet_type << 2) | (pn_len - 1)`
+- **Version:** Always `1` for ZettaTransport v1
+- **DCID / SCID:** Variable length, prefixed by a 1-byte length field
+- **PN Len:** Encoded in bits 0–1 of the first byte as `(pn_len - 1)`
 
-### 3.3. Short Header (Data / Close / MtuProbe)
+### Short Header Packets
 
-```text
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|0|K| Rsvd| Type| DCID Length   |    Destination CID (var) ...  |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                                                               |
-+                    Packet Number (64 bits)                    +
-|                                                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+Used for Data, Close, and MtuProbe packets once a connection is established.
+
+```
+ 0                   1
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5
+├─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┤
+│0│KP│Pkt Type │PN│ DCID Length  │
+├─┴──┴─────────┴──┴──────────────┤
+│  DCID (variable)               │
+├────────────────────────────────┤
+│  Packet Number (1–4 bytes)     │
+├────────────────────────────────┤
+│  Payload (encrypted)           │
+├────────────────────────────────┤
+│  AEAD Tag (16 bytes)           │
+└────────────────────────────────┘
 ```
 
-**First byte encoding:** `(packet_type & 0x3F) | (key_phase ? 0x40 : 0x00)`
+- **KP (bit 6):** Key Phase bit — toggles on each key rotation epoch
+- **Pkt Type:** Encoded in bits 2–5
 
-- Short Headers **omit** the Version and SCID fields.
-- The **Key Phase (K)** bit (bit 6) indicates which key epoch is in use, enabling in-band key rotation detection.
-- All payloads undergo AEAD encryption with the header as AAD, producing a mandatory 16-byte Poly1305 Authentication Tag appended to the payload.
+### Packet Types
 
-### 3.4. Payload Framing (Frames)
+| Value | Name | Header | Description |
+|---|---|---|---|
+| `0x00` | `Initial` | Long | First handshake packet from client |
+| `0x01` | `Handshake` | Long | Server handshake response |
+| `0x02` | `Data` | Short | Application data / ACK |
+| `0x05` | `Close` | Short | Graceful connection close |
+| `0x06` | `MtuProbe` | Short | Path MTU discovery probe |
+| `0x07` | `Retry` | Long | Server DoS retry with cookie |
 
-The payload of `Initial`, `Handshake`, and `Data` packets is a sequence of frames. Frame type is identified by a 1-byte tag:
+> Note: Frame type values and Packet type values occupy separate namespaces. For example, `Frame::StreamClose` encodes as `0x06` on the wire, which is the same byte value as `PacketType::MtuProbe` — but they appear in different positions in the packet structure.
 
-| Code | Frame | Wire Format | Description |
-|------|-------|------------|-------------|
-| `0x00` | **Padding** | `N` consecutive `0x00` bytes | Padding for anti-amplification |
-| `0x01` | **Stream** | `u32 stream_id` + `u64 offset` + `u16 len` + `len` bytes | Application data for a specific stream |
-| `0x02` | **Ack** | `u64 largest_acked` + `u32 window_size` + `u8 range_count` + `range_count × (u64 start, u64 end)` | Cumulative + selective acknowledgment with flow control |
-| `0x03` | **ConnectionClose** | (no payload) | Signals connection termination |
-| `0x04` | **Handshake** | `[u8; 32] x25519_pk` + `[u8; 32] ed25519_pk` + `[u8; 64] signature` | Carries key exchange material and authentication |
-| `0x05` | **Cookie** | `u16 len` + `len` bytes | Echoes a Retry cookie from the server |
-| `0x06` | **StreamClose** | `u32 stream_id` | Signals graceful closure of a single stream |
+### Packet Number Encoding
 
-**Ack frame semantics:**
-- `largest_acked`: Cumulative acknowledgment — all packets ≤ this PN are acknowledged.
-- `window_size`: Receiver's current flow control window (bytes available).
-- `ack_ranges`: SACK ranges for selective acknowledgment of non-contiguous packets within the replay bitmask window.
+Packet numbers are truncated to 1–4 bytes on the wire. The number of bytes used (`pn_len`) is selected dynamically based on the gap between the next PN and the lowest unacknowledged PN:
+
+```rust
+// src/protocol/packet_number.rs
+pub fn truncate_pn(pn: u64, largest_acked: u64) -> (u32, usize)
+pub fn expand_pn(pn_truncated: u64, pn_len: usize, largest_pn: u64) -> u64
+```
+
+`expand_pn` recovers the full 64-bit PN from a truncated value using the RFC 9000 §A.3 algorithm: candidate = `(expected & !mask) | truncated`, then adjust by ±window if outside the half-window around `expected`.
 
 ---
 
-## 4. State Machine and Connection Lifecycle
+## Frame Format
 
-### 4.1. Connection States
+Frames are the payload of decrypted packets. A single packet may contain multiple frames concatenated.
+
+### `0x00` — Padding
+
+One or more zero bytes. Consumed contiguously.
+
+### `0x01` — Stream
 
 ```
- ┌──────────────┐     Handshake Complete    ┌────────┐
- │ Handshaking  │ ─────────────────────────▶│ Active │
- └──────────────┘                           └───┬────┘
-                                                │
-                                    Close sent  │  Close received
-                                    or received │  
-                                                ▼
-                                          ┌─────────┐
-                                          │ Closing  │
-                                          └────┬────┘
-                                               │ Timeout / confirmed
-                                               ▼
-                                          ┌────────┐
-                                          │ Closed │
-                                          └────────┘
+[0x01][stream_id: u32][offset: u64][length: u16][data: length bytes]
 ```
 
-States: `Handshaking → Active → Closing → Closed`
+- `stream_id`: identifies which stream this chunk belongs to
+- `offset`: byte offset of this chunk within the stream
+- `length`: number of payload bytes following
 
-### 4.2. Handshake (Stateless Retry)
+### `0x02` — Ack
 
-1. **Client** generates a random 8-byte SCID. Sends `Initial` packet (Long Header, ≥1200 bytes) containing a `Handshake` frame with `(x25519_public_key, ed25519_public_key, ed25519_signature)`.
+```
+[0x02][largest_acked: u64][window_size: u32][range_count: u8]
+      ([start: u64][end: u64]) × range_count
+```
 
-2. **Server** receives `Initial`.
-   - If **no valid Retry cookie** is present: server sends a `Retry` packet with an HMAC-SHA256 cookie (containing timestamp + address binding). **No per-connection state is allocated.**
-   - If **a valid cookie** is present: server proceeds to step 4.
+- `largest_acked`: highest PN the sender has processed
+- `window_size`: sender's current receive window (used for flow control)
+- `ack_ranges`: SACK blocks as `(start_pn, end_pn)` inclusive pairs; maximum 128 ranges
 
-3. **Client** receives `Retry`, extracts the opaque cookie, and resends `Initial` with a `Cookie` frame echoing it.
+### `0x03` — ConnectionClose
 
-4. **Server** validates the cookie (HMAC verification, ≤30s expiry, address/SCID binding), verifies the Ed25519 signature on the X25519 public key, performs ECDH, derives session keys, generates a random server SCID, and sends a `Handshake` response (Long Header).
+```
+[0x03]
+```
 
-5. **Client** receives `Handshake`, verifies Ed25519 signature, performs ECDH, derives identical session keys, and transitions to `Active`.
+No payload. Signals graceful teardown.
 
-**State Enforcement:**
-- Short Header packets received during `Handshaking` state MUST be silently dropped.
-- All `Active` state Short Header packets MUST pass AEAD decryption or be dropped.
-- A server receiving an `Initial` for an already-Active CID treats it as a new connection.
+### `0x04` — Handshake
 
-**Amplification Limit:** During handshaking, the server MUST NOT send more than `3 × bytes_received` bytes total, preventing reflection amplification attacks.
+```
+[0x04][x25519_public_key: 32][ed25519_public_key: 32]
+      [transcript_hash_len: u16][transcript_hash: variable]
+      [ed25519_signature: 64]
+```
 
-**Handshake Concurrency:** A semaphore limits concurrent handshake processing to 256, preventing resource exhaustion from spoofed Initial floods.
+Carries key material and authentication for the handshake exchange.
 
-### 4.3. Timers
+### `0x05` — Cookie
 
-| Timer | Interval | Behavior |
-|-------|----------|----------|
-| **RTO** | `RTT + 4×RTTVAR` (min 50ms) | Retransmit unacked packets. Karn's Algorithm: RTT measurements ignore retransmitted packets. |
-| **Delayed ACK** | 25ms or 10 pending ACKs | Whichever threshold is reached first triggers an ACK flush. |
-| **Idle Timeout** | 60s | If no packets are received, the actor task exits and the connection is destroyed. |
-| **PMTUD Probe** | 15s | Periodic MTU probe at the next step size. |
+```
+[0x05][length: u16][cookie: length bytes]
+```
 
-### 4.4. Stream Lifecycle
+Client includes this frame in the second Initial packet after receiving a Retry.
 
-- **Stream 0** is automatically created during the handshake for both endpoints.
-- Additional streams can be opened via `ZtConnectionHandle::open_stream()`.
-- Remote-initiated streams are auto-created when a `Stream` frame with an unknown `stream_id` is received.
-- Streams are closed via `StreamClose` frame (`0x06`), which notifies the peer to release resources for that stream.
-- Maximum **100 concurrent streams** per connection (configurable via `MAX_CONCURRENT_STREAMS`).
+### `0x06` — StreamClose
 
-### 4.5. Connection Finalization
+```
+[0x06][stream_id: u32]
+```
 
-A graceful teardown occurs when either party sends a `Close` (`0x05`) packet containing a `ConnectionClose` frame. The connection transitions to `Closing`, and after a brief drain period (5s idle timer), memory is reclaimed and the actor exits.
+Signals that the sending side has finished writing to the stream.
 
 ---
 
-## 5. Cryptography
+## Cryptographic Design
 
-### 5.1. Key Exchange and Authentication
+### Handshake Phase
 
-- **X25519** (Curve25519 ECDH) produces a 32-byte `shared_secret`.
-- **Ed25519** signatures authenticate each peer's X25519 public key, preventing MITM attacks.
-- Optional **Pre-Shared Key (PSK)** can be mixed into the master secret for additional authentication.
+The handshake is a 1-RTT exchange (2-RTT if a Retry is required):
 
-### 5.2. Key Derivation (HKDF-SHA256)
+**Round 1 (optional — DoS protection):**
+1. Client sends an Initial packet (padded to ≥ 1200 bytes) with a `Handshake` frame containing its ephemeral X25519 public key and Ed25519 signature over `SHA-256(client_scid ‖ server_dcid ‖ x25519_pubkey)`.
+2. Server verifies the minimum packet size (anti-amplification guard). If no valid cookie is present, it responds with a `Retry` packet containing a 40-byte HMAC cookie.
 
-**Master Secret derivation:**
+**Round 2 (handshake completion):**
+1. Client retransmits the Initial packet with its `Cookie` frame and the HMAC cookie.
+2. Server verifies the cookie, then verifies the Ed25519 signature and transcript hash. It performs X25519 DH to derive the shared secret, creates the `CryptoContext`, spawns the actor, and responds with a `Handshake` packet carrying its ephemeral key, Ed25519 key, and signature.
+3. Client verifies the server's signature and transcript hash, completes the DH, derives the same shared secret, and marks the connection active.
 
-```
-ikm = shared_secret || sort(my_scid, peer_dcid) [|| PSK]
-salt = "ZettaTransport v1"
-master_secret = HKDF-Expand(HKDF-Extract(salt, ikm), "master_secret", 32)
-```
+All Initial packets use **deterministic Initial keys** derived from the DCID (not secret — same purpose as QUIC's initial secrets). Packet confidentiality begins after the handshake completes.
 
-**Per-epoch key expansion** (using HKDF-Expand with the master secret as PRK):
-
-```
-tx_key  = HKDF-Expand(secret, "client_key" | "server_key", 32)
-rx_key  = HKDF-Expand(secret, "server_key" | "client_key", 32)
-tx_hp   = HKDF-Expand(secret, "client_hp"  | "server_hp",  32)
-rx_hp   = HKDF-Expand(secret, "server_hp"  | "client_hp",  32)
-tx_iv   = HKDF-Expand(secret, "client_iv"  | "server_iv",  12)
-rx_iv   = HKDF-Expand(secret, "server_iv"  | "client_iv",  12)
-```
-
-Labels are chosen based on the endpoint role (client uses `client_*` for TX, `server_*` for RX).
-
-**Initial Keys** (for encrypting Initial/Handshake packets before session keys exist):
+#### Transcript Hash
 
 ```
-salt = "ZettaInitialSalt v1"
-initial_secret = HKDF-Expand(HKDF-Extract(salt, DCID), "initial_secret", 32)
+transcript_hash = SHA-256(client_scid ‖ server_dcid ‖ client_x25519_pubkey [‖ cookie])
 ```
 
-### 5.3. AEAD Encryption (ChaCha20-Poly1305)
+The server's transcript extends this with the server's ephemeral key:
 
-- **Nonce (12 bytes):** `nonce = tx_iv XOR (0x0000_0000 || packet_number_be)` — the 64-bit packet number is XOR'd into the rightmost 8 bytes of the IV.
-- **AAD (Associated Data):** The complete packet header (everything before the payload).
-- **Authentication Tag:** 16-byte Poly1305 tag appended after the encrypted payload.
-- **In-place operation:** Encryption and decryption mutate the payload buffer directly.
+```
+transcript_hash = SHA-256(client_scid ‖ server_scid ‖ client_x25519_pubkey ‖ server_x25519_pubkey)
+```
 
-### 5.4. Key Rotation (Forward Secrecy)
+Both sides sign their respective transcript hashes with Ed25519.
 
-Key rotation occurs every **16,000,000 packets** (epoch = PN / 16M):
+#### Retry Cookie
 
-1. Previous RX keys are retained (one epoch back) for decrypting out-of-order packets.
-2. A new secret is derived: `next_secret = HKDF-Expand(HKDF-Extract(None, current_secret), "ratchet", 32)`
-3. The old secret is **securely erased** using `zeroize`.
-4. New TX/RX keys, IVs, and HP keys are derived from the new secret.
-5. The **Key Phase** bit in the Short Header signals the epoch parity, enabling the receiver to detect key rotation.
+```rust
+// src/transport/cookie.rs
+fn make_retry_cookie(cookie_key: &[u8; 32], addr: &SocketAddr, client_scid: &[u8], now: u64) -> [u8; 40]
+```
 
-### 5.5. Header Protection
+Cookie layout: `[timestamp: 8 bytes][HMAC-SHA256: 32 bytes]`
 
-ZT applies QUIC-style header protection using ChaCha20:
-
-1. **Sample:** 16 bytes taken from `packet[pn_offset + 4 .. pn_offset + 20]`.
-2. **Nonce:** First 12 bytes of the sample.
-3. **Mask:** 5 bytes of ChaCha20 keystream generated with the HP key and sample nonce.
-4. **Apply:**
-   - First byte: `packet[0] ^= mask[0] & (0x0F for Long, 0x1F for Short)`
-   - Packet number bytes: `packet[pn_offset + i] ^= mask[i + 1]` for `i in 0..4`
+The HMAC input is `IP ‖ port ‖ client_scid ‖ timestamp`. Cookies expire after 30 seconds. Verification uses `subtle::ConstantTimeEq` to prevent timing attacks.
 
 ---
 
-## 6. Reliability, Flow, and Congestion Control
+### Key Derivation
 
-### 6.1. Congestion Control (AIMD)
+All key derivation uses **HKDF-SHA256** (`hkdf` crate).
 
-Congestion control operates in **exact bytes** (not abstracted packets).
+#### Initial Keys (non-secret)
 
-**Initialization:**
-- `cwnd` = `10 × MTU` = 12,000 bytes
-- `ssthresh` = 64 KB
-- `local_window` / `remote_window` = 1 MB
+```
+initial_secret = HKDF-Extract(salt=INITIAL_SALT, ikm=dcid)
+```
 
-**On Successful ACK:**
-- **Slow Start** (`cwnd < ssthresh`): `cwnd += bytes_acked`
-- **Congestion Avoidance** (`cwnd ≥ ssthresh`): `cwnd += (MTU × bytes_acked) / max(cwnd, MTU)`
+`INITIAL_SALT = b"ZettaTransport v1 InitialSalt\x00\x00\x00"` (version-pinned, public)
 
-**On Packet Loss (RTO expiration):**
-- `ssthresh = max(cwnd / 2, MTU × 2)`
-- `cwnd = ssthresh + 3 × MTU`
+#### Master Secret
 
-### 6.2. RTT Estimation
+```
+ikm = shared_secret ‖ client_scid ‖ server_scid [‖ psk]
+master_secret = HKDF-Expand(HKDF-Extract(salt="ZettaTransport v1", ikm), "master_secret", 32)
+```
 
-Uses the standard TCP RTT estimator (RFC 6298):
-- Initial: `RTT = 333ms`, `RTTVAR = 166ms`
-- On sample (first-transmission packets only, Karn's Algorithm):
-  - First sample: `RTT = sample`, `RTTVAR = sample / 2`
-  - Subsequent: `RTTVAR = (3×RTTVAR + |RTT - sample|) / 4`, `RTT = (7×RTT + sample) / 8`
-- `RTO = RTT + 4×RTTVAR` (minimum 50ms)
+CID ordering is role-based (not lexicographic) to ensure both sides derive the same IKM:
+- Client appends `my_scid` first, then `peer_dcid`
+- Server appends `peer_dcid` first, then `my_scid`
 
-### 6.3. Loss Detection and Retransmission
+#### Per-Epoch Keys
 
-- Loss is detected via **RTO timer expiration** for unacked Data packets.
-- Each packet is retransmitted up to **10 times** before being dropped.
-- If all unacked packets exceed the retry limit, the connection is terminated.
-- ZT does **not** implement Fast Retransmit (3-duplicate-ACKs) in v0.1.9.
+```
+key    = HKDF-Expand(prk, "{role}_key:{epoch}", 32)
+hp_key = HKDF-Expand(prk, "{role}_hp:{epoch}", 32)
+iv     = HKDF-Expand(prk, "{role}_iv:{epoch}", 12)
+```
 
-### 6.4. Flow Control
+Where `role` is `client` or `server`. The epoch suffix ensures distinct key material across epochs even if the PRK were reused.
 
-- Each ACK frame carries the sender's `window_size` (available receive buffer).
-- `ZtStream::send()` blocks (via `Notify`) when `remote_window` or `cwnd` is exhausted.
-- The local window is dynamically recalculated as `1MB - total_buffered_bytes`.
+#### Secret Ratchet
 
-### 6.5. Selective Acknowledgment (SACK)
+```
+next_secret = HKDF-Expand(HKDF-Extract(None, current_secret), "ratchet", 32)
+```
 
-ACK frames carry both a cumulative `largest_acked` and optional SACK ranges derived from the replay bitmask. The sender processes SACK ranges first, then cumulative ACKs, allowing efficient recovery of non-contiguous losses.
+The old secret is zeroized after ratcheting.
 
 ---
 
-## 7. Replay Protection (O(1) Sliding Window)
+### Header Protection
 
-ZT uses a **128-bit bitmask** sliding window for O(1) replay detection:
+Header protection conceals the packet number and key phase bit from passive observers, preventing traffic analysis.
 
-- **`highest_processed_pn`**: Tracks the highest packet number successfully processed.
-- **Immediate Rejection:** Any packet with `PN ≤ highest_processed_pn - 128` is dropped.
-- **Bitmask Check:** Packets with `PN ≤ highest_processed_pn` are checked against the 128-bit bitmask and dropped if already seen.
-- **Window Slide:** When a new highest PN is processed, the bitmask shifts left by the difference and the new PN is recorded.
+**Applying (send path):**
+1. Sample 16 bytes from the ciphertext starting at `pn_offset + 4`
+2. Encrypt the sample with AES-128-ECB using the HP key (first 16 bytes of the 32-byte HP key)
+3. Derive a mask from the encrypted block
+4. XOR `packet[0]` with `mask[0] & 0x0F` (long header) or `mask[0] & 0x1F` (short header)
+5. XOR each PN byte `packet[pn_offset + i]` with `mask[i + 1]`
 
----
-
-## 8. Path MTU Discovery (PMTUD)
-
-ZT periodically probes the network path to discover the maximum transmission unit:
-
-- **Probe sizes:** `[1200, 1350, 1400, 1450, 1500]` bytes
-- **Probe interval:** Every 15 seconds
-- **Mechanism:** Send an `MtuProbe` (`0x06`) packet padded to the target size. If acknowledged, upgrade the MTU.
-- **Maximum:** 1500 bytes (Ethernet standard)
-- **Probe packets** are tracked in `mtu_probes` map and marked `is_mtu_probe = true` in the unacked packet store.
+**Removing (receive path):** Same operation (XOR is its own inverse), but the PN length is read from the first byte **after** removing the mask.
 
 ---
 
-## 9. Multiplexed Stream Management
+### Key Rotation
 
-### 9.1. Stream State
+Key rotation is triggered when a Data packet arrives with a Key Phase (KP) bit that differs from the expected phase:
 
-Each stream maintains:
-- **Ring buffer** (1MB, lazily allocated) for reordering out-of-order data.
-- **`expected_rx_offset`** / **`next_tx_offset`**: Track ordered delivery and transmission progress.
-- **`received_ranges`** (`BTreeMap<u64, u64>`): Track received byte ranges for gap detection and merge.
-- **Application channel** (`mpsc::Sender<Bytes>`): Delivers reassembled, in-order data to the user.
+1. If the packet number is ≥ the highest processed PN, the peer has initiated a rotation: call `CryptoContext::rotate_keys()` which saves the current RX keys as fallback, ratchets the secret, and derives new epoch keys.
+2. If the packet number is below the highest processed PN, this is a late packet from the previous epoch: decrypt with the fallback (`prev_rx_*`) keys.
 
-### 9.2. Data Reassembly
-
-1. Incoming `Stream` frames are written to the ring buffer at `offset % window_size`.
-2. Received ranges are merged (adjacent/overlapping ranges coalesced).
-3. Contiguous data starting from `expected_rx_offset` is extracted and delivered to the application channel.
-4. `ZtStream::send()` automatically chunks data to fit within `MTU - 64` bytes.
-
-### 9.3. Backpressure
-
-When the congestion window or remote flow window is full, `ZtStream::send()` returns `WouldBlock`. The stream awaits a `Notify` signal from the ACK handler, which fires when window space becomes available.
+This allows graceful handling of out-of-order packets across a key rotation boundary.
 
 ---
 
-## 10. Anti-Amplification & DoS Mitigation
+### Replay Protection
 
-| Mechanism | Description |
-|-----------|-------------|
-| **1200-byte minimum** | Initial packets below 1200 bytes are silently dropped. |
-| **3× amplification limit** | Server tracks `bytes_sent` vs `bytes_received` and drops packets if `bytes_sent > 3 × bytes_received`. |
-| **Stateless Retry** | Server allocates zero state for unvalidated clients. The HMAC-SHA256 cookie binds to `(IP, port, client_SCID, timestamp)` with 30-second expiry. |
-| **Handshake semaphore** | Maximum 256 concurrent handshake tasks prevent resource exhaustion. |
+The `ReplayWindow` tracks the 2048 most recent packet numbers in a bitmask (`[u64; 32]` = 2048 bits). On receipt:
+
+1. If `pn ≤ highest - 2048`: unconditional replay (drop)
+2. If `pn ≤ highest`: check the corresponding bitmask bit
+3. If `pn > highest`: advance the window
+
+ACK ranges for SACK are also derived from this bitmask via `get_ack_ranges()`.
 
 ---
+
+## Connection Lifecycle
+
+```
+ConnectionState::Handshaking  →  ConnectionState::Active  →  ConnectionState::Closing  →  ConnectionState::Closed
+```
+
+- **Handshaking:** Client sends Initial, awaits Handshake response. Actor does not process Data packets in this state.
+- **Active:** Normal data exchange. Actor processes Data, MtuProbe, and Close packets.
+- **Closing:** `ConnectionClose` frame sent; actor awaits acknowledgment or idle timeout (5 seconds).
+- **Closed:** Actor removes itself from the routing table and exits.
+
+**Idle timeout:** 60 seconds of inactivity causes the actor to exit and clean up.
+
+---
+
+## Stream Multiplexing
+
+Each connection can carry up to `MAX_CONCURRENT_STREAMS = 100` concurrent streams.
+
+Stream IDs follow a parity scheme to avoid collisions:
+- **Client-initiated:** Even IDs — 0, 2, 4, …
+- **Server-initiated:** Odd IDs — 1, 3, 5, …
+
+Stream 0 is always pre-created during the handshake on both sides and is immediately available after `connect()` / `accept()`.
+
+### Receive Buffer
+
+Per stream, received chunks are stored in a `BTreeMap<u64, Bytes>` keyed by byte offset. The actor delivers chunks to the application in order:
+
+1. On `Frame::Stream` arrival, the chunk is inserted into the map.
+2. A delivery loop checks whether `expected_rx_offset` is available in the map (or a chunk that overlaps it).
+3. Overlapping chunks are sliced at `expected_rx_offset` before delivery.
+4. Fully consumed chunks are removed from the map.
+
+This approach handles retransmissions and reordering without a pre-allocated ring buffer.
+
+### Backpressure
+
+Each stream has a `window_size` of 1 MB. If `buffered_bytes + incoming > window_size`, the incoming chunk is dropped (the peer will retransmit). The `window_size` field in ACK frames communicates the available window back to the sender.
+
+---
+
+## Flow Control
+
+Flow control operates at two levels:
+
+**Per-stream receive window:** `StreamState::window_size` (1 MB). The receiver's current available window is advertised in every ACK frame's `window_size` field. If the sender's `remote_window` is less than the chunk size, `process_outgoing_data` returns `ZtError::FlowControlBlocked`.
+
+**Connection-level window:** `ZtConnection::local_window` is recalculated as `1 MB - sum(buffered_bytes across all streams)` before each ACK flush or MTU probe.
+
+When `FlowControlBlocked` or `CongestionWindowFull` is returned from the actor, `ZtStream::send()` waits on `window_opened.notified()` — a `tokio::sync::Notify` that is triggered whenever an ACK is processed.
+
+---
+
+## Congestion Control
+
+ZettaTransport implements a TCP-like AIMD algorithm with CUBIC-inspired loss response.
+
+### Slow Start
+
+```
+if cwnd < ssthresh:
+    cwnd += bytes_acked
+```
+
+Initial values: `cwnd = 10 × 1200 = 12000`, `ssthresh = 65536`.
+
+### Congestion Avoidance
+
+```
+if cwnd >= ssthresh:
+    cwnd += (mtu × bytes_acked) / cwnd
+```
+
+This is the standard AIMD additive increase formula.
+
+### Loss Detection
+
+Two mechanisms:
+
+1. **Fast Retransmit (SACK-based):** Any unacknowledged packet with `pn + 3 ≤ largest_acked` is considered lost and retransmitted immediately. This is equivalent to the 3-duplicate-ACK threshold in TCP.
+
+2. **RTO (Retransmit Timeout):** Packets unacknowledged for longer than `rtt + 4 × rttvar` (minimum 50ms) are retransmitted. After 10 retries, the packet is abandoned.
+
+### RTT Estimation
+
+Follows RFC 6298:
+
+```
+On first sample:
+    rtt    = sample
+    rttvar = sample / 2
+
+Subsequent samples:
+    rttvar = (3 × rttvar + |rtt - sample|) / 4
+    rtt    = (7 × rtt + sample) / 8
+```
+
+Only unretransmitted packets (`retries == 0`) contribute to RTT samples to avoid Karn's algorithm violations.
+
+### Loss Response (CUBIC-inspired)
+
+```
+ssthresh = max(cwnd × 0.7, 2 × mtu)
+cwnd     = ssthresh
+```
+
+The multiplicative decrease factor is 0.7 (versus TCP Reno's 0.5), matching CUBIC's `β_cubic`.
+
+---
+
+## Path MTU Discovery
+
+The actor sends MTU probe packets every 15 seconds. Probes are short-header Data packets padded to a target size with `Frame::Padding`:
+
+**Probe sizes tried (bytes):** `1200 → 1350 → 1400 → 1450 → 1500`
+
+The actor selects the smallest probe size larger than the current MTU. If a probe is acknowledged (either via cumulative ACK or SACK), the MTU is upgraded:
+
+```rust
+if up.is_mtu_probe && up.payload.len() > self.mtu {
+    self.mtu = up.payload.len();
+}
+```
+
+Probes are tracked in `mtu_probes: HashMap<u64, usize>` (PN → target size). MTU probes are not retransmitted on loss — a new probe cycle begins at the next 15-second interval.
+
+The current MTU affects stream chunking: `chunk_size = mtu - 64` (leaving room for headers and AEAD tag).
+
+---
+
+## Actor Model
+
+Each connection is managed by a `ZtConnectionActor` — a Tokio task that owns all mutable state for that connection. This design eliminates lock contention: the actor is the only writer of `ZtConnection`.
+
+### `ActorMessage`
+
+Messages sent to the actor via an unbounded `mpsc::channel(1024)`:
+
+| Message | Sender | Purpose |
+|---|---|---|
+| `IncomingPacket { data, addr }` | Packet router | Deliver a received datagram |
+| `OutgoingData { stream_id, data, respond_to }` | `ZtStream::send()` | Send application data |
+| `GetMtu { respond_to }` | `ZtStream::send()` | Query current MTU |
+| `CloseStream { stream_id }` | `ZtStream::close()` | Close a specific stream |
+| `OpenStream { respond_to }` | `ZtConnectionHandle::open_stream()` | Open a new stream |
+| `Close` | `ZtConnectionHandle::close()` | Close the connection |
+
+The actor uses `try_send` for internal operations where dropping is acceptable (e.g., delayed ACK timer overflow) and awaited `send` for application-facing responses.
+
+---
+
+## Packet Routing
+
+The `ZtEndpoint` maintains a `DashMap<Vec<u8>, mpsc::Sender<ActorMessage>>` routing table keyed on the **local SCID** (which is the DCID from the peer's perspective).
+
+**Dispatch logic (in `start_router`):**
+
+1. Call `extract_dcid_fast()` on the raw datagram — this reads the DCID length and bytes without full header parsing.
+2. Look up the DCID in the routing table.
+3. If found: `try_send(IncomingPacket)` to the actor channel. Drops the packet if the channel is full (backpressure).
+4. If not found: spawn `handle_handshake()` to attempt a new handshake.
+
+`extract_dcid_fast` handles both long-header (offset 5, length at byte 5) and short-header (offset 1, length at byte 1) formats.
+
+---
+
+## Timers
+
+Each actor manages four independent timers using `tokio::time::sleep_until` + `tokio::pin!`:
+
+| Timer | Default | Behaviour |
+|---|---|---|
+| `rto_timer` | `rtt` (333ms initial) | Triggers `handle_retransmits()` for unacknowledged packets |
+| `idle_timer` | 60 seconds | Closes the connection if no messages arrive |
+| `delayed_ack_timer` | Off (1 year) | Activates 25ms after the first unacknowledged incoming packet |
+| `mtu_probe_timer` | 15 seconds | Sends an MTU probe packet |
+
+The delayed ACK timer implements **delayed acknowledgment**: ACKs are batched for up to 25ms or until 10 frames have arrived (whichever comes first), reducing ACK traffic.
+
+After a `CloseStream` or `Close` message, the idle timer is shortened to 5 seconds to allow the close packet to be acknowledged before the actor exits.
