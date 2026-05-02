@@ -210,50 +210,52 @@ All packets are UDP datagrams. The first byte determines whether the packet has 
 Used for Initial, Handshake, and Retry packets.
 
 ```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-├─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┤
-│1│  Packet Type  │  PN Len   │          Version (32-bit)          │
-├─┴───────────────┴───────────┼─────────────────────────────────────┤
-│  DCID Length (8-bit)        │  DCID (variable)                   │
-├─────────────────────────────┤                                     │
-│  SCID Length (8-bit)        │  SCID (variable)                   │
-├─────────────────────────────┴─────────────────────────────────────┤
-│  Packet Number (1–4 bytes, truncated)                             │
-├───────────────────────────────────────────────────────────────────┤
-│  Payload (encrypted)                                              │
-├───────────────────────────────────────────────────────────────────┤
-│  AEAD Tag (16 bytes)                                              │
-└───────────────────────────────────────────────────────────────────┘
+Byte 0 (first byte):
+  bit 7   : 1 (long header flag)
+  bit 6   : 0 (reserved, unused)
+  bits 5-2: Packet Type (4 bits)
+  bits 1-0: PN Length encoding — actual pn_len = (bits1-0) + 1
+
+  first_byte = 0x80 | ((packet_type & 0x0F) << 2) | (pn_len - 1)
+
+Bytes 1–4 : Version (u32, big-endian) — always 1
+Byte  5   : DCID Length (u8)
+Bytes 6…  : DCID (variable, DCID Length bytes)
+Next byte : SCID Length (u8)
+Next bytes: SCID (variable, SCID Length bytes)
+Next bytes: Packet Number (pn_len bytes, truncated, big-endian)
+Remaining : Encrypted payload
+Last 16 B : AEAD tag (ChaCha20-Poly1305)
 ```
 
-- **First byte:** `1 | (packet_type << 2) | (pn_len - 1)`
 - **Version:** Always `1` for ZettaTransport v1
-- **DCID / SCID:** Variable length, prefixed by a 1-byte length field
-- **PN Len:** Encoded in bits 0–1 of the first byte as `(pn_len - 1)`
+- **DCID / SCID:** Variable length, each prefixed by a 1-byte length field
+- **PN Len:** `pn_len = (first_byte & 0x03) + 1` → 1 to 4 bytes
 
 ### Short Header Packets
 
 Used for Data, Close, and MtuProbe packets once a connection is established.
 
 ```
- 0                   1
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5
-├─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┼─┤
-│0│KP│Pkt Type │PN│ DCID Length  │
-├─┴──┴─────────┴──┴──────────────┤
-│  DCID (variable)               │
-├────────────────────────────────┤
-│  Packet Number (1–4 bytes)     │
-├────────────────────────────────┤
-│  Payload (encrypted)           │
-├────────────────────────────────┤
-│  AEAD Tag (16 bytes)           │
-└────────────────────────────────┘
+Byte 0 (first byte):
+  bit 7   : 0 (short header flag)
+  bit 6   : Key Phase (KP) — toggles on each key rotation epoch
+  bits 5-2: Packet Type (4 bits)
+  bits 1-0: PN Length encoding — actual pn_len = (bits1-0) + 1
+
+  first_byte = ((packet_type & 0x0F) << 2) | (pn_len - 1)
+               | (0x40 if key_phase)
+
+Byte  1   : DCID Length (u8)
+Next bytes: DCID (variable, DCID Length bytes)
+Next bytes: Packet Number (pn_len bytes, truncated, big-endian)
+Remaining : Encrypted payload
+Last 16 B : AEAD tag (ChaCha20-Poly1305)
 ```
 
-- **KP (bit 6):** Key Phase bit — toggles on each key rotation epoch
-- **Pkt Type:** Encoded in bits 2–5
+- **KP (bit 6):** Key Phase — set via `first_byte |= 0x40`; decoded as `(first_byte & 0x40) != 0`
+- **Packet Type:** `(first_byte >> 2) & 0x0F`
+- **PN Len:** `(first_byte & 0x03) + 1`, read **after** header protection is removed
 
 ### Packet Types
 
