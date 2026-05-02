@@ -1,4 +1,4 @@
-# ZettaTransport Protocol Specification (ZT-v0.1.7)
+# ZettaTransport Protocol Specification (ZT-v0.1.9)
 
 **Author:** Burak Demir <demirburak8338@gmail.com>  
 **Status:** Experimental / Active Development  
@@ -280,7 +280,7 @@ Uses the standard TCP RTT estimator (RFC 6298):
 - Loss is detected via **RTO timer expiration** for unacked Data packets.
 - Each packet is retransmitted up to **10 times** before being dropped.
 - If all unacked packets exceed the retry limit, the connection is terminated.
-- ZT does **not** implement Fast Retransmit (3-duplicate-ACKs) in v0.1.7.
+- ZT does **not** implement Fast Retransmit (3-duplicate-ACKs) in v0.1.9.
 
 ### 6.4. Flow Control
 

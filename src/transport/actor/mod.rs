@@ -77,7 +77,9 @@ impl ZtConnectionActor {
         incoming_streams_tx: mpsc::Sender<ZtStream>,
         is_client: bool,
     ) -> Self {
-        let next_stream_id = if is_client { 0 } else { 1 };
+        // Client uses even stream IDs, Server uses odd stream IDs.
+        // Stream 0 is explicitly created during handshake, so client starts at 2.
+        let next_stream_id = if is_client { 2 } else { 1 };
         Self {
             endpoint,
             socket,

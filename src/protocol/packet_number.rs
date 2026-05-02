@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 pub(crate) fn decode_pn_len(first_byte: u8) -> usize {
     (first_byte & 0x03) as usize + 1
 }

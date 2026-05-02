@@ -50,6 +50,14 @@ impl Drop for CryptoContext {
         if let Some(ref mut k) = self.prev_rx_iv {
             k.zeroize();
         }
+        
+        // Overwrite ciphers with zero-key instances to clear key material
+        let zero_key = chacha20poly1305::Key::from([0u8; 32]);
+        self.tx_cipher = ChaCha20Poly1305::new(&zero_key);
+        self.rx_cipher = ChaCha20Poly1305::new(&zero_key);
+        if let Some(ref mut prev_cipher) = self.prev_rx_cipher {
+            *prev_cipher = ChaCha20Poly1305::new(&zero_key);
+        }
     }
 }
 

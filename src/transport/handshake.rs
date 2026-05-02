@@ -52,7 +52,10 @@ pub(crate) async fn handle_handshake(
 
     let header = match PacketHeader::decode(&mut data_cursor) {
         Ok(h) => h,
-        Err(e) => return Ok(()),
+        Err(e) => {
+            tracing::debug!("Failed to decode packet header in handshake: {:?}", e);
+            return Ok(());
+        }
     };
     let header_len = initial_len - data_cursor.remaining();
     let aad = &original_data[..header_len];
@@ -71,6 +74,7 @@ pub(crate) async fn handle_handshake(
 
     let crypto = CryptoContext::initial(&header.dcid, false);
     if let Err(e) = crypto.decrypt_in_place(header.packet_number, aad, &mut payload, &tag, false) {
+        tracing::debug!("Handshake decryption failed: {:?}", e);
         return Ok(());
     }
 
@@ -223,6 +227,25 @@ pub(crate) async fn handle_handshake(
         );
 
         endpoint.routing_table.insert(scid.clone(), actor_tx);
+
+        struct RoutingTableGuard {
+            table: Arc<dashmap::DashMap<Vec<u8>, mpsc::Sender<crate::transport::actor::ActorMessage>>>,
+            scid: Vec<u8>,
+            commit: bool,
+        }
+        impl Drop for RoutingTableGuard {
+            fn drop(&mut self) {
+                if !self.commit {
+                    self.table.remove(&self.scid);
+                }
+            }
+        }
+        let mut cleanup_guard = RoutingTableGuard {
+            table: endpoint.routing_table.clone(),
+            scid: scid.clone(),
+            commit: false,
+        };
+
         tokio::spawn(actor.run());
 
         let conn_handle = ZtConnectionHandle::new(endpoint.clone(), scid.clone(), stream_rx);
@@ -234,8 +257,7 @@ pub(crate) async fn handle_handshake(
                 "Server accept queue is full. Dropping incoming connection from {:?}",
                 addr
             );
-            endpoint.routing_table.remove(&scid);
-            return Ok(());
+            return Ok(()); // cleanup_guard will remove it from routing_table
         }
 
         let pn_len = 1; // Handshake PN is typically 0, so 1 byte is enough.
@@ -287,6 +309,7 @@ pub(crate) async fn handle_handshake(
         if let Err(e) = endpoint.socket.try_send_to(packet_slice, addr) {
             tracing::debug!("Failed to send: {}", e);
         }
+        cleanup_guard.commit = true;
     }
     Ok(())
 }

@@ -23,11 +23,14 @@ impl ZtConnectionActor {
         }
         let tag = payload.split_off(payload.len() - 16);
         let mut payload_mut = payload.to_vec();
+        let tag_array: [u8; 16] = tag[..16]
+            .try_into()
+            .map_err(|_| ZtError::Crypto("Invalid tag length".into()))?;
         crypto.decrypt_in_place(
             header.packet_number,
             aad,
             &mut payload_mut,
-            &tag[..16].try_into().unwrap(),
+            &tag_array,
             false,
         )?;
         let mut payload_bytes = Bytes::from(payload_mut);
