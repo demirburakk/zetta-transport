@@ -24,10 +24,11 @@ pub(crate) fn apply_header_protection(
     let mask = block.as_slice();
 
     let is_long = (packet[0] & 0x80) != 0;
+    let pn_len = (packet[0] & 0x03) as usize + 1;
     let first_mask = mask[0] & if is_long { 0x0F } else { 0x1F };
     packet[0] ^= first_mask;
 
-    for i in 0..4 {
+    for i in 0..pn_len {
         if pn_offset + i < packet.len() {
             packet[pn_offset + i] ^= mask[i + 1];
         }
@@ -63,7 +64,9 @@ pub(crate) fn remove_header_protection(
     let first_mask = mask[0] & if is_long { 0x0F } else { 0x1F };
     packet[0] ^= first_mask;
 
-    for i in 0..4 {
+    let pn_len = (packet[0] & 0x03) as usize + 1;
+
+    for i in 0..pn_len {
         if pn_offset + i < packet.len() {
             packet[pn_offset + i] ^= mask[i + 1];
         }

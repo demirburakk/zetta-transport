@@ -27,6 +27,12 @@ pub(crate) async fn handle_handshake(
     data: Bytes,
     addr: SocketAddr,
 ) -> Result<()> {
+    let _permit = endpoint
+        .handshake_semaphore
+        .acquire()
+        .await
+        .map_err(|_| ZtError::ActorFailed)?;
+
     if data.len() < 1200 {
         return Ok(()); // Anti-amplification drop
     }
@@ -44,7 +50,10 @@ pub(crate) async fn handle_handshake(
     let mut data_cursor = original_data.clone();
     let initial_len = data_cursor.remaining();
 
-    let header = PacketHeader::decode(&mut data_cursor)?;
+    let header = match PacketHeader::decode(&mut data_cursor) {
+        Ok(h) => h,
+        Err(e) => return Ok(()),
+    };
     let header_len = initial_len - data_cursor.remaining();
     let aad = &original_data[..header_len];
 
@@ -61,10 +70,7 @@ pub(crate) async fn handle_handshake(
     tag.copy_from_slice(&tag_bytes);
 
     let crypto = CryptoContext::initial(&header.dcid, false);
-    if crypto
-        .decrypt_in_place(header.packet_number, aad, &mut payload, &tag, false)
-        .is_err()
-    {
+    if let Err(e) = crypto.decrypt_in_place(header.packet_number, aad, &mut payload, &tag, false) {
         return Ok(());
     }
 
@@ -110,22 +116,20 @@ pub(crate) async fn handle_handshake(
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    let is_cookie_valid = cookie_data
-        .as_deref()
-        .is_some_and(|c| {
-            cookie::verify_retry_cookie(
-                &endpoint.cookie_key,
-                &addr,
-                &header.scid,
-                c,
-                current_time,
-            )
-        });
+    let is_cookie_valid = cookie_data.as_deref().is_some_and(|c| {
+        cookie::verify_retry_cookie(&endpoint.cookie_key, &addr, &header.scid, c, current_time)
+    });
 
     if !is_cookie_valid {
         let new_cookie =
             cookie::make_retry_cookie(&endpoint.cookie_key, &addr, &header.scid, current_time);
-        send_retry(&endpoint, addr, &header.scid, header.packet_number, &new_cookie)?;
+        send_retry(
+            &endpoint,
+            addr,
+            &header.scid,
+            header.packet_number,
+            &new_cookie,
+        )?;
         return Ok(());
     }
 
@@ -139,6 +143,9 @@ pub(crate) async fn handle_handshake(
         sha2::Digest::update(&mut hasher, &header.scid);
         sha2::Digest::update(&mut hasher, &header.dcid);
         sha2::Digest::update(&mut hasher, pk_bytes);
+        if let Some(ref c) = cookie_data {
+            sha2::Digest::update(&mut hasher, c);
+        }
         let expected_hash = sha2::Digest::finalize(hasher).to_vec();
 
         if expected_hash != remote_transcript_hash {
@@ -155,8 +162,9 @@ pub(crate) async fn handle_handshake(
             return Err(ZtError::Unauthorized);
         }
 
+        let (ephemeral_secret, ephemeral_public) = crate::crypto::keypair::generate_keypair();
         let shared = crate::crypto::keypair::compute_shared_secret(
-            &endpoint.static_secret,
+            &ephemeral_secret,
             PublicKey::from(pk_bytes),
         );
 
@@ -202,8 +210,8 @@ pub(crate) async fn handle_handshake(
             endpoint.socket.clone(),
             actor_rx,
             new_conn,
-            endpoint.public_key,
-            endpoint.static_secret.clone(),
+            ephemeral_public,
+            ephemeral_secret,
             endpoint.ed_signing_key.clone(),
             endpoint.ed_public_key,
             endpoint.psk,
@@ -211,6 +219,7 @@ pub(crate) async fn handle_handshake(
             endpoint.routing_table.clone(),
             scid.clone(),
             stream_tx.clone(),
+            false,
         );
 
         endpoint.routing_table.insert(scid.clone(), actor_tx);
@@ -229,6 +238,7 @@ pub(crate) async fn handle_handshake(
             return Ok(());
         }
 
+        let pn_len = 1; // Handshake PN is typically 0, so 1 byte is enough.
         let hs_header = PacketHeader {
             p_type: PacketType::Handshake,
             is_long: true,
@@ -237,6 +247,7 @@ pub(crate) async fn handle_handshake(
             scid: scid.clone(),
             packet_number: handshake_pn,
             key_phase: false,
+            pn_len,
         };
         let mut buf = BytesMut::with_capacity(256);
         hs_header.encode(&mut buf);
@@ -246,17 +257,14 @@ pub(crate) async fn handle_handshake(
         sha2::Digest::update(&mut hasher, &header.scid);
         sha2::Digest::update(&mut hasher, &scid);
         sha2::Digest::update(&mut hasher, pk_bytes);
-        sha2::Digest::update(&mut hasher, endpoint.public_key.as_bytes());
+        sha2::Digest::update(&mut hasher, ephemeral_public.as_bytes());
         let transcript_hash = sha2::Digest::finalize(hasher).to_vec();
 
         let frame = Frame::Handshake {
-            public_key: *endpoint.public_key.as_bytes(),
+            public_key: *ephemeral_public.as_bytes(),
             ed_public_key: *endpoint.ed_public_key.as_bytes(),
             transcript_hash: transcript_hash.clone(),
-            signature: endpoint
-                .ed_signing_key
-                .sign(&transcript_hash)
-                .to_bytes(),
+            signature: endpoint.ed_signing_key.sign(&transcript_hash).to_bytes(),
         };
         frame.encode(&mut buf);
         let payload_len = buf.len() - header_len;
@@ -288,10 +296,10 @@ pub(crate) async fn handle_handshake(
 /// Retry packets carry a plaintext token and have no encrypted payload,
 /// so header protection is not applied.
 fn send_retry(
-    endpoint: &ZtEndpoint,
+    endpoint: &Arc<ZtEndpoint>,
     addr: SocketAddr,
     client_scid: &[u8],
-    _packet_number: u64,
+    pn: u64,
     cookie_bytes: &[u8; 40],
 ) -> Result<()> {
     let retry_header = PacketHeader {
@@ -299,9 +307,10 @@ fn send_retry(
         is_long: true,
         version: 1,
         dcid: client_scid.to_vec(),
-        scid: vec![],
-        packet_number: 0,
+        scid: Vec::new(),
+        packet_number: pn,
         key_phase: false,
+        pn_len: 1,
     };
 
     let mut buf = BytesMut::with_capacity(128);

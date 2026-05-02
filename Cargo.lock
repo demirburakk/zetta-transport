@@ -1048,6 +1048,7 @@ dependencies = [
  "libc",
  "rand",
  "sha2 0.11.0",
+ "subtle",
  "thiserror",
  "tokio",
  "tokio-util",

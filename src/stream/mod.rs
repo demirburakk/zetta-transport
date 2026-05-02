@@ -93,7 +93,6 @@ impl ZtStream {
         Ok(())
     }
 
-
     /// Receives a decrypted, in-order chunk of data from the remote peer.
     /// Returns `None` if the stream is closed.
     pub async fn recv(&mut self) -> Option<Bytes> {

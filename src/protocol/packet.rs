@@ -1,9 +1,6 @@
 use crate::error::{Result, ZtError};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-/// Packet types for ZettaTransport.
-/// Note: Packet types and Frame types exist in separate namespaces.
-/// E.g., PacketType::MtuProbe (0x06) is distinct from Frame::StreamClose (0x06).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PacketType {
     Initial = 0x00,
@@ -23,6 +20,7 @@ pub struct PacketHeader {
     pub scid: Vec<u8>,
     pub packet_number: u64,
     pub key_phase: bool,
+    pub pn_len: usize,
 }
 
 impl PacketHeader {
@@ -56,24 +54,44 @@ impl PacketHeader {
     }
 
     pub(crate) fn encode(&self, dst: &mut BytesMut) {
+        let pn_len = self.pn_len.clamp(1, 4);
+        let len_bits = (pn_len - 1) as u8;
+        let mask = match pn_len {
+            1 => 0xFF,
+            2 => 0xFFFF,
+            3 => 0xFFFFFF,
+            4 => 0xFFFFFFFF,
+            _ => 0xFFFFFFFF,
+        };
+        let truncated_pn = (self.packet_number & mask) as u32;
+
         if self.is_long {
-            let first_byte = 0x80 | (self.p_type as u8);
+            let first_byte = 0x80 | ((self.p_type as u8 & 0x0F) << 2) | len_bits;
             dst.put_u8(first_byte);
             dst.put_u32(self.version);
             dst.put_u8(self.dcid.len() as u8);
             dst.put_slice(&self.dcid);
             dst.put_u8(self.scid.len() as u8);
             dst.put_slice(&self.scid);
-            dst.put_u64(self.packet_number);
         } else {
-            let mut first_byte = self.p_type as u8 & 0x3F;
+            let mut first_byte = ((self.p_type as u8 & 0x0F) << 2) | len_bits;
             if self.key_phase {
-                first_byte |= 0x40; // Set Key Phase bit
+                first_byte |= 0x40;
             }
             dst.put_u8(first_byte);
             dst.put_u8(self.dcid.len() as u8);
             dst.put_slice(&self.dcid);
-            dst.put_u64(self.packet_number);
+        }
+
+        match pn_len {
+            1 => dst.put_u8(truncated_pn as u8),
+            2 => dst.put_u16(truncated_pn as u16),
+            3 => {
+                let bytes = truncated_pn.to_be_bytes();
+                dst.put_slice(&bytes[1..4]);
+            }
+            4 => dst.put_u32(truncated_pn),
+            _ => unreachable!(),
         }
     }
 
@@ -81,12 +99,12 @@ impl PacketHeader {
         if src.remaining() < 1 {
             return Err(ZtError::InvalidPacket("Empty buffer".into()));
         }
-
         let first_byte = src.get_u8();
         let is_long = (first_byte & 0x80) != 0;
+        let pn_len = (first_byte & 0x03) as usize + 1;
+        let p_type_val = (first_byte >> 2) & 0x0F;
 
         if is_long {
-            let p_type_val = first_byte & 0x0F;
             let p_type = match p_type_val {
                 0x00 => PacketType::Initial,
                 0x01 => PacketType::Handshake,
@@ -94,32 +112,35 @@ impl PacketHeader {
                 0x07 => PacketType::Retry,
                 _ => return Err(ZtError::InvalidPacket("Invalid long packet type".into())),
             };
-
-            if src.remaining() < 14 {
-                return Err(ZtError::InvalidPacket(
-                    "Packet too short for long header".into(),
-                ));
+            if src.remaining() < 5 + pn_len {
+                return Err(ZtError::InvalidPacket("Short".into()));
             }
-
             let version = src.get_u32();
-
             let dcid_len = src.get_u8() as usize;
             if src.remaining() < dcid_len {
                 return Err(ZtError::InvalidPacket("Truncated DCID".into()));
             }
             let dcid = src.copy_to_bytes(dcid_len).to_vec();
-
             if src.remaining() < 1 {
-                return Err(ZtError::InvalidPacket("Missing SCID length".into()));
+                return Err(ZtError::InvalidPacket("Missing SCID len".into()));
             }
             let scid_len = src.get_u8() as usize;
-            if src.remaining() < scid_len + 8 {
-                return Err(ZtError::InvalidPacket(
-                    "Truncated SCID or missing PN".into(),
-                ));
+            if src.remaining() < scid_len + pn_len {
+                return Err(ZtError::InvalidPacket("Truncated".into()));
             }
             let scid = src.copy_to_bytes(scid_len).to_vec();
-            let packet_number = src.get_u64();
+
+            let truncated_pn = match pn_len {
+                1 => src.get_u8() as u64,
+                2 => src.get_u16() as u64,
+                3 => {
+                    let mut b = [0u8; 4];
+                    src.copy_to_slice(&mut b[1..4]);
+                    u32::from_be_bytes(b) as u64
+                }
+                4 => src.get_u32() as u64,
+                _ => unreachable!(),
+            };
 
             Ok(Self {
                 p_type,
@@ -127,33 +148,38 @@ impl PacketHeader {
                 version,
                 dcid,
                 scid,
-                packet_number,
+                packet_number: truncated_pn,
                 key_phase: false,
+                pn_len,
             })
         } else {
             let key_phase = (first_byte & 0x40) != 0;
-            let p_type_val = first_byte & 0x3F;
             let p_type = match p_type_val {
                 0x02 => PacketType::Data,
                 0x05 => PacketType::Close,
                 0x06 => PacketType::MtuProbe,
                 _ => return Err(ZtError::InvalidPacket("Invalid short packet type".into())),
             };
-
-            if src.remaining() < 9 {
-                return Err(ZtError::InvalidPacket(
-                    "Packet too short for short header".into(),
-                ));
+            if src.remaining() < 1 + pn_len {
+                return Err(ZtError::InvalidPacket("Short".into()));
             }
-
             let dcid_len = src.get_u8() as usize;
-            if src.remaining() < dcid_len + 8 {
-                return Err(ZtError::InvalidPacket(
-                    "Truncated DCID or missing PN".into(),
-                ));
+            if src.remaining() < dcid_len + pn_len {
+                return Err(ZtError::InvalidPacket("Truncated".into()));
             }
             let dcid = src.copy_to_bytes(dcid_len).to_vec();
-            let packet_number = src.get_u64();
+
+            let truncated_pn = match pn_len {
+                1 => src.get_u8() as u64,
+                2 => src.get_u16() as u64,
+                3 => {
+                    let mut b = [0u8; 4];
+                    src.copy_to_slice(&mut b[1..4]);
+                    u32::from_be_bytes(b) as u64
+                }
+                4 => src.get_u32() as u64,
+                _ => unreachable!(),
+            };
 
             Ok(Self {
                 p_type,
@@ -161,8 +187,9 @@ impl PacketHeader {
                 version: 0,
                 dcid,
                 scid: vec![],
-                packet_number,
+                packet_number: truncated_pn,
                 key_phase,
+                pn_len,
             })
         }
     }

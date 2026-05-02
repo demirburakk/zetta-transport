@@ -13,8 +13,7 @@ pub(crate) fn make_retry_cookie(
     client_scid: &[u8],
     now: u64,
 ) -> [u8; 40] {
-    let mut hmac =
-        HmacSha256::new_from_slice(cookie_key).expect("HMAC can take any key size");
+    let mut hmac = HmacSha256::new_from_slice(cookie_key).expect("HMAC can take any key size");
     match addr.ip() {
         std::net::IpAddr::V4(v4) => hmac.update(&v4.octets()),
         std::net::IpAddr::V6(v6) => hmac.update(&v6.octets()),
@@ -53,5 +52,5 @@ pub(crate) fn verify_retry_cookie(
     }
 
     let expected = make_retry_cookie(cookie_key, addr, client_scid, cookie_time);
-    expected[8..40] == cookie[8..40]
+    subtle::ConstantTimeEq::ct_eq(&expected[8..40], &cookie[8..40]).into()
 }

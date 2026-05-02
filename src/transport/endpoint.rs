@@ -11,7 +11,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot};
-use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Type alias for the optional peer key verification callback.
 pub type PeerKeyVerifier = Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>;
@@ -24,15 +23,13 @@ pub type PeerKeyVerifier = Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>;
 pub struct ZtEndpoint {
     pub(crate) socket: Arc<UdpSocket>,
     pub(crate) routing_table: Arc<DashMap<Vec<u8>, mpsc::Sender<ActorMessage>>>,
-    pub(crate) static_secret: StaticSecret,
-    pub public_key: PublicKey,
     // Signing key must stay private; only the verifying key is shared.
     pub(crate) ed_signing_key: SigningKey,
     pub ed_public_key: VerifyingKey,
     pub(crate) psk: Option<[u8; 32]>,
     pub(crate) cookie_key: [u8; 32],
     pub verify_peer_key: Option<PeerKeyVerifier>,
-    handshake_semaphore: Arc<Semaphore>,
+    pub(crate) handshake_semaphore: Arc<Semaphore>,
 
     incoming_rx: Mutex<mpsc::Receiver<ZtConnectionHandle>>,
     pub(crate) incoming_tx: mpsc::Sender<ZtConnectionHandle>,
@@ -41,8 +38,6 @@ pub struct ZtEndpoint {
 impl ZtEndpoint {
     /// Binds an endpoint to the given local address.
     pub async fn bind(addr: &str, psk: Option<[u8; 32]>) -> Result<Arc<Self>> {
-        let (secret, public) = crate::crypto::keypair::generate_keypair();
-
         let mut csprng = rand::rngs::OsRng;
         let ed_signing_key = SigningKey::generate(&mut csprng);
         let ed_public_key = ed_signing_key.verifying_key();
@@ -54,8 +49,6 @@ impl ZtEndpoint {
         let endpoint = Arc::new(Self {
             socket,
             routing_table: Arc::new(DashMap::new()),
-            static_secret: secret,
-            public_key: public,
             ed_signing_key,
             ed_public_key,
             psk,
@@ -74,10 +67,16 @@ impl ZtEndpoint {
     /// to the correct per-connection actor or initiates new handshakes.
     fn start_router(endpoint: Arc<Self>) {
         tokio::spawn(async move {
-            let mut buf = [0u8; 2048]; // Handle padded initial packets
+            let mut buf = bytes::BytesMut::zeroed(2048);
             loop {
                 if let Ok((len, addr)) = endpoint.socket.recv_from(&mut buf).await {
-                    let data = Bytes::copy_from_slice(&buf[..len]);
+                    let data = buf.split_to(len);
+                    if buf.capacity() < 2048 {
+                        buf = bytes::BytesMut::zeroed(2048);
+                    } else {
+                        // Restore zeroed size for recv_from
+                        buf.resize(2048, 0);
+                    }
 
                     if let Some(dcid) = crate::protocol::routing::extract_dcid_fast(&data) {
                         if let Some(tx) = endpoint.routing_table.get(&dcid) {
@@ -87,26 +86,14 @@ impl ZtEndpoint {
                                 tracing::trace!("Dropped packet for {:?}: queue full", dcid);
                             }
                         } else {
-                            // Prevent unbounded task spawning on spoofed/unknown DCIDs.
-                            let permit =
-                                match endpoint.handshake_semaphore.clone().try_acquire_owned() {
-                                    Ok(p) => p,
-                                    Err(_) => {
-                                        tracing::debug!(
-                                            "Handshake shed load: too many concurrent attempts"
-                                        );
-                                        continue;
-                                    }
-                                };
-
                             let ep_clone = endpoint.clone();
                             tokio::spawn(async move {
-                                let _permit = permit;
-                                if let Err(e) =
-                                    crate::transport::handshake::handle_handshake(
-                                        ep_clone, data, addr,
-                                    )
-                                    .await
+                                if let Err(e) = crate::transport::handshake::handle_handshake(
+                                    ep_clone,
+                                    data.freeze(),
+                                    addr,
+                                )
+                                .await
                                 {
                                     tracing::debug!("Handshake failed: {:?}", e);
                                 }
@@ -145,12 +132,7 @@ impl ZtEndpoint {
                 respond_to: resp_tx,
             })
             .await
-            .map_err(|e| {
-                ZtError::Io(std::io::Error::other(format!(
-                    "Actor send failed: {}",
-                    e
-                )))
-            })?;
+            .map_err(|e| ZtError::Io(std::io::Error::other(format!("Actor send failed: {}", e))))?;
             return resp_rx.await.unwrap_or(Err(ZtError::ActorFailed));
         }
         Err(ZtError::ActorFailed)
@@ -223,13 +205,15 @@ impl ZtEndpoint {
 
         let (wait_tx, wait_rx) = oneshot::channel();
 
+        let (ephemeral_secret, ephemeral_public) = crate::crypto::keypair::generate_keypair();
+
         let actor = ZtConnectionActor::new(
             self.clone(),
             self.socket.clone(),
             actor_rx,
             conn,
-            self.public_key,
-            self.static_secret.clone(),
+            ephemeral_public,
+            ephemeral_secret,
             self.ed_signing_key.clone(),
             self.ed_public_key,
             self.psk,
@@ -237,6 +221,7 @@ impl ZtEndpoint {
             self.routing_table.clone(),
             scid.clone(),
             stream_tx.clone(),
+            true,
         );
 
         self.routing_table.insert(scid.clone(), actor_tx);

@@ -6,7 +6,7 @@ mod packet_sender;
 use crate::error::Result;
 use crate::stream::ZtStream;
 use crate::transport::connection::ZtConnection;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::net::SocketAddr;
@@ -18,7 +18,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 /// Messages exchanged between the endpoint API layer and the per-connection actor.
 pub(crate) enum ActorMessage {
     IncomingPacket {
-        data: Bytes,
+        data: BytesMut,
         addr: SocketAddr,
     },
     OutgoingData {
@@ -75,7 +75,9 @@ impl ZtConnectionActor {
         routing_table: Arc<DashMap<Vec<u8>, mpsc::Sender<ActorMessage>>>,
         scid: Vec<u8>,
         incoming_streams_tx: mpsc::Sender<ZtStream>,
+        is_client: bool,
     ) -> Self {
+        let next_stream_id = if is_client { 0 } else { 1 };
         Self {
             endpoint,
             socket,
@@ -92,7 +94,7 @@ impl ZtConnectionActor {
             scid,
             last_active_stream_id: 0,
             incoming_streams_tx,
-            next_stream_id: 1,
+            next_stream_id,
         }
     }
 

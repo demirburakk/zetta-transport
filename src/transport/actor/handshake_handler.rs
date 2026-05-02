@@ -11,22 +11,40 @@ use x25519_dalek::PublicKey;
 
 impl ZtConnectionActor {
     pub(super) fn handle_handshake_response(
-        &mut self, header: PacketHeader, mut payload: Bytes,
-        aad: &[u8], addr: SocketAddr,
+        &mut self,
+        header: PacketHeader,
+        mut payload: Bytes,
+        aad: &[u8],
+        addr: SocketAddr,
     ) -> Result<()> {
         let crypto = crate::crypto::CryptoContext::initial(&header.dcid, true);
-        if payload.len() < 16 { return Ok(()); }
+        if payload.len() < 16 {
+            return Ok(());
+        }
         let tag = payload.split_off(payload.len() - 16);
         let mut payload_mut = payload.to_vec();
-        crypto.decrypt_in_place(header.packet_number, aad, &mut payload_mut, &tag[..16].try_into().unwrap(), false)?;
+        crypto.decrypt_in_place(
+            header.packet_number,
+            aad,
+            &mut payload_mut,
+            &tag[..16].try_into().unwrap(),
+            false,
+        )?;
         let mut payload_bytes = Bytes::from(payload_mut);
         let mut handshake = None;
         while payload_bytes.remaining() > 0 {
-            if let Ok(Frame::Handshake { public_key, ed_public_key, transcript_hash, signature }) = Frame::decode(&mut payload_bytes) {
+            if let Ok(Frame::Handshake {
+                public_key,
+                ed_public_key,
+                transcript_hash,
+                signature,
+            }) = Frame::decode(&mut payload_bytes)
+            {
                 handshake = Some((public_key, ed_public_key, transcript_hash, signature));
             }
         }
-        let Some((pk_bytes, remote_ed_pk_bytes, transcript_hash, remote_sig_bytes)) = handshake else {
+        let Some((pk_bytes, remote_ed_pk_bytes, transcript_hash, remote_sig_bytes)) = handshake
+        else {
             return Err(ZtError::Crypto("No handshake".into()));
         };
 
@@ -41,13 +59,25 @@ impl ZtConnectionActor {
             return Err(ZtError::Crypto("Invalid Transcript Hash".into()));
         }
 
-        let remote_ed_pk = VerifyingKey::from_bytes(&remote_ed_pk_bytes).map_err(|_| ZtError::Crypto("Invalid EdPK".into()))?;
-        remote_ed_pk.verify(&expected_hash, &Signature::from_bytes(&remote_sig_bytes)).map_err(|_| ZtError::Crypto("Invalid Sig".into()))?;
-        let shared = crate::crypto::keypair::compute_shared_secret(&self.static_secret, PublicKey::from(pk_bytes));
+        let remote_ed_pk = VerifyingKey::from_bytes(&remote_ed_pk_bytes)
+            .map_err(|_| ZtError::Crypto("Invalid EdPK".into()))?;
+        remote_ed_pk
+            .verify(&expected_hash, &Signature::from_bytes(&remote_sig_bytes))
+            .map_err(|_| ZtError::Crypto("Invalid Sig".into()))?;
+        let shared = crate::crypto::keypair::compute_shared_secret(
+            &self.static_secret,
+            PublicKey::from(pk_bytes),
+        );
         let old_scid = self.state.dcid.clone();
         let new_dcid = header.scid.clone();
         self.state.dcid = new_dcid.clone();
-        self.state.crypto = Some(crate::crypto::CryptoContext::from_shared_secret(shared, &self.state.scid, &self.state.dcid, self.psk, true));
+        self.state.crypto = Some(crate::crypto::CryptoContext::from_shared_secret(
+            shared,
+            &self.state.scid,
+            &self.state.dcid,
+            self.psk,
+            true,
+        ));
         self.state.addr = addr;
         self.state.state = ConnectionState::Active;
         self.state.mark_processed(header.packet_number);
@@ -57,11 +87,18 @@ impl ZtConnectionActor {
                 self.routing_table.insert(new_dcid, actor_tx.clone());
             }
         }
-        if let Some(tx) = self.handshake_waiter.take() { let _ = tx.send(()); }
+        if let Some(tx) = self.handshake_waiter.take() {
+            let _ = tx.send(());
+        }
         Ok(())
     }
 
-    pub(super) fn handle_retry_packet(&mut self, _header: PacketHeader, payload: Bytes, _addr: SocketAddr) -> Result<()> {
+    pub(super) fn handle_retry_packet(
+        &mut self,
+        _header: PacketHeader,
+        payload: Bytes,
+        _addr: SocketAddr,
+    ) -> Result<()> {
         self.send_initial_packet(Some(payload))
     }
 }

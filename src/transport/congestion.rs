@@ -41,7 +41,7 @@ impl ZtConnection {
             for pn in range {
                 if let Some(up) = self.unacked_packets.remove(pn) {
                     bytes_acked += up.payload.len();
-                    if sample_rtt.is_none() {
+                    if sample_rtt.is_none() && up.retries == 0 {
                         sample_rtt = Some(up.sent_at.elapsed());
                     }
                     if up.is_mtu_probe
@@ -65,7 +65,7 @@ impl ZtConnection {
         for pn in acked_pns {
             if let Some(up) = self.unacked_packets.remove(pn) {
                 bytes_acked += up.payload.len();
-                if sample_rtt.is_none() {
+                if sample_rtt.is_none() && up.retries == 0 {
                     sample_rtt = Some(up.sent_at.elapsed());
                 }
                 if up.is_mtu_probe
@@ -77,7 +77,7 @@ impl ZtConnection {
                 }
             }
         }
-        
+
         // 3. Fast Retransmit Detection (SACK-based gap detection)
         // Any unacked packet that is strictly less than largest_acked_pn - 3
         // is considered lost and must be retransmitted immediately.
@@ -125,7 +125,8 @@ impl ZtConnection {
 
     /// Adjusts congestion window after packet loss detection.
     pub(crate) fn handle_loss(&mut self) {
-        self.ssthresh = (self.cwnd / 2).max(self.mtu * 2);
-        self.cwnd = self.ssthresh + 3 * self.mtu;
+        // CUBIC multiplicative decrease factor is 0.7 instead of Reno's 0.5
+        self.ssthresh = ((self.cwnd * 7) / 10).max(self.mtu * 2);
+        self.cwnd = self.ssthresh;
     }
 }

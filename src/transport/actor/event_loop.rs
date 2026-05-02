@@ -75,7 +75,7 @@ impl ZtConnectionActor {
                         }
                         ActorMessage::OpenStream { respond_to } => {
                             let stream_id = self.next_stream_id;
-                            self.next_stream_id += 1;
+                            self.next_stream_id += 2;
 
                             let (data_tx, data_rx) = mpsc::channel(2048);
                             let window_opened = Arc::new(Notify::new());

@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
 use crate::transport::stream_state::UnackedPacket;
+use std::collections::VecDeque;
 
 /// A sliding window ring buffer for tracking unacknowledged packets.
 /// Provides O(1) access by sequence number and avoids BTreeMap overhead.
@@ -74,16 +74,18 @@ impl UnackedWindow {
 
     pub fn iter(&self) -> impl Iterator<Item = (u64, &UnackedPacket)> {
         let base_pn = self.base_pn;
-        self.deque.iter().enumerate().filter_map(move |(i, opt)| {
-            opt.as_ref().map(|p| (base_pn + i as u64, p))
-        })
+        self.deque
+            .iter()
+            .enumerate()
+            .filter_map(move |(i, opt)| opt.as_ref().map(|p| (base_pn + i as u64, p)))
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (u64, &mut UnackedPacket)> {
         let base_pn = self.base_pn;
-        self.deque.iter_mut().enumerate().filter_map(move |(i, opt)| {
-            opt.as_mut().map(|p| (base_pn + i as u64, p))
-        })
+        self.deque
+            .iter_mut()
+            .enumerate()
+            .filter_map(move |(i, opt)| opt.as_mut().map(|p| (base_pn + i as u64, p)))
     }
 
     pub fn keys(&self) -> impl Iterator<Item = u64> + '_ {
@@ -171,7 +173,8 @@ impl ReplayWindow {
         if bit_shift > 0 {
             let inv_shift = 64 - bit_shift;
             for i in (1..32).rev() {
-                self.bitmask[i] = (self.bitmask[i] << bit_shift) | (self.bitmask[i - 1] >> inv_shift);
+                self.bitmask[i] =
+                    (self.bitmask[i] << bit_shift) | (self.bitmask[i - 1] >> inv_shift);
             }
             self.bitmask[0] <<= bit_shift;
         }
@@ -183,32 +186,49 @@ impl ReplayWindow {
             return ranges;
         };
 
-        let mut in_range = true;
-        let mut current_end = highest;
+        let mut in_range = false;
+        let mut current_end = 0;
+        let mut diff = 0u64;
 
-        for i in 1..2048u64 {
-            if highest < i {
+        for &word in self.bitmask.iter() {
+            if diff > highest {
                 break;
             }
-            let pn = highest - i;
-            let word_idx = (i / 64) as usize;
-            let bit_idx = i % 64;
-            let received = (self.bitmask[word_idx] & (1 << bit_idx)) != 0;
+            if !in_range && word == 0 {
+                diff += 64;
+                continue;
+            }
+            if in_range && word == u64::MAX {
+                diff += 64;
+                continue;
+            }
 
-            if received {
-                if !in_range {
-                    in_range = true;
-                    current_end = pn;
+            let mut w = word;
+            for _ in 0..64 {
+                if diff > highest {
+                    break;
                 }
-            } else if in_range {
-                ranges.push((pn + 1, current_end));
-                in_range = false;
+                let received = (w & 1) != 0;
+                let pn = highest - diff;
+
+                if received {
+                    if !in_range {
+                        in_range = true;
+                        current_end = pn;
+                    }
+                } else if in_range {
+                    ranges.push((pn + 1, current_end));
+                    in_range = false;
+                }
+
+                w >>= 1;
+                diff += 1;
             }
         }
 
         if in_range {
-            let lowest_checked = highest.saturating_sub(2047);
-            ranges.push((lowest_checked, current_end));
+            let lowest = highest.saturating_sub(diff.saturating_sub(1));
+            ranges.push((lowest, current_end));
         }
 
         ranges

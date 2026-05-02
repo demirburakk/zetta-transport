@@ -124,6 +124,9 @@ impl Frame {
                 let largest_acked = src.get_u64();
                 let window_size = src.get_u32();
                 let range_count = if src.remaining() > 0 { src.get_u8() } else { 0 } as usize;
+                if range_count > 128 {
+                    return Err(ZtError::InvalidPacket("Too many ACK ranges".into()));
+                }
 
                 if src.remaining() < range_count * 16 {
                     return Err(ZtError::InvalidPacket("Ack frame ranges truncated".into()));

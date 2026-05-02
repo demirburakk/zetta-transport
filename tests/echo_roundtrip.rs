@@ -1,10 +1,21 @@
+#[test]
+
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("debug")
+        .try_init();
+}
+
 use std::time::Duration;
 
 use zetta_transport::transport::endpoint::ZtEndpoint;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn echo_roundtrip_large_payload() {
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("debug")
+        .with_test_writer()
+        .try_init();
 
     let server = ZtEndpoint::bind("127.0.0.1:0", None)
         .await

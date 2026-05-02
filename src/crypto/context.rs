@@ -31,6 +31,28 @@ pub(crate) struct CryptoContext {
     prev_rx_cipher: Option<ChaCha20Poly1305>,
 }
 
+impl Drop for CryptoContext {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.secret.zeroize();
+        self.tx_key.zeroize();
+        self.rx_key.zeroize();
+        self.tx_hp_key.zeroize();
+        self.rx_hp_key.zeroize();
+        self.tx_iv.zeroize();
+        self.rx_iv.zeroize();
+        if let Some(ref mut k) = self.prev_rx_key {
+            k.zeroize();
+        }
+        if let Some(ref mut k) = self.prev_rx_hp_key {
+            k.zeroize();
+        }
+        if let Some(ref mut k) = self.prev_rx_iv {
+            k.zeroize();
+        }
+    }
+}
+
 impl CryptoContext {
     /// Creates a crypto context from a completed DH shared secret.
     pub(crate) fn from_shared_secret(
@@ -40,7 +62,13 @@ impl CryptoContext {
         psk: Option<[u8; 32]>,
         is_client: bool,
     ) -> Self {
-        let secret = key_derivation::derive_master_secret(&shared_secret, my_scid, peer_dcid, psk, is_client);
+        let secret = key_derivation::derive_master_secret(
+            &shared_secret,
+            my_scid,
+            peer_dcid,
+            psk,
+            is_client,
+        );
         let mut ctx = Self::with_secret(secret, is_client);
         ctx.apply_epoch_keys(0);
         ctx
