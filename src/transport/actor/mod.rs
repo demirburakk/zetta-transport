@@ -57,6 +57,7 @@ pub(crate) struct ZtConnectionActor {
     pub(super) last_active_stream_id: u32,
     pub(super) incoming_streams_tx: mpsc::Sender<ZtStream>,
     pub(super) next_stream_id: u32,
+    pub(super) is_client: bool,
 }
 
 impl ZtConnectionActor {
@@ -97,6 +98,7 @@ impl ZtConnectionActor {
             last_active_stream_id: 0,
             incoming_streams_tx,
             next_stream_id,
+            is_client,
         }
     }
 

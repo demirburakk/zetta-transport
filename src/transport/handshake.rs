@@ -250,7 +250,7 @@ pub(crate) async fn handle_handshake(
 
         let conn_handle = ZtConnectionHandle::new(endpoint.clone(), scid.clone(), stream_rx);
         let stream0 = ZtStream::new(endpoint.clone(), scid.clone(), 0, data_rx, window_opened);
-        let _ = stream_tx.try_send(stream0);
+        stream_tx.try_send(stream0).expect("Stream 0 channel full");
 
         if endpoint.incoming_tx.try_send(conn_handle).is_err() {
             tracing::warn!(

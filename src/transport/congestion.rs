@@ -112,7 +112,24 @@ impl ZtConnection {
             if self.cwnd < self.ssthresh {
                 self.cwnd += bytes_acked;
             } else {
-                self.cwnd += (self.mtu * bytes_acked) / self.cwnd.max(self.mtu);
+                let c = 0.4;
+                let t = if let Some(last_time) = self.last_congestion_time {
+                    last_time.elapsed().as_secs_f64()
+                } else {
+                    0.0
+                };
+                
+                let w_cubic_pkts = c * (t - self.cubic_k).powi(3) + self.cubic_w_max;
+                let target_cwnd = (w_cubic_pkts * self.mtu as f64) as usize;
+                
+                let reno_inc = (self.mtu * bytes_acked) / self.cwnd.max(self.mtu);
+                
+                if target_cwnd > self.cwnd {
+                    let cubic_inc = target_cwnd - self.cwnd;
+                    self.cwnd += cubic_inc.min(bytes_acked); // Bound the increase by acked amount
+                } else {
+                    self.cwnd += reno_inc;
+                }
             }
         }
 
@@ -125,8 +142,22 @@ impl ZtConnection {
 
     /// Adjusts congestion window after packet loss detection.
     pub(crate) fn handle_loss(&mut self) {
-        // CUBIC multiplicative decrease factor is 0.7 instead of Reno's 0.5
-        self.ssthresh = ((self.cwnd * 7) / 10).max(self.mtu * 2);
+        let beta = 0.7;
+        let c = 0.4;
+        
+        let current_cwnd_pkts = self.cwnd as f64 / self.mtu as f64;
+        
+        // Fast convergence
+        if current_cwnd_pkts < self.cubic_w_max {
+            self.cubic_w_max = current_cwnd_pkts * (1.0 + beta) / 2.0;
+        } else {
+            self.cubic_w_max = current_cwnd_pkts;
+        }
+
+        self.ssthresh = ((self.cwnd as f64 * beta) as usize).max(self.mtu * 2);
         self.cwnd = self.ssthresh;
+        
+        self.cubic_k = (self.cubic_w_max * (1.0 - beta) / c).cbrt();
+        self.last_congestion_time = Some(std::time::Instant::now());
     }
 }

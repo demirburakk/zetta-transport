@@ -13,7 +13,8 @@ impl ZtConnectionActor {
     #[cfg(unix)]
     pub(super) fn sendmsg_vectored(&mut self, iov: &[IoSlice]) -> Result<()> {
         let total_len: usize = iov.iter().map(|s| s.len()).sum();
-        if self.state.state == ConnectionState::Handshaking
+        if !self.is_client
+            && self.state.state == ConnectionState::Handshaking
             && self.state.bytes_sent + total_len > 3 * self.state.bytes_received.max(1)
         {
             tracing::warn!("Amplification limit reached, dropping packet");
@@ -203,25 +204,48 @@ impl ZtConnectionActor {
     }
 
     pub(super) fn process_outgoing_data(&mut self, stream_id: u32, data: Bytes) -> Result<()> {
-        if self.state.remote_window < data.len() as u32 {
+        let to_send_len = data.len() as u32;
+
+        // Check global flow control
+        if self.state.remote_window < to_send_len {
             return Err(ZtError::FlowControlBlocked);
         }
-        if self.state.bytes_in_flight + data.len() > self.state.cwnd {
+
+        // Check stream flow control
+        let stream = self.state.streams.get_mut(&stream_id).ok_or(ZtError::ActorFailed)?;
+        if stream.tx_window < to_send_len as u64 {
+            return Err(ZtError::FlowControlBlocked);
+        }
+
+        let to_send_len_usize = to_send_len as usize;
+        
+        if self.state.bytes_in_flight + to_send_len_usize > self.state.cwnd {
             return Err(ZtError::CongestionWindowFull);
         }
 
-        let start = {
-            let stream = self
-                .state
-                .streams
-                .get_mut(&stream_id)
-                .ok_or(ZtError::ActorFailed)?;
-            let start = stream.next_tx_offset;
-            stream.next_tx_offset += data.len() as u64;
-            start
-        };
+        let now = StdInstant::now();
+        if let Some(last) = self.state.last_pacing_update {
+            let elapsed = now.duration_since(last).as_secs_f64();
+            let rate = self.state.cwnd as f64 / self.state.rtt.as_secs_f64().max(0.001);
+            self.state.pacing_tokens += rate * elapsed;
+            let max_burst = (self.state.mtu * 10) as f64;
+            if self.state.pacing_tokens > max_burst {
+                self.state.pacing_tokens = max_burst;
+            }
+        }
+        self.state.last_pacing_update = Some(now);
 
-        self.state.remote_window -= data.len() as u32;
+        if self.state.pacing_tokens < to_send_len as f64 {
+            return Err(ZtError::PacingBlocked);
+        }
+
+        let start = stream.next_tx_offset;
+        stream.next_tx_offset += to_send_len as u64;
+        stream.tx_window -= to_send_len as u64;
+        
+        self.state.remote_window -= to_send_len;
+        self.state.pacing_tokens -= to_send_len as f64;
+        
         let payload = UnackedPayload::Stream {
             stream_id,
             offset: start,
@@ -318,6 +342,9 @@ impl ZtConnectionActor {
             }
             UnackedPayload::StreamClose { stream_id } => {
                 Frame::StreamClose { id: *stream_id }.encode(&mut packet);
+            }
+            UnackedPayload::MaxStreamData { stream_id, max_data } => {
+                Frame::MaxStreamData { id: *stream_id, max_data: *max_data }.encode(&mut packet);
             }
             UnackedPayload::Close => {
                 Frame::ConnectionClose.encode(&mut packet);

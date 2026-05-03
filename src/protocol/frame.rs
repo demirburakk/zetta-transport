@@ -30,6 +30,13 @@ pub enum Frame {
     StreamClose {
         id: u32,
     },
+    MaxStreamData {
+        id: u32,
+        max_data: u64,
+    },
+    MaxData {
+        max_data: u64,
+    },
 }
 
 impl Frame {
@@ -85,6 +92,15 @@ impl Frame {
             Frame::StreamClose { id } => {
                 dst.put_u8(0x06);
                 dst.put_u32(*id);
+            }
+            Frame::MaxStreamData { id, max_data } => {
+                dst.put_u8(0x07);
+                dst.put_u32(*id);
+                dst.put_u64(*max_data);
+            }
+            Frame::MaxData { max_data } => {
+                dst.put_u8(0x08);
+                dst.put_u64(*max_data);
             }
         }
     }
@@ -186,6 +202,21 @@ impl Frame {
                 }
                 let id = src.get_u32();
                 Ok(Frame::StreamClose { id })
+            }
+            0x07 => {
+                if src.remaining() < 12 {
+                    return Err(ZtError::InvalidPacket("MaxStreamData frame too short".into()));
+                }
+                let id = src.get_u32();
+                let max_data = src.get_u64();
+                Ok(Frame::MaxStreamData { id, max_data })
+            }
+            0x08 => {
+                if src.remaining() < 8 {
+                    return Err(ZtError::InvalidPacket("MaxData frame too short".into()));
+                }
+                let max_data = src.get_u64();
+                Ok(Frame::MaxData { max_data })
             }
             _ => Err(ZtError::InvalidPacket(format!(
                 "Unknown frame type: {}",

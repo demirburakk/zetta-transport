@@ -32,6 +32,11 @@ pub(crate) struct ZtConnection {
 
     pub(crate) cwnd: usize,
     pub(crate) ssthresh: usize,
+    pub(crate) cubic_w_max: f64,
+    pub(crate) cubic_k: f64,
+    pub(crate) last_congestion_time: Option<std::time::Instant>,
+    pub(crate) pacing_tokens: f64,
+    pub(crate) last_pacing_update: Option<std::time::Instant>,
     pub(crate) bytes_in_flight: usize,
     pub(crate) mtu: usize,
     pub(crate) bytes_received: usize,
@@ -69,6 +74,11 @@ impl ZtConnection {
 
             cwnd: 10 * 1200,
             ssthresh: 64 * 1024,
+            cubic_w_max: 0.0,
+            cubic_k: 0.0,
+            last_congestion_time: None,
+            pacing_tokens: 12000.0, // Initial burst
+            last_pacing_update: None,
             bytes_in_flight: 0,
             mtu: 1200,
             bytes_received: 0,
@@ -79,7 +89,7 @@ impl ZtConnection {
             current_key_epoch: 0,
         }
     }
-
+    
     pub(crate) fn get_next_packet_number(&mut self) -> Result<u64> {
         let n = self.next_packet_number;
         self.next_packet_number = self

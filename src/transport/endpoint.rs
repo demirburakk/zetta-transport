@@ -42,12 +42,26 @@ impl ZtEndpoint {
         let ed_signing_key = SigningKey::generate(&mut csprng);
         let ed_public_key = ed_signing_key.verifying_key();
 
-        let socket = Arc::new(UdpSocket::bind(addr).await?);
-        let (tx, rx) = mpsc::channel(1024);
+        let socket_addr: SocketAddr = addr.parse().map_err(|e| std::io::Error::other(format!("Invalid address: {}", e)))?;
         let cookie_key = rand::thread_rng().r#gen::<[u8; 32]>();
+        let (tx, rx) = mpsc::channel(1024);
+
+        // Bind main socket
+        let domain = match socket_addr {
+            SocketAddr::V4(_) => socket2::Domain::IPV4,
+            SocketAddr::V6(_) => socket2::Domain::IPV6,
+        };
+        let std_socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+        std_socket.set_reuse_port(true)?;
+        std_socket.set_nonblocking(true)?;
+        std_socket.bind(&socket_addr.into())?;
+        
+        let actual_addr: SocketAddr = std_socket.local_addr()?.as_socket().unwrap();
+        
+        let socket = Arc::new(UdpSocket::from_std(std_socket.into())?);
 
         let endpoint = Arc::new(Self {
-            socket,
+            socket: socket.clone(),
             routing_table: Arc::new(DashMap::new()),
             ed_signing_key,
             ed_public_key,
@@ -59,47 +73,91 @@ impl ZtEndpoint {
             incoming_tx: tx,
         });
 
-        Self::start_router(endpoint.clone());
+        // Main socket routing
+        Self::start_router(endpoint.clone(), socket.clone());
+
+        let cores = num_cpus::get();
+        // Since we already have 1 task on main socket, start cores - 1 more
+        for _ in 1..cores {
+            let task_socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+            task_socket.set_reuse_port(true)?;
+            task_socket.set_nonblocking(true)?;
+            task_socket.bind(&actual_addr.into())?;
+            let tokio_socket = Arc::new(UdpSocket::from_std(task_socket.into())?);
+            Self::start_router(endpoint.clone(), tokio_socket);
+        }
+        
         Ok(endpoint)
     }
 
     /// Starts the packet router task that dispatches incoming datagrams
     /// to the correct per-connection actor or initiates new handshakes.
-    fn start_router(endpoint: Arc<Self>) {
+    fn start_router(endpoint: Arc<Self>, socket: Arc<UdpSocket>) {
         tokio::spawn(async move {
-            let mut buf = bytes::BytesMut::zeroed(2048);
+            let mut local_routing_table = std::collections::HashMap::new();
+            let mut buf = bytes::BytesMut::zeroed(65536); // Large buffer for vectored/batched reading
             loop {
-                if let Ok((len, addr)) = endpoint.socket.recv_from(&mut buf).await {
+                // Batch up to 64 packets before yielding context
+                let mut processed = 0;
+                while processed < 64 {
+                    // Try to read immediately without awaiting if possible to simulate vectored I/O
+                    let recv_result = socket.try_recv_from(&mut buf);
+                    let (len, addr) = match recv_result {
+                        Ok(res) => res,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if processed == 0 {
+                                // Await the next packet if we haven't processed any yet
+                                match socket.recv_from(&mut buf).await {
+                                    Ok(res) => res,
+                                    Err(_) => break,
+                                }
+                            } else {
+                                break; // Yield back to executor
+                            }
+                        }
+                        Err(_) => break,
+                    };
+
                     let data = buf.split_to(len);
                     if buf.capacity() < 2048 {
-                        buf = bytes::BytesMut::zeroed(2048);
+                        buf = bytes::BytesMut::zeroed(65536);
                     } else {
-                        // Restore zeroed size for recv_from
-                        buf.resize(2048, 0);
+                        buf.resize(65536, 0);
                     }
 
                     if let Some(dcid) = crate::protocol::routing::extract_dcid_fast(&data) {
-                        if let Some(tx) = endpoint.routing_table.get(&dcid) {
-                            if let Err(_e) =
-                                tx.try_send(ActorMessage::IncomingPacket { data, addr })
-                            {
-                                tracing::trace!("Dropped packet for {:?}: queue full", dcid);
+                        let mut routed = false;
+                        if let Some(tx) = local_routing_table.get(&dcid) {
+                            let tx: &mpsc::Sender<ActorMessage> = tx;
+                            if tx.try_send(ActorMessage::IncomingPacket { data: data.clone(), addr }).is_ok() {
+                                routed = true;
+                            } else {
+                                // Channel full or closed, remove from local cache
+                                local_routing_table.remove(&dcid);
                             }
-                        } else {
-                            let ep_clone = endpoint.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = crate::transport::handshake::handle_handshake(
-                                    ep_clone,
-                                    data.freeze(),
-                                    addr,
-                                )
-                                .await
-                                {
-                                    tracing::debug!("Handshake failed: {:?}", e);
-                                }
-                            });
+                        }
+                        
+                        if !routed {
+                            if let Some(tx) = endpoint.routing_table.get(&dcid) {
+                                local_routing_table.insert(dcid.clone(), tx.clone());
+                                let _ = tx.try_send(ActorMessage::IncomingPacket { data, addr });
+                            } else {
+                                let ep_clone = endpoint.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = crate::transport::handshake::handle_handshake(
+                                        ep_clone,
+                                        data.freeze(),
+                                        addr,
+                                    )
+                                    .await
+                                    {
+                                        tracing::debug!("Handshake failed: {:?}", e);
+                                    }
+                                });
+                            }
                         }
                     }
+                    processed += 1;
                 }
             }
         });
@@ -192,7 +250,6 @@ impl ZtEndpoint {
         rand::thread_rng().fill(&mut dcid[..]);
 
         let mut conn = ZtConnection::new(addr, scid.clone(), dcid);
-        conn.bytes_received = 1000000; // Client is not subject to amplification limits
         conn.state = ConnectionState::Handshaking;
 
         let (data_tx, data_rx) = mpsc::channel(2048);
@@ -230,7 +287,7 @@ impl ZtEndpoint {
         match tokio::time::timeout(std::time::Duration::from_secs(5), wait_rx).await {
             Ok(Ok(_)) => {
                 let stream0 = ZtStream::new(self.clone(), scid.clone(), 0, data_rx, window_opened);
-                let _ = stream_tx.try_send(stream0);
+                stream_tx.try_send(stream0).expect("Stream 0 channel full");
                 Ok(ZtConnectionHandle::new(self.clone(), scid, stream_rx))
             }
             _ => {

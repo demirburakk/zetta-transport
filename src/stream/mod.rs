@@ -86,6 +86,9 @@ impl ZtStream {
                         // received) or the congestion window grows.
                         self.window_opened.notified().await;
                     }
+                    Err(crate::error::ZtError::PacingBlocked) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
                     Err(e) => return Err(e),
                 }
             }

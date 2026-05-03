@@ -4,7 +4,7 @@ use crate::protocol::frame::Frame;
 use crate::protocol::packet::{PacketHeader, PacketType};
 use crate::stream::ZtStream;
 use crate::transport::connection::ZtConnection;
-use crate::transport::stream_state::{ConnectionState, StreamState};
+use crate::transport::stream_state::{ConnectionState, StreamState, UnackedPayload};
 use bytes::{Buf, Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -159,72 +159,60 @@ impl ZtConnectionActor {
                 }
 
                 let stream = self.state.streams.get_mut(&id).unwrap();
-                if offset < stream.expected_rx_offset {
+
+                // If the entire data payload is older than read_head, ignore.
+                // Note: we can still receive overlapping packets. 
+                // We'll let `StreamReceiveBuffer::write` handle writing. 
+                // Wait, if offset + len <= read_head, it's fully duplicate.
+                if offset + (data.len() as u64) <= stream.receive_buffer.read_head {
                     self.pending_acks += 1;
                     return Ok(());
                 }
+                
+                // Truncate overlapping prefix if needed, to avoid writing before read_head
+                let (write_offset, write_data) = if offset < stream.receive_buffer.read_head {
+                    let diff = (stream.receive_buffer.read_head - offset) as usize;
+                    (stream.receive_buffer.read_head, &data[diff..])
+                } else {
+                    (offset, data.as_ref())
+                };
 
-                if !data.is_empty() {
-                    let window_size = stream.window_size;
-
-                    if stream.buffered_bytes + data.len() > window_size as usize {
+                if !write_data.is_empty() {
+                    if !stream.receive_buffer.write(write_offset, write_data) {
                         tracing::warn!(
                             "Stream {} buffered data exceeds window ({} bytes), dropping",
                             id,
-                            window_size
+                            stream.window_size
                         );
                         self.pending_acks += 1;
                         return Ok(());
                     }
-
-                    stream.chunks.insert(offset, data.clone());
-                    stream.buffered_bytes += data.len();
                 }
 
+                let mut forwarded = false;
                 loop {
-                    let expected = stream.expected_rx_offset;
-                    let maybe_chunk = stream
-                        .chunks
-                        .range(..=expected)
-                        .next_back()
-                        .map(|(&k, v)| (k, v.clone()));
-
-                    if let Some((start_offset, chunk)) = maybe_chunk {
-                        let end_offset = start_offset + chunk.len() as u64;
-                        if end_offset > expected {
-                            let data_to_send = if start_offset == expected {
-                                chunk
-                            } else {
-                                chunk.slice((expected - start_offset) as usize..)
-                            };
-
-                            if stream.app_tx.try_send(data_to_send).is_ok() {
-                                let sent_len = end_offset - expected;
-                                stream.expected_rx_offset = end_offset;
-                                stream.buffered_bytes =
-                                    stream.buffered_bytes.saturating_sub(sent_len as usize);
-
-                                let to_remove: Vec<_> = stream
-                                    .chunks
-                                    .range(..=stream.expected_rx_offset)
-                                    .filter(|(k, v)| {
-                                        **k + v.len() as u64 <= stream.expected_rx_offset
-                                    })
-                                    .map(|(&k, _)| k)
-                                    .collect();
-                                for k in to_remove {
-                                    stream.chunks.remove(&k);
-                                }
-                            } else {
-                                break;
-                            }
+                    if let Some(chunk) = stream.receive_buffer.read_contiguous() {
+                        if stream.app_tx.try_send(chunk).is_ok() {
+                            forwarded = true;
                         } else {
-                            stream.chunks.remove(&start_offset);
+                            break;
                         }
                     } else {
                         break;
                     }
                 }
+                
+                stream.expected_rx_offset = stream.receive_buffer.read_head;
+
+                if forwarded {
+                    let max_data = stream.expected_rx_offset + stream.window_size;
+                    let payload = UnackedPayload::MaxStreamData {
+                        stream_id: id,
+                        max_data,
+                    };
+                    let _ = self.retransmit_payload(payload);
+                }
+
                 self.pending_acks += 1;
                 if self.pending_acks >= 10 {
                     let _ = self.flush_acks();
@@ -255,6 +243,24 @@ impl ZtConnectionActor {
             }
             Frame::StreamClose { id } => {
                 self.state.streams.remove(&id);
+            }
+            Frame::MaxStreamData { id, max_data } => {
+                if let Some(stream) = self.state.streams.get_mut(&id) {
+                    let new_window = max_data.saturating_sub(stream.next_tx_offset);
+                    if new_window > stream.tx_window {
+                        stream.tx_window = new_window;
+                        stream.window_opened.notify_waiters();
+                    }
+                }
+            }
+            Frame::MaxData { max_data } => {
+                let new_window = max_data.saturating_sub(self.state.bytes_sent as u64) as u32;
+                if new_window > self.state.remote_window {
+                    self.state.remote_window = new_window;
+                    for stream in self.state.streams.values() {
+                        stream.window_opened.notify_waiters();
+                    }
+                }
             }
             _ => {}
         }
