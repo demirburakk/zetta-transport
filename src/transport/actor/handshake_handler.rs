@@ -51,10 +51,17 @@ impl ZtConnectionActor {
             return Err(ZtError::Crypto("No handshake".into()));
         };
 
+        let old_scid = self.state.dcid.clone();
+        let new_dcid = header.scid.clone();
+        
         let mut hasher = sha2::Sha256::new();
         sha2::Digest::update(&mut hasher, &self.state.scid);
-        sha2::Digest::update(&mut hasher, &header.scid);
+        sha2::Digest::update(&mut hasher, &old_scid);
         sha2::Digest::update(&mut hasher, self.public_key.as_bytes());
+        if let Some(ref c) = self.state.cookie {
+            sha2::Digest::update(&mut hasher, c);
+        }
+        sha2::Digest::update(&mut hasher, &new_dcid);
         sha2::Digest::update(&mut hasher, pk_bytes);
         let expected_hash = sha2::Digest::finalize(hasher).to_vec();
 
@@ -71,8 +78,6 @@ impl ZtConnectionActor {
             &self.static_secret,
             PublicKey::from(pk_bytes),
         );
-        let old_scid = self.state.dcid.clone();
-        let new_dcid = header.scid.clone();
         self.state.dcid = new_dcid.clone();
         self.state.crypto = Some(crate::crypto::CryptoContext::from_shared_secret(
             shared,

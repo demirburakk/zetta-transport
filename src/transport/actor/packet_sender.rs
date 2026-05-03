@@ -178,7 +178,7 @@ impl ZtConnectionActor {
         let header_len = packet.len();
         let ack_ranges = self.state.get_ack_ranges();
         Frame::Ack {
-            largest_acked: self.state.replay_window.highest_processed.unwrap_or(0),
+            largest_acked: self.state.ack_tracker.highest_processed.unwrap_or(0),
             window_size: self.state.local_window,
             ack_ranges,
         }
@@ -224,9 +224,9 @@ impl ZtConnectionActor {
         }
 
         let now = StdInstant::now();
+        let rate = self.state.cwnd as f64 / self.state.rtt.as_secs_f64().max(0.001);
         if let Some(last) = self.state.last_pacing_update {
             let elapsed = now.duration_since(last).as_secs_f64();
-            let rate = self.state.cwnd as f64 / self.state.rtt.as_secs_f64().max(0.001);
             self.state.pacing_tokens += rate * elapsed;
             let max_burst = (self.state.mtu * 10) as f64;
             if self.state.pacing_tokens > max_burst {
@@ -236,7 +236,9 @@ impl ZtConnectionActor {
         self.state.last_pacing_update = Some(now);
 
         if self.state.pacing_tokens < to_send_len as f64 {
-            return Err(ZtError::PacingBlocked);
+            let deficit = to_send_len as f64 - self.state.pacing_tokens;
+            let wait_secs = deficit / rate;
+            return Err(ZtError::PacingBlocked(std::time::Duration::from_secs_f64(wait_secs)));
         }
 
         let start = stream.next_tx_offset;
@@ -416,6 +418,7 @@ impl ZtConnectionActor {
         sha2::Digest::update(&mut hasher, &self.state.dcid);
         sha2::Digest::update(&mut hasher, self.public_key.as_bytes());
         if let Some(ref c) = cookie {
+            self.state.cookie = Some(c.clone());
             sha2::Digest::update(&mut hasher, c);
         }
         let transcript_hash = sha2::Digest::finalize(hasher).to_vec();

@@ -43,8 +43,10 @@ pub(crate) struct ZtConnection {
     pub(crate) bytes_sent: usize,
 
     pub(crate) replay_window: ReplayWindow,
+    pub(crate) ack_tracker: super::window::AckTracker,
 
     pub(crate) current_key_epoch: u64,
+    pub(crate) cookie: Option<bytes::Bytes>,
 }
 
 impl ZtConnection {
@@ -73,7 +75,7 @@ impl ZtConnection {
             remote_window: 1024 * 1024,
 
             cwnd: 10 * 1200,
-            ssthresh: 64 * 1024,
+            ssthresh: usize::MAX,
             cubic_w_max: 0.0,
             cubic_k: 0.0,
             last_congestion_time: None,
@@ -85,8 +87,10 @@ impl ZtConnection {
             bytes_sent: 0,
 
             replay_window: ReplayWindow::new(),
+            ack_tracker: super::window::AckTracker::new(),
 
             current_key_epoch: 0,
+            cookie: None,
         }
     }
     

@@ -46,8 +46,8 @@ pub enum ZtError {
     CongestionWindowFull,
 
     /// Send was blocked because of pacing limits to avoid bufferbloat.
-    #[error("Pacing blocked")]
-    PacingBlocked,
+    #[error("Pacing blocked for {0:?}")]
+    PacingBlocked(std::time::Duration),
 
     /// The connection has reached its maximum number of concurrent streams.
     #[error("Too many concurrent streams (limit: {limit})")]

@@ -6,17 +6,19 @@ use aes::cipher::{BlockCipherEncrypt, KeyInit};
 pub(crate) fn apply_header_protection(
     packet: &mut [u8],
     pn_offset: usize,
-    tx_hp_key: &[u8; 32],
+    tx_hp_key: &[u8; 16],
 ) -> Result<()> {
     let sample_offset = pn_offset + 4; // Sample starts 4 bytes after PN field
     if packet.len() < sample_offset + 16 {
-        return Ok(());
+        return Err(ZtError::InvalidPacket(
+            "Packet too short to apply header protection".into(),
+        ));
     }
 
     let mut sample = [0u8; 16];
     sample.copy_from_slice(&packet[sample_offset..sample_offset + 16]);
 
-    let cipher = Aes128::new_from_slice(&tx_hp_key[..16])
+    let cipher = Aes128::new_from_slice(tx_hp_key)
         .map_err(|_| ZtError::Crypto("Invalid HP key length".into()))?;
 
     let mut block = aes::Block::from(sample);
@@ -41,7 +43,7 @@ pub(crate) fn apply_header_protection(
 pub(crate) fn remove_header_protection(
     packet: &mut [u8],
     pn_offset: usize,
-    hp_key: &[u8; 32],
+    hp_key: &[u8; 16],
 ) -> Result<()> {
     let sample_offset = pn_offset + 4;
     if sample_offset + 16 > packet.len() {
@@ -53,7 +55,7 @@ pub(crate) fn remove_header_protection(
     let mut sample = [0u8; 16];
     sample.copy_from_slice(&packet[sample_offset..sample_offset + 16]);
 
-    let cipher = Aes128::new_from_slice(&hp_key[..16])
+    let cipher = Aes128::new_from_slice(hp_key)
         .map_err(|_| ZtError::Crypto("Invalid HP key length".into()))?;
 
     let mut block = aes::Block::from(sample);

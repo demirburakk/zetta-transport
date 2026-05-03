@@ -8,14 +8,15 @@ impl ZtConnection {
         self.replay_window.is_replay(pn)
     }
 
-    /// Marks a packet number as processed in the replay bitmask.
+    /// Marks a packet number as processed in the replay bitmask and ACK tracker.
     pub(crate) fn mark_processed(&mut self, pn: u64) {
-        self.replay_window.mark_processed(pn)
+        self.replay_window.mark_processed(pn);
+        self.ack_tracker.mark_processed(pn);
     }
 
-    /// Builds ACK ranges from the replay bitmask for selective acknowledgment.
+    /// Builds ACK ranges from the ACK tracker for selective acknowledgment.
     pub(crate) fn get_ack_ranges(&self) -> Vec<(u64, u64)> {
-        self.replay_window.get_ack_ranges()
+        self.ack_tracker.get_ack_ranges()
     }
 
     /// Processes an ACK frame: removes acked packets, updates RTT, adjusts
