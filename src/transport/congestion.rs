@@ -29,6 +29,7 @@ impl ZtConnection {
         fast_retransmits: &mut Vec<UnackedPayload>,
     ) {
         let mut bytes_acked = 0usize;
+        let mut bytes_in_flight_acked = 0usize;
         let mut sample_rtt = None;
 
         // 1. Process SACK ranges first (Selective ACK)
@@ -42,6 +43,7 @@ impl ZtConnection {
             for pn in range {
                 if let Some(up) = self.unacked_packets.remove(pn) {
                     bytes_acked += up.payload.len();
+                    bytes_in_flight_acked += up.sent_bytes;
                     if sample_rtt.is_none() && up.retries == 0 {
                         sample_rtt = Some(up.sent_at.elapsed());
                     }
@@ -66,6 +68,7 @@ impl ZtConnection {
         for pn in acked_pns {
             if let Some(up) = self.unacked_packets.remove(pn) {
                 bytes_acked += up.payload.len();
+                bytes_in_flight_acked += up.sent_bytes;
                 if sample_rtt.is_none() && up.retries == 0 {
                     sample_rtt = Some(up.sent_at.elapsed());
                 }
@@ -88,14 +91,25 @@ impl ZtConnection {
                 lost_pns.push(pn);
             }
         }
+        let mut loss_detected = false;
         for pn in lost_pns {
             if let Some(up) = self.unacked_packets.remove(pn) {
-                fast_retransmits.push(up.payload);
-                self.handle_loss();
+                self.bytes_in_flight = self.bytes_in_flight.saturating_sub(up.sent_bytes);
+                if up.is_mtu_probe {
+                    self.mtu_probes.remove(&pn);
+                } else {
+                    fast_retransmits.push(up.payload);
+                    loss_detected = true;
+                }
             }
         }
+        if loss_detected {
+            self.handle_loss();
+        }
 
-        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(bytes_acked);
+        self.bytes_in_flight = self
+            .bytes_in_flight
+            .saturating_sub(bytes_in_flight_acked);
 
         if let Some(rtt) = sample_rtt {
             if !self.rtt_initialized {

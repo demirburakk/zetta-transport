@@ -188,6 +188,7 @@ pub(crate) struct AckTracker {
 }
 
 impl AckTracker {
+    const MAX_ACK_RANGES: usize = 128;
     pub fn new() -> Self {
         Self {
             highest_processed: None,
@@ -290,6 +291,9 @@ impl AckTracker {
                     }
                 } else if in_range {
                     ranges.push((pn + 1, current_end));
+                    if ranges.len() >= Self::MAX_ACK_RANGES {
+                        return ranges;
+                    }
                     in_range = false;
                 }
 
@@ -300,9 +304,10 @@ impl AckTracker {
 
         if in_range {
             let lowest = highest.saturating_sub(diff.saturating_sub(1));
-            ranges.push((lowest, current_end));
+            if ranges.len() < Self::MAX_ACK_RANGES {
+                ranges.push((lowest, current_end));
+            }
         }
-
         ranges
     }
 }

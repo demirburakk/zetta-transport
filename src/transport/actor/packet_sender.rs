@@ -9,7 +9,25 @@ use sha2::Digest;
 use std::io::IoSlice;
 use std::time::{Duration, Instant as StdInstant};
 
+const KEY_UPDATE_PACKET_INTERVAL: u64 = 1 << 20;
+
 impl ZtConnectionActor {
+    fn note_packet_sent(&mut self) {
+        if self.state.state != ConnectionState::Active {
+            return;
+        }
+        let Some(crypto) = self.state.crypto.as_mut() else {
+            return;
+        };
+        self.state.packets_since_key_update =
+            self.state.packets_since_key_update.saturating_add(1);
+        if self.state.packets_since_key_update >= KEY_UPDATE_PACKET_INTERVAL {
+            crypto.rotate_keys();
+            self.state.current_key_epoch = self.state.current_key_epoch.saturating_add(1);
+            self.state.packets_since_key_update = 0;
+        }
+    }
+
     #[cfg(unix)]
     pub(super) fn sendmsg_vectored(&mut self, iov: &[IoSlice]) -> Result<()> {
         let total_len: usize = iov.iter().map(|s| s.len()).sum();
@@ -39,7 +57,7 @@ impl ZtConnectionActor {
             std::net::SocketAddr::V4(v4) => {
                 addr_v4.sin_family = libc::AF_INET as _;
                 addr_v4.sin_port = v4.port().to_be();
-                addr_v4.sin_addr.s_addr = u32::from_be_bytes(v4.ip().octets());
+                addr_v4.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
                 msg.msg_name = &mut addr_v4 as *mut _ as *mut c_void;
                 msg.msg_namelen = std::mem::size_of::<sockaddr_in>() as _;
             }
@@ -136,8 +154,10 @@ impl ZtConnectionActor {
         if let Some(offset) = PacketHeader::get_pn_offset(ps) {
             crypto.apply_header_protection(ps, offset)?;
         }
+        let sent_bytes = packet.len();
         if let Err(e) = self.sendmsg_vectored(&[IoSlice::new(packet.as_ref())]) {
             tracing::debug!("Failed to send MTU probe: {}", e);
+            return Ok(());
         }
         self.state.unacked_packets.insert(
             pn,
@@ -146,9 +166,11 @@ impl ZtConnectionActor {
                 sent_at: StdInstant::now(),
                 retries: 0,
                 is_mtu_probe: true,
+                sent_bytes,
             },
         );
         self.state.mtu_probes.insert(pn, target_size);
+        self.note_packet_sent();
         Ok(())
     }
 
@@ -198,6 +220,8 @@ impl ZtConnectionActor {
         }
         if let Err(e) = self.sendmsg_vectored(&[IoSlice::new(&packet)]) {
             tracing::warn!("Failed to flush acks: {}", e);
+        } else {
+            self.note_packet_sent();
         }
         self.pending_acks = 0;
         Ok(())
@@ -244,6 +268,8 @@ impl ZtConnectionActor {
         let start = stream.next_tx_offset;
         stream.next_tx_offset += to_send_len as u64;
         stream.tx_window -= to_send_len as u64;
+        self.state.conn_tx_offset =
+            self.state.conn_tx_offset.saturating_add(to_send_len as u64);
         
         self.state.remote_window -= to_send_len;
         self.state.pacing_tokens -= to_send_len as f64;
@@ -263,7 +289,9 @@ impl ZtConnectionActor {
         let mut to_drop = Vec::new();
         for (pn, up) in self.state.unacked_packets.iter_mut() {
             if now.duration_since(up.sent_at) > rto {
-                if up.retries > 10 {
+                if up.is_mtu_probe {
+                    to_drop.push(pn);
+                } else if up.retries > 10 {
                     to_drop.push(pn);
                 } else {
                     up.retries += 1;
@@ -279,8 +307,10 @@ impl ZtConnectionActor {
         for pn in to_drop {
             if let Some(up) = self.state.unacked_packets.remove(pn) {
                 self.state.bytes_in_flight =
-                    self.state.bytes_in_flight.saturating_sub(up.payload.len());
-                if to_retransmit.contains(&pn) {
+                    self.state.bytes_in_flight.saturating_sub(up.sent_bytes);
+                if up.is_mtu_probe {
+                    self.state.mtu_probes.remove(&pn);
+                } else if to_retransmit.contains(&pn) {
                     payloads_to_resend.push(up.payload);
                 }
             }
@@ -378,9 +408,11 @@ impl ZtConnectionActor {
                 sent_at: StdInstant::now(),
                 retries: 0,
                 is_mtu_probe,
+                sent_bytes: packet_len,
             },
         );
         self.state.bytes_in_flight += packet_len;
+        self.note_packet_sent();
 
         Ok(())
     }

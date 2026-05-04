@@ -17,6 +17,9 @@ impl ZtConnectionActor {
         aad: &[u8],
         addr: SocketAddr,
     ) -> Result<()> {
+        if header.version != 1 {
+            return Err(ZtError::InvalidPacket("Unsupported version".into()));
+        }
         let crypto = crate::crypto::CryptoContext::initial(&header.dcid, true);
         if payload.len() < 16 {
             return Ok(());

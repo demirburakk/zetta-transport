@@ -65,6 +65,7 @@ impl ZtConnectionActor {
                 if let Some(crypto) = self.state.crypto.as_mut() {
                     crypto.rotate_keys();
                     self.state.current_key_epoch += 1;
+                    self.state.packets_since_key_update = 0;
                 }
                 use_prev_key = false;
                 rotated_this_packet = true;
@@ -91,7 +92,10 @@ impl ZtConnectionActor {
                 }
                 let tag_idx = payload_buf.len() - 16;
                 let tag_bytes = payload_buf.split_off(tag_idx);
-                let tag: [u8; 16] = tag_bytes.as_ref().try_into().unwrap();
+                let tag: [u8; 16] = tag_bytes
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| ZtError::InvalidPacket("Invalid tag size".into()))?;
 
                 if let Err(e) = crypto.decrypt_in_place(
                     header.packet_number,
@@ -131,6 +135,14 @@ impl ZtConnectionActor {
         match frame {
             Frame::Stream { id, offset, data } => {
                 if !self.state.streams.contains_key(&id) {
+                    let expected_parity = if self.is_client { 1 } else { 0 };
+                    if (id % 2) as u8 != expected_parity {
+                        let _ = self.initiate_close();
+                        return Err(ZtError::InvalidPacket(
+                            "Invalid stream id parity".into(),
+                        ));
+                    }
+
                     if self.state.streams.len() >= ZtConnection::MAX_CONCURRENT_STREAMS {
                         tracing::warn!(
                             "Peer exceeded MAX_CONCURRENT_STREAMS ({}), dropping stream {}",
@@ -158,7 +170,9 @@ impl ZtConnectionActor {
                     let _ = self.incoming_streams_tx.try_send(stream);
                 }
 
-                let stream = self.state.streams.get_mut(&id).unwrap();
+                let Some(stream) = self.state.streams.get_mut(&id) else {
+                    return Ok(());
+                };
 
                 // If the entire data payload is older than read_head, ignore.
                 // Note: we can still receive overlapping packets. 
@@ -178,7 +192,12 @@ impl ZtConnectionActor {
                 };
 
                 if !write_data.is_empty() {
-                    if !stream.receive_buffer.write(write_offset, write_data) {
+                    match stream.receive_buffer.write(write_offset, write_data) {
+                        Some(added) => {
+                            stream.buffered_bytes =
+                                stream.buffered_bytes.saturating_add(added);
+                        }
+                        None => {
                         tracing::warn!(
                             "Stream {} buffered data exceeds window ({} bytes), dropping",
                             id,
@@ -188,12 +207,15 @@ impl ZtConnectionActor {
                         return Err(ZtError::InvalidPacket(
                             "Stream receive window exceeded".into(),
                         ));
+                        }
                     }
                 }
 
                 let mut forwarded = false;
                 loop {
                     if let Some(chunk) = stream.receive_buffer.read_contiguous() {
+                        stream.buffered_bytes =
+                            stream.buffered_bytes.saturating_sub(chunk.len());
                         if stream.app_tx.try_send(chunk).is_ok() {
                             forwarded = true;
                         } else {
@@ -256,7 +278,9 @@ impl ZtConnectionActor {
                 }
             }
             Frame::MaxData { max_data } => {
-                let new_window = max_data.saturating_sub(self.state.bytes_sent as u64) as u32;
+                let new_window = max_data
+                    .saturating_sub(self.state.conn_tx_offset)
+                    .min(u32::MAX as u64) as u32;
                 if new_window > self.state.remote_window {
                     self.state.remote_window = new_window;
                     for stream in self.state.streams.values() {

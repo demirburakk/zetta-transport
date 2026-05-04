@@ -31,15 +31,15 @@ impl StreamReceiveBuffer {
         }
     }
 
-    pub(crate) fn write(&mut self, offset: u64, data: &[u8]) -> bool {
+    pub(crate) fn write(&mut self, offset: u64, data: &[u8]) -> Option<usize> {
         if data.is_empty() {
-            return true;
+            return Some(0);
         }
         let end_offset = offset + data.len() as u64;
-        
+
         // Cannot fit in the buffer
         if end_offset > self.read_head + self.buffer.len() as u64 {
-            return false;
+            return None;
         }
 
         if end_offset > self.write_head {
@@ -52,15 +52,23 @@ impl StreamReceiveBuffer {
             self.buffer[pos as usize] = b;
         }
 
-        self.add_range(offset..end_offset);
-        true
+        let added = self.add_range(offset..end_offset);
+        Some(added)
     }
 
-    fn add_range(&mut self, mut new_range: std::ops::Range<u64>) {
+    fn add_range(&mut self, mut new_range: std::ops::Range<u64>) -> usize {
+        let original_start = new_range.start;
+        let original_end = new_range.end;
+        let mut overlap = 0u64;
         let mut i = 0;
         while i < self.received_ranges.len() {
             let r = &self.received_ranges[i];
             if new_range.start <= r.end && r.start <= new_range.end {
+                let overlap_start = original_start.max(r.start);
+                let overlap_end = original_end.min(r.end);
+                if overlap_end > overlap_start {
+                    overlap += overlap_end - overlap_start;
+                }
                 // Merge
                 new_range.start = std::cmp::min(new_range.start, r.start);
                 new_range.end = std::cmp::max(new_range.end, r.end);
@@ -71,6 +79,8 @@ impl StreamReceiveBuffer {
         }
         self.received_ranges.push(new_range);
         self.received_ranges.sort_by_key(|r| r.start);
+        let new_len = original_end.saturating_sub(original_start);
+        new_len.saturating_sub(overlap) as usize
     }
 
     pub(crate) fn read_contiguous(&mut self) -> Option<Bytes> {
@@ -108,12 +118,6 @@ impl StreamReceiveBuffer {
         None
     }
 
-    pub(crate) fn buffered_len(&self) -> usize {
-        self.received_ranges
-            .iter()
-            .map(|r| (r.end - r.start) as usize)
-            .sum()
-    }
 }
 
 /// Per-stream receive/transmit state.
@@ -123,6 +127,7 @@ pub(crate) struct StreamState {
     pub(crate) receive_buffer: StreamReceiveBuffer,
     pub(crate) window_size: u64,
     pub(crate) tx_window: u64,
+    pub(crate) buffered_bytes: usize,
     pub(crate) window_opened: Arc<Notify>,
     pub(crate) app_tx: mpsc::Sender<Bytes>,
 }
@@ -136,6 +141,7 @@ impl StreamState {
             receive_buffer: StreamReceiveBuffer::new(window_size as usize),
             window_size,
             tx_window: 1024 * 1024,
+            buffered_bytes: 0,
             window_opened,
             app_tx,
         }
@@ -178,4 +184,5 @@ pub(crate) struct UnackedPacket {
     pub(crate) sent_at: Instant,
     pub(crate) retries: u32,
     pub(crate) is_mtu_probe: bool,
+    pub(crate) sent_bytes: usize,
 }

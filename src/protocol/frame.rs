@@ -62,8 +62,9 @@ impl Frame {
                 dst.put_u8(0x02);
                 dst.put_u64(*largest_acked);
                 dst.put_u32(*window_size);
-                dst.put_u8(ack_ranges.len() as u8);
-                for (start, end) in ack_ranges {
+                let range_len = ack_ranges.len().min(128);
+                dst.put_u8(range_len as u8);
+                for (start, end) in ack_ranges.iter().take(range_len) {
                     dst.put_u64(*start);
                     dst.put_u64(*end);
                 }
@@ -134,12 +135,12 @@ impl Frame {
                 Ok(Frame::Stream { id, offset, data })
             }
             0x02 => {
-                if src.remaining() < 12 {
+                if src.remaining() < 13 {
                     return Err(ZtError::InvalidPacket("Ack frame too short".into()));
                 }
                 let largest_acked = src.get_u64();
                 let window_size = src.get_u32();
-                let range_count = if src.remaining() > 0 { src.get_u8() } else { 0 } as usize;
+                let range_count = src.get_u8() as usize;
                 if range_count > 128 {
                     return Err(ZtError::InvalidPacket("Too many ACK ranges".into()));
                 }
@@ -151,6 +152,11 @@ impl Frame {
                 for _ in 0..range_count {
                     let start = src.get_u64();
                     let end = src.get_u64();
+                    if start > end {
+                        return Err(ZtError::InvalidPacket(
+                            "Ack range start > end".into(),
+                        ));
+                    }
                     ack_ranges.push((start, end));
                 }
                 Ok(Frame::Ack {

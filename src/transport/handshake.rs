@@ -63,6 +63,9 @@ pub(crate) async fn handle_handshake(
     if !header.is_long || header.p_type != PacketType::Initial {
         return Ok(());
     }
+    if header.version != 1 {
+        return Ok(());
+    }
 
     let mut payload = data_cursor.to_vec();
     if payload.len() < 16 {

@@ -56,7 +56,10 @@ impl ZtEndpoint {
         std_socket.set_nonblocking(true)?;
         std_socket.bind(&socket_addr.into())?;
         
-        let actual_addr: SocketAddr = std_socket.local_addr()?.as_socket().unwrap();
+        let actual_addr: SocketAddr = std_socket
+            .local_addr()?
+            .as_socket()
+            .ok_or_else(|| std::io::Error::other("Failed to resolve local socket addr"))?;
         
         let socket = Arc::new(UdpSocket::from_std(std_socket.into())?);
 

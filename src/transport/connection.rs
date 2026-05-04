@@ -41,11 +41,13 @@ pub(crate) struct ZtConnection {
     pub(crate) mtu: usize,
     pub(crate) bytes_received: usize,
     pub(crate) bytes_sent: usize,
+    pub(crate) conn_tx_offset: u64,
 
     pub(crate) replay_window: ReplayWindow,
     pub(crate) ack_tracker: super::window::AckTracker,
 
     pub(crate) current_key_epoch: u64,
+    pub(crate) packets_since_key_update: u64,
     pub(crate) cookie: Option<bytes::Bytes>,
 }
 
@@ -85,11 +87,13 @@ impl ZtConnection {
             mtu: 1200,
             bytes_received: 0,
             bytes_sent: 0,
+            conn_tx_offset: 0,
 
             replay_window: ReplayWindow::new(),
             ack_tracker: super::window::AckTracker::new(),
 
             current_key_epoch: 0,
+            packets_since_key_update: 0,
             cookie: None,
         }
     }
@@ -106,7 +110,7 @@ impl ZtConnection {
     pub(crate) fn get_total_buffered_bytes(&self) -> usize {
         self.streams
             .values()
-            .map(|s| s.receive_buffer.buffered_len())
+            .map(|s| s.buffered_bytes)
             .sum()
     }
 }

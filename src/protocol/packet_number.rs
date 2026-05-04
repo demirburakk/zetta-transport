@@ -1,8 +1,3 @@
-#[allow(dead_code)]
-pub(crate) fn decode_pn_len(first_byte: u8) -> usize {
-    (first_byte & 0x03) as usize + 1
-}
-
 pub(crate) fn truncate_pn(pn: u64, largest_acked: u64) -> (u32, usize) {
     let unacked = pn.saturating_sub(largest_acked);
     let num_bits = 64 - unacked.leading_zeros();
