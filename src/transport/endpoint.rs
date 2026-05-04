@@ -287,7 +287,9 @@ impl ZtEndpoint {
         match tokio::time::timeout(std::time::Duration::from_secs(5), wait_rx).await {
             Ok(Ok(_)) => {
                 let stream0 = ZtStream::new(self.clone(), scid.clone(), 0, data_rx, window_opened);
-                stream_tx.try_send(stream0).expect("Stream 0 channel full");
+                if stream_tx.try_send(stream0).is_err() {
+                    tracing::warn!("Stream 0 channel full; dropping preallocated stream");
+                }
                 Ok(ZtConnectionHandle::new(self.clone(), scid, stream_rx))
             }
             _ => {

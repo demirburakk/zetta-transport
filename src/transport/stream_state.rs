@@ -107,6 +107,13 @@ impl StreamReceiveBuffer {
         }
         None
     }
+
+    pub(crate) fn buffered_len(&self) -> usize {
+        self.received_ranges
+            .iter()
+            .map(|r| (r.end - r.start) as usize)
+            .sum()
+    }
 }
 
 /// Per-stream receive/transmit state.
@@ -116,7 +123,6 @@ pub(crate) struct StreamState {
     pub(crate) receive_buffer: StreamReceiveBuffer,
     pub(crate) window_size: u64,
     pub(crate) tx_window: u64,
-    pub(crate) buffered_bytes: usize,
     pub(crate) window_opened: Arc<Notify>,
     pub(crate) app_tx: mpsc::Sender<Bytes>,
 }
@@ -130,7 +136,6 @@ impl StreamState {
             receive_buffer: StreamReceiveBuffer::new(window_size as usize),
             window_size,
             tx_window: 1024 * 1024,
-            buffered_bytes: 0,
             window_opened,
             app_tx,
         }

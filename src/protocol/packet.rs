@@ -108,7 +108,6 @@ impl PacketHeader {
             let p_type = match p_type_val {
                 0x00 => PacketType::Initial,
                 0x01 => PacketType::Handshake,
-                0x02 => PacketType::Data,
                 0x07 => PacketType::Retry,
                 _ => return Err(ZtError::InvalidPacket("Invalid long packet type".into())),
             };

@@ -39,7 +39,7 @@ impl ZtConnectionActor {
             std::net::SocketAddr::V4(v4) => {
                 addr_v4.sin_family = libc::AF_INET as _;
                 addr_v4.sin_port = v4.port().to_be();
-                addr_v4.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+                addr_v4.sin_addr.s_addr = u32::from_be_bytes(v4.ip().octets());
                 msg.msg_name = &mut addr_v4 as *mut _ as *mut c_void;
                 msg.msg_namelen = std::mem::size_of::<sockaddr_in>() as _;
             }

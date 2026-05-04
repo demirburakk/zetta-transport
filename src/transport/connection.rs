@@ -104,6 +104,9 @@ impl ZtConnection {
     }
 
     pub(crate) fn get_total_buffered_bytes(&self) -> usize {
-        self.streams.values().map(|s| s.buffered_bytes).sum()
+        self.streams
+            .values()
+            .map(|s| s.receive_buffer.buffered_len())
+            .sum()
     }
 }

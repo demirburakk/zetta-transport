@@ -184,8 +184,10 @@ impl ZtConnectionActor {
                             id,
                             stream.window_size
                         );
-                        self.pending_acks += 1;
-                        return Ok(());
+                        let _ = self.initiate_close();
+                        return Err(ZtError::InvalidPacket(
+                            "Stream receive window exceeded".into(),
+                        ));
                     }
                 }
 
