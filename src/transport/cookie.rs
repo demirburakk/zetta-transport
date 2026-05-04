@@ -54,3 +54,69 @@ pub(crate) fn verify_retry_cookie(
     let expected = make_retry_cookie(cookie_key, addr, client_scid, cookie_time);
     subtle::ConstantTimeEq::ct_eq(&expected[8..40], &cookie[8..40]).into()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn make_addr() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080)
+    }
+
+    #[test]
+    fn cookie_verify_valid() {
+        let key = [1u8; 32];
+        let addr = make_addr();
+        let scid = b"client_scid";
+        let now = 1000u64;
+
+        let cookie = make_retry_cookie(&key, &addr, scid, now);
+        assert!(verify_retry_cookie(&key, &addr, scid, &cookie, now));
+    }
+
+    #[test]
+    fn cookie_verify_expired() {
+        let key = [1u8; 32];
+        let addr = make_addr();
+        let scid = b"client_scid";
+        let cookie = make_retry_cookie(&key, &addr, scid, 1000);
+        assert!(!verify_retry_cookie(&key, &addr, scid, &cookie, 1031));
+    }
+
+    #[test]
+    fn cookie_verify_wrong_ip() {
+        let key = [1u8; 32];
+        let addr1 = make_addr();
+        let addr2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 8080);
+        let scid = b"client_scid";
+        let cookie = make_retry_cookie(&key, &addr1, scid, 1000);
+        assert!(!verify_retry_cookie(&key, &addr2, scid, &cookie, 1000));
+    }
+
+    #[test]
+    fn cookie_verify_wrong_scid() {
+        let key = [1u8; 32];
+        let addr = make_addr();
+        let cookie = make_retry_cookie(&key, &addr, b"scid_A", 1000);
+        assert!(!verify_retry_cookie(&key, &addr, b"scid_B", &cookie, 1000));
+    }
+
+    #[test]
+    fn cookie_wrong_length_rejected() {
+        let key = [1u8; 32];
+        let addr = make_addr();
+        assert!(!verify_retry_cookie(&key, &addr, b"scid", b"too_short", 1000));
+        assert!(!verify_retry_cookie(&key, &addr, b"scid", &[0u8; 50], 1000));
+    }
+
+    #[test]
+    fn cookie_timing_boundary() {
+        let key = [1u8; 32];
+        let addr = make_addr();
+        let scid = b"s";
+        let cookie = make_retry_cookie(&key, &addr, scid, 1000);
+        assert!(verify_retry_cookie(&key, &addr, scid, &cookie, 1030));
+        assert!(!verify_retry_cookie(&key, &addr, scid, &cookie, 1031));
+    }
+}

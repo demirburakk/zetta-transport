@@ -76,3 +76,61 @@ pub(crate) fn remove_header_protection(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_packet() -> Vec<u8> {
+        let mut p = vec![0u8; 30];
+        p[0] = 0x08;
+        p[1] = 0;
+        p
+    }
+
+    #[test]
+    fn header_protection_roundtrip() {
+        let hp_key = [0xABu8; 16];
+        let pn_offset = 2;
+        let mut packet = make_test_packet();
+        let original = packet.clone();
+
+        apply_header_protection(&mut packet, pn_offset, &hp_key).unwrap();
+        assert_ne!(packet[0], original[0]);
+        assert_ne!(packet[pn_offset], original[pn_offset]);
+
+        remove_header_protection(&mut packet, pn_offset, &hp_key).unwrap();
+        assert_eq!(packet, original);
+    }
+
+    #[test]
+    fn apply_hp_short_packet_errors() {
+        let hp_key = [0u8; 16];
+        let mut too_short = vec![0u8; 10];
+        too_short[0] = 0x08;
+        too_short[1] = 0;
+        let result = apply_header_protection(&mut too_short, 2, &hp_key);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn remove_hp_short_packet_errors() {
+        let hp_key = [0u8; 16];
+        let mut too_short = vec![0u8; 10];
+        too_short[0] = 0x08;
+        too_short[1] = 0;
+        let result = remove_header_protection(&mut too_short, 2, &hp_key);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn long_header_mask_bits() {
+        let hp_key = [0xFFu8; 16];
+        let pn_offset = 6;
+        let mut packet = vec![0xFFu8; 30];
+        packet[0] = 0x80;
+        let original_first = packet[0];
+        apply_header_protection(&mut packet, pn_offset, &hp_key).unwrap();
+        assert_eq!(packet[0] & 0xF0, original_first & 0xF0);
+    }
+}

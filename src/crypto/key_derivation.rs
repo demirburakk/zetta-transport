@@ -149,3 +149,65 @@ pub(super) fn ratchet_secret(current_secret: &mut [u8; 32]) -> [u8; 32] {
     current_secret.zeroize();
     next_secret
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_master_secret_symmetric() {
+        let shared = [42u8; 32];
+        let client_scid = b"client01";
+        let server_scid = b"server01";
+
+        let client_secret = derive_master_secret(&shared, client_scid, server_scid, None, true);
+        let server_secret = derive_master_secret(&shared, server_scid, client_scid, None, false);
+        assert_eq!(client_secret, server_secret);
+    }
+
+    #[test]
+    fn derive_master_secret_psk_changes_result() {
+        let shared = [1u8; 32];
+        let scid = b"abc";
+        let dcid = b"xyz";
+        let no_psk = derive_master_secret(&shared, scid, dcid, None, true);
+        let with_psk = derive_master_secret(&shared, scid, dcid, Some([99u8; 32]), true);
+        assert_ne!(no_psk, with_psk);
+    }
+
+    #[test]
+    fn epoch_keys_client_server_differ() {
+        let secret = [7u8; 32];
+        let client_keys = derive_epoch_keys(&secret, 0, true);
+        let server_keys = derive_epoch_keys(&secret, 0, false);
+        assert_eq!(client_keys.tx_key, server_keys.rx_key);
+        assert_eq!(client_keys.rx_key, server_keys.tx_key);
+        assert_eq!(client_keys.tx_hp_key, server_keys.rx_hp_key);
+    }
+
+    #[test]
+    fn epoch_suffix_produces_different_keys() {
+        let secret = [3u8; 32];
+        let epoch0 = derive_epoch_keys(&secret, 0, true);
+        let epoch1 = derive_epoch_keys(&secret, 1, true);
+        assert_ne!(epoch0.tx_key, epoch1.tx_key);
+    }
+
+    #[test]
+    fn ratchet_produces_different_secret() {
+        let mut secret = [5u8; 32];
+        let original = secret;
+        let next = ratchet_secret(&mut secret);
+        assert_ne!(original, next);
+        assert_eq!(secret, [0u8; 32]);
+    }
+
+    #[test]
+    fn ratchet_is_deterministic() {
+        let mut s1 = [9u8; 32];
+        let mut s2 = [9u8; 32];
+        let r1 = ratchet_secret(&mut s1);
+        let r2 = ratchet_secret(&mut s2);
+        assert_eq!(r1, r2);
+    }
+}

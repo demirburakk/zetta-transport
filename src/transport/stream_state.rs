@@ -148,6 +148,82 @@ impl StreamState {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_and_read_sequential() {
+        let mut buf = StreamReceiveBuffer::new(4096);
+        buf.write(0, b"hello").unwrap();
+        let chunk = buf.read_contiguous().unwrap();
+        assert_eq!(&chunk[..], b"hello");
+        assert!(buf.read_contiguous().is_none());
+    }
+
+    #[test]
+    fn out_of_order_delivery() {
+        let mut buf = StreamReceiveBuffer::new(4096);
+        buf.write(5, b"world").unwrap();
+        assert!(buf.read_contiguous().is_none());
+        buf.write(0, b"hello").unwrap();
+        let chunk = buf.read_contiguous().unwrap();
+        assert_eq!(&chunk[..], b"helloworld");
+        assert!(buf.read_contiguous().is_none());
+    }
+
+    #[test]
+    fn duplicate_write_handled() {
+        let mut buf = StreamReceiveBuffer::new(4096);
+        let added1 = buf.write(0, b"hello").unwrap();
+        let added2 = buf.write(0, b"hello").unwrap();
+        assert_eq!(added1, 5);
+        assert_eq!(added2, 0);
+        let chunk = buf.read_contiguous().unwrap();
+        assert_eq!(&chunk[..], b"hello");
+    }
+
+    #[test]
+    fn overlapping_write() {
+        let mut buf = StreamReceiveBuffer::new(4096);
+        buf.write(0, b"hello world").unwrap();
+        buf.write(6, b"WORLD!!").unwrap();
+        let chunk = buf.read_contiguous().unwrap();
+        assert_eq!(chunk.len(), 13);
+    }
+
+    #[test]
+    fn circular_wrap_around() {
+        let mut buf = StreamReceiveBuffer::new(16);
+        buf.write(0, b"0123456789abcdef").unwrap();
+        let _ = buf.read_contiguous();
+        buf.write(16, b"NEW_DATA").unwrap();
+        let chunk = buf.read_contiguous().unwrap();
+        assert_eq!(&chunk[..], b"NEW_DATA");
+    }
+
+    #[test]
+    fn window_overflow_returns_none() {
+        let mut buf = StreamReceiveBuffer::new(100);
+        let result = buf.write(0, &vec![0u8; 101]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn buffered_ranges_merge_correctly() {
+        let mut buf = StreamReceiveBuffer::new(4096);
+        let added1 = buf.write(0, b"12345").unwrap();
+        let added2 = buf.write(10, b"abcde").unwrap();
+        assert_eq!(added1, 5);
+        assert_eq!(added2, 5);
+        let _ = buf.read_contiguous();
+        let added3 = buf.write(5, b"67890").unwrap();
+        assert_eq!(added3, 5);
+        let chunk = buf.read_contiguous().unwrap();
+        assert_eq!(chunk.len(), 10);
+    }
+}
+
 /// Describes the content of an unacknowledged packet.
 pub(crate) enum UnackedPayload {
     Stream {

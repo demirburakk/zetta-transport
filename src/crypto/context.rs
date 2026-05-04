@@ -232,3 +232,99 @@ impl CryptoContext {
         *Nonce::from_slice(&nonce_bytes)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_context_pair() -> (CryptoContext, CryptoContext) {
+        let (secret, public) = crate::crypto::keypair::generate_keypair();
+        let (server_secret, server_public) = crate::crypto::keypair::generate_keypair();
+        let client_shared = crate::crypto::keypair::compute_shared_secret(&secret, server_public);
+        let server_shared = crate::crypto::keypair::compute_shared_secret(&server_secret, public);
+
+        let client_scid = b"client01";
+        let server_scid = b"server01";
+
+        let client =
+            CryptoContext::from_shared_secret(client_shared, client_scid, server_scid, None, true);
+        let server =
+            CryptoContext::from_shared_secret(server_shared, server_scid, client_scid, None, false);
+        (client, server)
+    }
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let (client, server) = make_context_pair();
+        let aad = b"header bytes";
+        let plaintext = b"secret message";
+        let mut payload = plaintext.to_vec();
+
+        let tag = client.encrypt_in_place(0, aad, &mut payload).unwrap();
+        assert_ne!(&payload[..], plaintext);
+
+        server.decrypt_in_place(0, aad, &mut payload, &tag, false).unwrap();
+        assert_eq!(&payload[..], plaintext);
+    }
+
+    #[test]
+    fn different_pn_produces_different_ciphertext() {
+        let (client, _) = make_context_pair();
+        let aad = b"aad";
+        let plaintext = [0u8; 32];
+
+        let mut p1 = plaintext.to_vec();
+        let mut p2 = plaintext.to_vec();
+        client.encrypt_in_place(0, aad, &mut p1).unwrap();
+        client.encrypt_in_place(1, aad, &mut p2).unwrap();
+        assert_ne!(p1, p2);
+    }
+
+    #[test]
+    fn wrong_aad_fails_decryption() {
+        let (client, server) = make_context_pair();
+        let mut payload = b"data".to_vec();
+        let tag = client
+            .encrypt_in_place(0, b"correct_aad", &mut payload)
+            .unwrap();
+        let result = server.decrypt_in_place(0, b"wrong_aad", &mut payload, &tag, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn tampered_payload_fails_decryption() {
+        let (client, server) = make_context_pair();
+        let aad = b"aad";
+        let mut payload = b"hello".to_vec();
+        let tag = client.encrypt_in_place(0, aad, &mut payload).unwrap();
+        payload[0] ^= 0xFF;
+        let result = server.decrypt_in_place(0, aad, &mut payload, &tag, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn key_rotation_allows_prev_key_decryption() {
+        let (client, mut server) = make_context_pair();
+        let aad = b"aad";
+        let mut payload = b"old epoch data".to_vec();
+        let tag = client.encrypt_in_place(0, aad, &mut payload).unwrap();
+
+        server.rotate_keys();
+
+        server.decrypt_in_place(0, aad, &mut payload, &tag, true).unwrap();
+    }
+
+    #[test]
+    fn initial_context_symmetric() {
+        let dcid = b"test_dcid_01";
+        let client_ctx = CryptoContext::initial(dcid, true);
+        let server_ctx = CryptoContext::initial(dcid, false);
+
+        let aad = b"initial header";
+        let mut payload = b"handshake data".to_vec();
+        let tag = client_ctx.encrypt_in_place(0, aad, &mut payload).unwrap();
+        server_ctx
+            .decrypt_in_place(0, aad, &mut payload, &tag, false)
+            .unwrap();
+    }
+}

@@ -311,3 +311,88 @@ impl AckTracker {
         ranges
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ack_tracker_sequential() {
+        let mut t = AckTracker::new();
+        for pn in 0..10u64 {
+            t.mark_processed(pn);
+        }
+        let ranges = t.get_ack_ranges();
+        assert_eq!(ranges, vec![(0, 9)]);
+    }
+
+    #[test]
+    fn ack_tracker_with_gap() {
+        let mut t = AckTracker::new();
+        for pn in [0u64, 1, 2, 5, 6, 7] {
+            t.mark_processed(pn);
+        }
+        let ranges = t.get_ack_ranges();
+        assert_eq!(ranges.len(), 2);
+        assert!(ranges.contains(&(5, 7)));
+        assert!(ranges.contains(&(0, 2)));
+    }
+
+    #[test]
+    fn ack_tracker_out_of_order() {
+        let mut t = AckTracker::new();
+        t.mark_processed(10);
+        t.mark_processed(5);
+        t.mark_processed(8);
+        let ranges = t.get_ack_ranges();
+        assert!(ranges.contains(&(10, 10)));
+        assert!(ranges.contains(&(8, 8)));
+        assert!(ranges.contains(&(5, 5)));
+    }
+
+    #[test]
+    fn ack_tracker_duplicate_ignored() {
+        let mut t = AckTracker::new();
+        t.mark_processed(5);
+        t.mark_processed(5);
+        let ranges = t.get_ack_ranges();
+        assert_eq!(ranges, vec![(5, 5)]);
+    }
+
+    #[test]
+    fn ack_tracker_window_overflow_resets() {
+        let mut t = AckTracker::new();
+        t.mark_processed(0);
+        t.mark_processed(3000);
+        let ranges = t.get_ack_ranges();
+        assert_eq!(ranges, vec![(3000, 3000)]);
+    }
+
+    #[test]
+    fn replay_window_no_replay_initially() {
+        let w = ReplayWindow::new();
+        assert!(!w.is_replay(0));
+        assert!(!w.is_replay(100));
+    }
+
+    #[test]
+    fn replay_window_detects_replay() {
+        let mut w = ReplayWindow::new();
+        w.mark_processed(5);
+        assert!(w.is_replay(5));
+    }
+
+    #[test]
+    fn replay_window_too_old_is_replay() {
+        let mut w = ReplayWindow::new();
+        w.mark_processed(3000);
+        assert!(w.is_replay(0));
+    }
+
+    #[test]
+    fn replay_window_future_is_not_replay() {
+        let mut w = ReplayWindow::new();
+        w.mark_processed(5);
+        assert!(!w.is_replay(6));
+    }
+}

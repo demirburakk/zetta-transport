@@ -38,3 +38,38 @@ pub(crate) fn expand_pn(pn_truncated: u64, pn_len: usize, largest_pn: u64) -> u6
         candidate_pn
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_expand_roundtrip() {
+        let cases = [
+            (0u64, 0u64),
+            (1, 0),
+            (255, 0),
+            (256, 0),
+            (1000, 900),
+            (u32::MAX as u64, u32::MAX as u64 - 100),
+            (u64::MAX / 2, u64::MAX / 2 - 1),
+        ];
+        for (pn, largest_acked) in cases {
+            let (truncated, len) = truncate_pn(pn, largest_acked);
+            let expanded = expand_pn(truncated as u64, len, largest_acked);
+            assert_eq!(expanded, pn, "pn={pn}, largest_acked={largest_acked}");
+        }
+    }
+
+    #[test]
+    fn expand_pn_out_of_order() {
+        let expanded = expand_pn(98, 1, 99);
+        assert_eq!(expanded, 98);
+    }
+
+    #[test]
+    fn expand_pn_wraparound_u8() {
+        let expanded = expand_pn(0, 1, 254);
+        assert_eq!(expanded, 256);
+    }
+}

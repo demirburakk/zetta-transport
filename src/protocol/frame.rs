@@ -231,3 +231,73 @@ impl Frame {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::{Bytes, BytesMut, BufMut};
+
+    fn roundtrip(frame: Frame) -> Frame {
+        let mut buf = BytesMut::new();
+        frame.encode(&mut buf);
+        let mut bytes = buf.freeze();
+        Frame::decode(&mut bytes).expect("decode failed")
+    }
+
+    #[test]
+    fn stream_frame_roundtrip() {
+        let f = Frame::Stream {
+            id: 42,
+            offset: 1000,
+            data: Bytes::from_static(b"hello world"),
+        };
+        assert_eq!(roundtrip(f.clone()), f);
+    }
+
+    #[test]
+    fn ack_frame_roundtrip_with_ranges() {
+        let f = Frame::Ack {
+            largest_acked: 500,
+            window_size: 65536,
+            ack_ranges: vec![(400, 450), (480, 499)],
+        };
+        assert_eq!(roundtrip(f.clone()), f);
+    }
+
+    #[test]
+    fn ack_frame_rejects_invalid_range() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(0x02);
+        buf.put_u64(100u64);
+        buf.put_u32(65536u32);
+        buf.put_u8(1u8);
+        buf.put_u64(50u64);
+        buf.put_u64(10u64);
+        let mut bytes = buf.freeze();
+        assert!(Frame::decode(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn decode_truncated_stream_frame_errors() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(0x01);
+        buf.put_u32(1u32);
+        let mut bytes = buf.freeze();
+        assert!(Frame::decode(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn ack_range_count_limit() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(0x02);
+        buf.put_u64(200u64);
+        buf.put_u32(65536u32);
+        buf.put_u8(129u8);
+        for i in 0..129u64 {
+            buf.put_u64(i * 2);
+            buf.put_u64(i * 2 + 1);
+        }
+        let mut bytes = buf.freeze();
+        assert!(Frame::decode(&mut bytes).is_err());
+    }
+}
