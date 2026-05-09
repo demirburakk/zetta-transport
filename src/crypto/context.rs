@@ -201,6 +201,32 @@ impl CryptoContext {
             .map_err(|e| ZtError::Crypto(format!("Decryption failed: {}", e)))
     }
 
+    /// Attempts to decrypt the payload with the NEXT epoch's keys.
+    /// If successful, commits the key rotation and returns Ok.
+    pub(crate) fn trial_decrypt_and_rotate(
+        &mut self,
+        packet_number: u64,
+        aad: &[u8],
+        payload: &mut [u8],
+        tag: &[u8; 16],
+    ) -> Result<()> {
+        let mut next_secret = self.secret.clone();
+        next_secret = key_derivation::ratchet_secret(&mut next_secret);
+        let next_epoch = self.epoch + 1;
+        let keys = key_derivation::derive_epoch_keys(&next_secret, next_epoch, self.is_client);
+        
+        let nonce = self.make_nonce_from_iv(&keys.rx_iv, packet_number);
+        let chacha_tag = chacha20poly1305::Tag::from_slice(tag);
+        
+        keys.rx_cipher
+            .decrypt_in_place_detached(&nonce, aad, payload, chacha_tag)
+            .map_err(|e| ZtError::Crypto(format!("Trial decryption failed: {}", e)))?;
+            
+        // Trial succeeded, commit rotation
+        self.rotate_keys();
+        Ok(())
+    }
+
     /// Applies header protection to a packet using the TX HP key.
     pub(crate) fn apply_header_protection(
         &self,

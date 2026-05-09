@@ -98,7 +98,12 @@ impl ZtStream {
                         // Wait until either the peer opens its window (ACK
                         // received), the congestion window grows, or the
                         // connection is closed.
-                        self.window_opened.notified().await;
+                        if tokio::time::timeout(
+                            std::time::Duration::from_secs(15),
+                            self.window_opened.notified()
+                        ).await.is_err() {
+                            return Err(crate::error::ZtError::Timeout);
+                        }
                     }
                     Err(crate::error::ZtError::PacingBlocked(duration)) => {
                         tokio::time::sleep(duration).await;

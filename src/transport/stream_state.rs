@@ -52,9 +52,16 @@ impl StreamReceiveBuffer {
         }
 
         let cap = self.buffer.len() as u64;
-        for (i, &b) in data.iter().enumerate() {
-            let pos = (offset + i as u64) % cap;
-            self.buffer[pos as usize] = b;
+        let start_idx = (offset % cap) as usize;
+        let mut data_offset = 0;
+        let mut write_idx = start_idx;
+
+        while data_offset < data.len() {
+            let chunk_len = std::cmp::min(data.len() - data_offset, self.buffer.len() - write_idx);
+            self.buffer[write_idx..write_idx + chunk_len]
+                .copy_from_slice(&data[data_offset..data_offset + chunk_len]);
+            data_offset += chunk_len;
+            write_idx = 0; // Wrap around for the next iteration
         }
 
         let added = self.add_range(offset, end_offset);

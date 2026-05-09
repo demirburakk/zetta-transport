@@ -30,12 +30,7 @@ pub(crate) async fn handle_handshake(
     data: Bytes,
     addr: SocketAddr,
 ) -> Result<()> {
-    let _permit = endpoint
-        .handshake_semaphore
-        .acquire()
-        .await
-        .map_err(|_| ZtError::ActorFailed)?;
-
+    // Semaphore acquisition is now handled upstream in `endpoint.rs` before `tokio::spawn`.
     if data.len() < 1200 {
         return Ok(()); // Anti-amplification drop
     }

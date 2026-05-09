@@ -131,20 +131,23 @@ impl ZtConnection {
                 // Slow start
                 self.cwnd += bytes_acked;
             } else {
-                // CUBIC congestion avoidance.
-                // Compute t relative to the ACK processing instant.
-                // Note: If last_congestion_time is None (before any loss occurs),
-                // t = 0.0, which means w_cubic_pkts will be evaluated below cubic_w_max.
-                // This correctly causes target_cwnd < cwnd, gracefully falling back
-                // to Reno-style additive increase during the initial congestion avoidance phase.
-                let c = 0.4;
-                let t = self
-                    .last_congestion_time
-                    .map_or(0.0, |last| last.elapsed().as_secs_f64());
+                let should_update = match self.last_cubic_update {
+                    Some(last) => last.elapsed() >= self.rtt,
+                    None => true,
+                };
+                
+                if should_update {
+                    self.last_cubic_update = Some(std::time::Instant::now());
+                    let c = 0.4;
+                    let t = self
+                        .last_congestion_time
+                        .map_or(0.0, |last| last.elapsed().as_secs_f64());
 
-                let w_cubic_pkts = c * (t - self.cubic_k).powi(3) + self.cubic_w_max;
-                let target_cwnd = (w_cubic_pkts * self.mtu as f64) as usize;
+                    let w_cubic_pkts = c * (t - self.cubic_k).powi(3) + self.cubic_w_max;
+                    self.target_cwnd = (w_cubic_pkts * self.mtu as f64) as usize;
+                }
 
+                let target_cwnd = self.target_cwnd;
                 let reno_inc = (self.mtu * bytes_acked) / self.cwnd.max(self.mtu);
 
                 if target_cwnd > self.cwnd {

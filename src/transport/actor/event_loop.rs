@@ -15,16 +15,19 @@ impl ZtConnectionActor {
         let mut idle_deadline = TokioInstant::now() + Duration::from_secs(60);
         let mut ack_deadline = TokioInstant::now() + SLEEP_FOREVER;
         let mut mtu_probe_deadline = TokioInstant::now() + Duration::from_secs(15);
+        let mut pacing_deadline = TokioInstant::now() + SLEEP_FOREVER;
 
         let rto_timer = sleep_until(rto_deadline);
         let idle_timer = sleep_until(idle_deadline);
         let delayed_ack_timer = sleep_until(ack_deadline);
         let mtu_probe_timer = sleep_until(mtu_probe_deadline);
+        let pacing_timer = sleep_until(pacing_deadline);
 
         tokio::pin!(rto_timer);
         tokio::pin!(idle_timer);
         tokio::pin!(delayed_ack_timer);
         tokio::pin!(mtu_probe_timer);
+        tokio::pin!(pacing_timer);
 
         if self.state.state == ConnectionState::Handshaking
             && let Err(e) = self.send_initial_packet(None)
@@ -34,6 +37,12 @@ impl ZtConnectionActor {
 
         loop {
             if self.state.state == ConnectionState::Closed {
+                let zombie_duration = self.state.rtt * 3;
+                let _ = tokio::time::timeout(zombie_duration, async {
+                    while let Some(_) = self.receiver.recv().await {
+                        // In zombie state, just drain and drop messages
+                    }
+                }).await;
                 break;
             }
 
@@ -56,6 +65,13 @@ impl ZtConnectionActor {
                         ActorMessage::OutgoingData { stream_id, data, respond_to } => {
                             self.last_active_stream_id = stream_id;
                             let result = self.process_outgoing_data(stream_id, data);
+                            if let Some(wait) = self.flush_pacing_queue() {
+                                pacing_deadline = TokioInstant::now() + wait;
+                                pacing_timer.as_mut().reset(pacing_deadline);
+                            } else {
+                                pacing_deadline = TokioInstant::now() + SLEEP_FOREVER;
+                                pacing_timer.as_mut().reset(pacing_deadline);
+                            }
                             let _ = respond_to.send(result);
                         }
                         ActorMessage::GetMtu { respond_to } => {
@@ -121,6 +137,16 @@ impl ZtConnectionActor {
                     }
                     mtu_probe_deadline = TokioInstant::now() + Duration::from_secs(15);
                     mtu_probe_timer.as_mut().reset(mtu_probe_deadline);
+                }
+
+                _ = &mut pacing_timer => {
+                    if let Some(wait) = self.flush_pacing_queue() {
+                        pacing_deadline = TokioInstant::now() + wait;
+                        pacing_timer.as_mut().reset(pacing_deadline);
+                    } else {
+                        pacing_deadline = TokioInstant::now() + SLEEP_FOREVER;
+                        pacing_timer.as_mut().reset(pacing_deadline);
+                    }
                 }
 
                 _ = &mut idle_timer => { break; }

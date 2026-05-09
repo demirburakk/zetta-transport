@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use super::stream_state::{ConnectionState, StreamState};
+use super::stream_state::{ConnectionState, StreamState, UnackedPayload};
 use super::window::{ReplayWindow, UnackedWindow};
 
 /// Represents a single connection to a remote peer.
@@ -37,6 +37,8 @@ pub(crate) struct ZtConnection {
     pub(crate) cubic_w_max: f64,
     pub(crate) cubic_k: f64,
     pub(crate) last_congestion_time: Option<std::time::Instant>,
+    pub(crate) last_cubic_update: Option<std::time::Instant>,
+    pub(crate) target_cwnd: usize,
     pub(crate) pacing_tokens: f64,
     pub(crate) last_pacing_update: Option<std::time::Instant>,
     pub(crate) bytes_in_flight: usize,
@@ -44,6 +46,9 @@ pub(crate) struct ZtConnection {
     pub(crate) bytes_received: usize,
     pub(crate) bytes_sent: usize,
     pub(crate) conn_tx_offset: u64,
+
+    pub(crate) unpaced_queue: std::collections::VecDeque<UnackedPayload>,
+    pub(crate) queued_bytes: usize,
 
     pub(crate) replay_window: ReplayWindow,
     pub(crate) ack_tracker: super::window::AckTracker,
@@ -86,6 +91,8 @@ impl ZtConnection {
             cubic_w_max: 0.0,
             cubic_k: 0.0,
             last_congestion_time: None,
+            last_cubic_update: None,
+            target_cwnd: 10 * 1200,
             pacing_tokens: 12000.0, // Initial burst
             last_pacing_update: None,
             bytes_in_flight: 0,
@@ -93,6 +100,9 @@ impl ZtConnection {
             bytes_received: 0,
             bytes_sent: 0,
             conn_tx_offset: 0,
+
+            unpaced_queue: std::collections::VecDeque::new(),
+            queued_bytes: 0,
 
             replay_window: ReplayWindow::new(),
             ack_tracker: super::window::AckTracker::new(),

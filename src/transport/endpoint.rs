@@ -156,18 +156,23 @@ impl ZtEndpoint {
                                     let _ = tx.try_send(ActorMessage::IncomingPacket { data, addr });
                                 }
                             } else {
-                                let ep_clone = endpoint.clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = crate::transport::handshake::handle_handshake(
-                                        ep_clone,
-                                        data.freeze(),
-                                        addr,
-                                    )
-                                    .await
-                                    {
-                                        tracing::debug!("Handshake failed: {:?}", e);
-                                    }
-                                });
+                                if let Ok(permit) = endpoint.handshake_semaphore.clone().try_acquire_owned() {
+                                    let ep_clone = endpoint.clone();
+                                    tokio::spawn(async move {
+                                        let _permit = permit;
+                                        if let Err(e) = crate::transport::handshake::handle_handshake(
+                                            ep_clone,
+                                            data.freeze(),
+                                            addr,
+                                        )
+                                        .await
+                                        {
+                                            tracing::debug!("Handshake failed: {:?}", e);
+                                        }
+                                    });
+                                } else {
+                                    tracing::debug!("Dropped incoming handshake: server at capacity");
+                                }
                             }
                         }
                     }

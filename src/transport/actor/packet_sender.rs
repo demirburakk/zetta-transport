@@ -242,27 +242,10 @@ impl ZtConnectionActor {
         }
 
         let to_send_len_usize = to_send_len as usize;
+        let queued_bytes = self.state.queued_bytes;
         
-        if self.state.bytes_in_flight + to_send_len_usize > self.state.cwnd {
+        if self.state.bytes_in_flight + to_send_len_usize + queued_bytes > self.state.cwnd {
             return Err(ZtError::CongestionWindowFull);
-        }
-
-        let now = StdInstant::now();
-        let rate = self.state.cwnd as f64 / self.state.rtt.as_secs_f64().max(0.001);
-        if let Some(last) = self.state.last_pacing_update {
-            let elapsed = now.duration_since(last).as_secs_f64();
-            self.state.pacing_tokens += rate * elapsed;
-            let max_burst = (self.state.mtu * 10) as f64;
-            if self.state.pacing_tokens > max_burst {
-                self.state.pacing_tokens = max_burst;
-            }
-        }
-        self.state.last_pacing_update = Some(now);
-
-        if self.state.pacing_tokens < to_send_len as f64 {
-            let deficit = to_send_len as f64 - self.state.pacing_tokens;
-            let wait_secs = deficit / rate;
-            return Err(ZtError::PacingBlocked(std::time::Duration::from_secs_f64(wait_secs)));
         }
 
         let start = stream.next_tx_offset;
@@ -272,14 +255,50 @@ impl ZtConnectionActor {
             self.state.conn_tx_offset.saturating_add(to_send_len as u64);
         
         self.state.remote_window -= to_send_len;
-        self.state.pacing_tokens -= to_send_len as f64;
         
+        let payload_len = data.len();
         let payload = UnackedPayload::Stream {
             stream_id,
             offset: start,
             data,
         };
-        self.send_payload(payload)
+        self.state.unpaced_queue.push_back(payload);
+        self.state.queued_bytes += payload_len;
+        Ok(())
+    }
+
+    pub(super) fn flush_pacing_queue(&mut self) -> Option<std::time::Duration> {
+        let now = StdInstant::now();
+        let rate = self.state.cwnd as f64 / self.state.rtt.as_secs_f64().max(0.001);
+        if let Some(last) = self.state.last_pacing_update {
+            let elapsed = now.duration_since(last).as_secs_f64();
+            self.state.pacing_tokens += rate * elapsed;
+            let max_burst = (self.state.mtu * 10) as f64;
+            if self.state.pacing_tokens > max_burst {
+                self.state.pacing_tokens = max_burst;
+            }
+        } else {
+            self.state.last_pacing_update = Some(now);
+        }
+        self.state.last_pacing_update = Some(now);
+
+        while let Some(payload) = self.state.unpaced_queue.front() {
+            let len = payload.len() as f64;
+            let payload_len = payload.len();
+            if self.state.pacing_tokens >= len {
+                let p = self.state.unpaced_queue.pop_front().unwrap();
+                self.state.queued_bytes = self.state.queued_bytes.saturating_sub(payload_len);
+                self.state.pacing_tokens -= len;
+                if let Err(e) = self.send_payload(p) {
+                    tracing::debug!("Failed to send paced payload: {}", e);
+                }
+            } else {
+                let deficit = len - self.state.pacing_tokens;
+                let wait_secs = deficit / rate;
+                return Some(std::time::Duration::from_secs_f64(wait_secs));
+            }
+        }
+        None
     }
 
     pub(super) fn handle_retransmits(&mut self) -> Result<()> {
@@ -295,6 +314,9 @@ impl ZtConnectionActor {
                     to_drop.push(pn);
                 } else {
                     up.retries += 1;
+                    if up.retries > 3 {
+                        self.state.mtu = 1200; // MTU Fallback
+                    }
                     up.sent_at = now;
                     to_drop.push(pn);
                     to_retransmit.insert(pn);
@@ -445,7 +467,6 @@ impl ZtConnectionActor {
         h.encode(&mut p);
         let h_len = p.len();
 
-        // Include protocol version in transcript to prevent downgrade attacks.
         let mut hasher = sha2::Sha256::new();
         sha2::Digest::update(&mut hasher, &1u32.to_be_bytes());
         sha2::Digest::update(&mut hasher, &self.state.scid);

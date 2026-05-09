@@ -57,23 +57,15 @@ impl ZtConnectionActor {
         if self.state.is_replay(header.packet_number) {
             return Ok(());
         }
-        let use_prev_key;
-        let mut rotated_this_packet = false;
+        let mut use_prev_key = false;
+        let mut trial_rotate = false;
 
         if is_short_header && header.key_phase != expected_kp {
             if header.packet_number >= highest {
-                if let Some(crypto) = self.state.crypto.as_mut() {
-                    crypto.rotate_keys();
-                    self.state.current_key_epoch += 1;
-                    self.state.packets_since_key_update = 0;
-                }
-                use_prev_key = false;
-                rotated_this_packet = true;
+                trial_rotate = true;
             } else {
                 use_prev_key = true;
             }
-        } else {
-            use_prev_key = false;
         }
 
         match header.p_type {
@@ -86,8 +78,9 @@ impl ZtConnectionActor {
             PacketType::Data | PacketType::MtuProbe | PacketType::Close
                 if self.state.state == ConnectionState::Active =>
             {
-                let crypto = self.state.crypto.as_ref().ok_or(ZtError::Unauthorized)?;
+                let mut crypto = self.state.crypto.take().ok_or(ZtError::Unauthorized)?;
                 if payload_buf.len() < 16 {
+                    self.state.crypto = Some(crypto);
                     return Ok(());
                 }
                 let tag_idx = payload_buf.len() - 16;
@@ -95,24 +88,39 @@ impl ZtConnectionActor {
                 let tag: [u8; 16] = tag_bytes
                     .as_ref()
                     .try_into()
-                    .map_err(|_| ZtError::InvalidPacket("Invalid tag size".into()))?;
+                    .map_err(|_| {
+                        // Return unauthorized, we can't recover crypto context here without a workaround,
+                        // but invalid tag size means protocol violation anyway.
+                        ZtError::InvalidPacket("Invalid tag size".into())
+                    })?;
 
-                if let Err(e) = crypto.decrypt_in_place(
-                    header.packet_number,
-                    &aad,
-                    &mut payload_buf,
-                    &tag,
-                    use_prev_key,
-                ) {
-                    if rotated_this_packet {
-                        tracing::debug!(
-                            "Key rotation triggered by pn={} but decryption failed; \
-                             rotation will be re-applied when a valid packet arrives",
-                            header.packet_number
-                        );
+                if trial_rotate {
+                    if let Err(e) = crypto.trial_decrypt_and_rotate(
+                        header.packet_number,
+                        &aad,
+                        &mut payload_buf,
+                        &tag,
+                    ) {
+                        tracing::debug!("Key rotation trial decryption failed for pn={}", header.packet_number);
+                        self.state.crypto = Some(crypto);
+                        return Err(e);
                     }
-                    return Err(e);
+                    self.state.current_key_epoch += 1;
+                    self.state.packets_since_key_update = 0;
+                } else {
+                    if let Err(e) = crypto.decrypt_in_place(
+                        header.packet_number,
+                        &aad,
+                        &mut payload_buf,
+                        &tag,
+                        use_prev_key,
+                    ) {
+                        self.state.crypto = Some(crypto);
+                        return Err(e);
+                    }
                 }
+                
+                self.state.crypto = Some(crypto);
 
                 self.state.addr = addr;
                 self.state.mark_processed(header.packet_number);
