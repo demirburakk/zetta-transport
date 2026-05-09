@@ -4,5 +4,4 @@ pub(crate) mod connection;
 pub(crate) mod cookie;
 pub mod endpoint;
 pub(crate) mod handshake;
-pub(crate) mod stream_state;
-pub(crate) mod window;
+pub(crate) mod state;

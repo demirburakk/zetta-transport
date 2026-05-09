@@ -2,7 +2,7 @@ use crate::error::{Result, ZtError};
 use crate::stream::{ZtConnectionHandle, ZtStream};
 use crate::transport::actor::{ActorMessage, ZtConnectionActor};
 use crate::transport::connection::ZtConnection;
-use crate::transport::stream_state::{ConnectionState, StreamState};
+use crate::transport::state::{ConnectionState, StreamState};
 use bytes::Bytes;
 use dashmap::DashMap;
 use ed25519_dalek::{SigningKey, VerifyingKey};

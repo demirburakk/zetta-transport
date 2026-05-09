@@ -7,7 +7,7 @@ use crate::transport::actor::ZtConnectionActor;
 use crate::transport::connection::ZtConnection;
 use crate::transport::cookie;
 use crate::transport::endpoint::ZtEndpoint;
-use crate::transport::stream_state::{ConnectionState, StreamState};
+use crate::transport::state::{ConnectionState, StreamState};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use rand::Rng;

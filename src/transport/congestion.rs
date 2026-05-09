@@ -1,5 +1,5 @@
 use super::connection::ZtConnection;
-use crate::transport::stream_state::UnackedPayload;
+use crate::transport::state::UnackedPayload;
 
 /// Congestion control, loss recovery, and replay protection for a connection.
 impl ZtConnection {

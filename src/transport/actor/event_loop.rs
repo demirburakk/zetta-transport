@@ -1,7 +1,7 @@
 use super::ActorMessage;
 use super::ZtConnectionActor;
 use crate::stream::ZtStream;
-use crate::transport::stream_state::{ConnectionState, StreamState};
+use crate::transport::state::{ConnectionState, StreamState};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};

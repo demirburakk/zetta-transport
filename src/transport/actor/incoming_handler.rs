@@ -4,7 +4,7 @@ use crate::protocol::frame::Frame;
 use crate::protocol::packet::{PacketHeader, PacketType};
 use crate::stream::ZtStream;
 use crate::transport::connection::ZtConnection;
-use crate::transport::stream_state::{ConnectionState, StreamState, UnackedPayload};
+use crate::transport::state::{ConnectionState, StreamState, UnackedPayload};
 use bytes::{Buf, Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::sync::Arc;

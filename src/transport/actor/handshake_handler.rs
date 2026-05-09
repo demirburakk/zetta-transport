@@ -2,7 +2,7 @@ use super::ZtConnectionActor;
 use crate::error::{Result, ZtError};
 use crate::protocol::frame::Frame;
 use crate::protocol::packet::PacketHeader;
-use crate::transport::stream_state::ConnectionState;
+use crate::transport::state::ConnectionState;
 use bytes::{Buf, Bytes};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::Digest;

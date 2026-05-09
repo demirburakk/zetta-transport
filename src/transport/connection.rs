@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use super::stream_state::{ConnectionState, StreamState, UnackedPayload};
-use super::window::{ReplayWindow, UnackedWindow};
+use super::state::{
+    AckTracker, ConnectionState, ReplayWindow, StreamState, UnackedPayload, UnackedWindow,
+};
 
 /// Represents a single connection to a remote peer.
 ///
@@ -51,7 +52,7 @@ pub(crate) struct ZtConnection {
     pub(crate) queued_bytes: usize,
 
     pub(crate) replay_window: ReplayWindow,
-    pub(crate) ack_tracker: super::window::AckTracker,
+    pub(crate) ack_tracker: AckTracker,
 
     pub(crate) current_key_epoch: u64,
     pub(crate) packets_since_key_update: u64,
@@ -105,7 +106,7 @@ impl ZtConnection {
             queued_bytes: 0,
 
             replay_window: ReplayWindow::new(),
-            ack_tracker: super::window::AckTracker::new(),
+            ack_tracker: AckTracker::new(),
 
             current_key_epoch: 0,
             packets_since_key_update: 0,
