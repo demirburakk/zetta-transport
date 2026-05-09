@@ -22,6 +22,15 @@ impl ZtConnectionActor {
         self.state.packets_since_key_update =
             self.state.packets_since_key_update.saturating_add(1);
         if self.state.packets_since_key_update >= KEY_UPDATE_PACKET_INTERVAL {
+            // Safety: defer rotation if there are many unacked packets in flight.
+            // This ensures the receiver has had a chance to process packets from
+            // the current epoch before we move to the next one. Without this check,
+            // massive packet loss could cause the sender to rotate while the receiver
+            // is still in the old epoch — and with a 1-bit key phase indicator,
+            // a 2-epoch gap is unrecoverable.
+            if self.state.unacked_packets.len() > (KEY_UPDATE_PACKET_INTERVAL / 4) as usize {
+                return;
+            }
             crypto.rotate_keys();
             self.state.current_key_epoch = self.state.current_key_epoch.saturating_add(1);
             self.state.packets_since_key_update = 0;
@@ -306,12 +315,14 @@ impl ZtConnectionActor {
         let rto = (self.state.rtt + self.state.rttvar * 4).max(Duration::from_millis(50));
         let mut to_retransmit = std::collections::HashSet::new();
         let mut to_drop = Vec::new();
+        let mut non_probe_dropped = false;
         for (pn, up) in self.state.unacked_packets.iter_mut() {
             if now.duration_since(up.sent_at) > rto {
                 if up.is_mtu_probe {
                     to_drop.push(pn);
                 } else if up.retries > 10 {
                     to_drop.push(pn);
+                    non_probe_dropped = true;
                 } else {
                     up.retries += 1;
                     if up.retries > 3 {
@@ -323,7 +334,6 @@ impl ZtConnectionActor {
                 }
             }
         }
-        let total_unacked = self.state.unacked_packets.len();
 
         let mut payloads_to_resend = Vec::new();
         for pn in to_drop {
@@ -347,7 +357,7 @@ impl ZtConnectionActor {
             }
         }
 
-        if total_unacked > 0 && to_retransmit.is_empty() && self.state.unacked_packets.is_empty() {
+        if non_probe_dropped && to_retransmit.is_empty() && self.state.unacked_packets.is_empty() {
             return Err(ZtError::Timeout);
         }
         Ok(())

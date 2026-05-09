@@ -223,12 +223,27 @@ impl ZtConnectionActor {
                 let mut forwarded = false;
                 loop {
                     if let Some(chunk) = stream.receive_buffer.read_contiguous() {
+                        let chunk_len = chunk.len();
+                        let chunk_offset = stream.receive_buffer.read_head - chunk_len as u64;
                         stream.buffered_bytes =
-                            stream.buffered_bytes.saturating_sub(chunk.len());
-                        if stream.app_tx.try_send(chunk).is_ok() {
-                            forwarded = true;
-                        } else {
-                            break;
+                            stream.buffered_bytes.saturating_sub(chunk_len);
+                        match stream.app_tx.try_send(chunk.clone()) {
+                            Ok(()) => {
+                                forwarded = true;
+                            }
+                            Err(_) => {
+                                // Application channel is full. Put the chunk back into
+                                // the receive buffer at the correct offset so it is
+                                // not lost and can be forwarded on the next attempt.
+                                stream.receive_buffer.unread(chunk_offset, &chunk);
+                                stream.buffered_bytes =
+                                    stream.buffered_bytes.saturating_add(chunk_len);
+                                tracing::debug!(
+                                    "Stream {} app channel full, deferring {} bytes",
+                                    id, chunk_len
+                                );
+                                break;
+                            }
                         }
                     } else {
                         break;

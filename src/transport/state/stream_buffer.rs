@@ -144,6 +144,21 @@ impl StreamReceiveBuffer {
         }
         None
     }
+
+    /// Puts previously read data back into the buffer at the given offset.
+    ///
+    /// Used when the application channel is full and the chunk cannot be
+    /// forwarded — the data is re-inserted so it can be retried later
+    /// without data loss.
+    pub(crate) fn unread(&mut self, offset: u64, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        // Rewind read_head to the original position.
+        self.read_head = offset;
+        // Re-register the range (the data is still in the circular buffer).
+        self.add_range(offset, offset + data.len() as u64);
+    }
 }
 
 #[cfg(test)]

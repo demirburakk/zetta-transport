@@ -310,6 +310,16 @@ pub(crate) async fn handle_handshake(
         let payload_len = buf.len() - header_len;
         buf.put_bytes(0, 16); // tag
 
+        // SECURITY NOTE: The server's Handshake response is encrypted with
+        // Initial-level crypto (deterministic, publicly derivable from DCID).
+        // This is architecturally necessary because the client has not yet
+        // computed the session shared secret — it needs the server's ephemeral
+        // public key (carried in this packet) to do so. Confidentiality is NOT
+        // a goal here; authentication IS, and it is provided by:
+        //   1. The Ed25519 signature over the transcript hash
+        //   2. The transcript hash binding both parties' ephemeral keys and CIDs
+        // This mirrors QUIC's design where ServerHello is sent in Initial
+        // protection, with full confidentiality only after key exchange completes.
         let crypto = CryptoContext::initial(&hs_header.dcid, false);
         {
             let packet_slice = buf.as_mut();

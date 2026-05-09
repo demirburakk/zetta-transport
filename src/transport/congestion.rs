@@ -131,6 +131,11 @@ impl ZtConnection {
                 // Slow start
                 self.cwnd += bytes_acked;
             } else {
+                // Start a new CUBIC epoch if we just entered congestion avoidance.
+                if self.cubic_epoch_start.is_none() {
+                    self.cubic_epoch_start = Some(std::time::Instant::now());
+                }
+
                 let should_update = match self.last_cubic_update {
                     Some(last) => last.elapsed() >= self.rtt,
                     None => true,
@@ -139,12 +144,15 @@ impl ZtConnection {
                 if should_update {
                     self.last_cubic_update = Some(std::time::Instant::now());
                     let c = 0.4;
+                    // t is measured from the epoch start, not from last_congestion_time.
+                    // This prevents t from growing unboundedly when no congestion
+                    // occurs for a long time, which would cause sudden cwnd explosions.
                     let t = self
-                        .last_congestion_time
-                        .map_or(0.0, |last| last.elapsed().as_secs_f64());
+                        .cubic_epoch_start
+                        .map_or(0.0, |epoch| epoch.elapsed().as_secs_f64());
 
                     let w_cubic_pkts = c * (t - self.cubic_k).powi(3) + self.cubic_w_max;
-                    self.target_cwnd = (w_cubic_pkts * self.mtu as f64) as usize;
+                    self.target_cwnd = (w_cubic_pkts * self.mtu as f64).max(0.0) as usize;
                 }
 
                 let target_cwnd = self.target_cwnd;
@@ -191,5 +199,8 @@ impl ZtConnection {
         
         self.cubic_k = (self.cubic_w_max * (1.0 - beta) / c).cbrt();
         self.last_congestion_time = Some(std::time::Instant::now());
+        // Reset the CUBIC epoch so t starts fresh after recovery.
+        self.cubic_epoch_start = None;
+        self.last_cubic_update = None;
     }
 }

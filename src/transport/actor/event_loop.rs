@@ -135,7 +135,11 @@ impl ZtConnectionActor {
                     if let Err(e) = self.send_mtu_probe() {
                         tracing::debug!("Failed to send MTU probe: {}", e);
                     }
-                    mtu_probe_deadline = TokioInstant::now() + Duration::from_secs(15);
+                    // RTT-adaptive probe interval: max(5s, 10 * smoothed_rtt).
+                    // Avoids wasting bandwidth on slow links while still probing
+                    // quickly on fast ones.
+                    let probe_interval = (self.state.rtt * 10).max(Duration::from_secs(5));
+                    mtu_probe_deadline = TokioInstant::now() + probe_interval;
                     mtu_probe_timer.as_mut().reset(mtu_probe_deadline);
                 }
 

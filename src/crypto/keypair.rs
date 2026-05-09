@@ -1,6 +1,6 @@
 use rand::rngs::OsRng;
 use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 /// Generates a new X25519 ephemeral keypair for Diffie-Hellman key exchange.
 ///
@@ -14,14 +14,18 @@ pub(crate) fn generate_keypair() -> (EphemeralSecret, PublicKey) {
 }
 
 /// Computes a shared secret using our ephemeral private key and the peer's
-/// public key, then immediately zeroizes the raw bytes.
+/// public key, returning the raw bytes.
 ///
 /// The `EphemeralSecret` is consumed (moved) by `diffie_hellman`, so it
 /// cannot be accidentally reused — enforced at compile time.
+///
+/// The intermediate `SharedSecret` bytes are wrapped in `Zeroizing` to
+/// guarantee they are wiped from the stack when the guard drops.
 pub(crate) fn compute_shared_secret(my_secret: EphemeralSecret, their_public: PublicKey) -> [u8; 32] {
     let shared: SharedSecret = my_secret.diffie_hellman(&their_public);
-    let mut bytes = shared.to_bytes();
-    let result = bytes;
-    bytes.zeroize();
-    result
+    // Zeroizing<T> implements Drop to zeroize the inner value. The copy
+    // into `result` happens before the guard drops, so the caller gets
+    // the real bytes and the stack copy is scrubbed.
+    let guarded = Zeroizing::new(shared.to_bytes());
+    *guarded
 }

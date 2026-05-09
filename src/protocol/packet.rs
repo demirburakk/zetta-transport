@@ -3,10 +3,15 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Packet types for wire-level headers.
 ///
-/// Discriminant values are in the 0x10+ range to avoid any collision with
-/// Frame type bytes (0x00–0x08). Even though they live in separate parsing
-/// contexts (header vs. payload), using distinct values eliminates a class
-/// of implementation bugs.
+/// Long-header types: Initial (0x00), Handshake (0x01), Retry (0x0C).
+/// Short-header types: Data (0x02), Close (0x0A), MtuProbe (0x0B).
+///
+/// These discriminants overlap with Frame type bytes (0x00–0x08) at the
+/// byte level, but they occupy **separate parsing contexts**: packet type
+/// is extracted from the header's first byte (bits [5:2]), while frame
+/// types are parsed from the decrypted payload stream. The gap between
+/// short-header types (0x0A+) and frame types (≤0x08) provides an extra
+/// safety margin against mis-parsing corrupted data.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PacketType {
     Initial = 0x00,

@@ -30,9 +30,15 @@ pub(crate) fn make_retry_cookie(
     cookie
 }
 
+/// Maximum age in seconds for a retry cookie to remain valid.
+///
+/// A tight window (5s) limits replay attack surface while comfortably
+/// covering even high-latency network round-trips.
+const COOKIE_MAX_AGE_SECS: u64 = 5;
+
 /// Verifies a retry cookie against the client's address and SCID.
 ///
-/// Returns false if the cookie is expired (>30s) or the HMAC doesn't match.
+/// Returns false if the cookie is expired (>5s) or the HMAC doesn't match.
 pub(crate) fn verify_retry_cookie(
     cookie_key: &[u8; 32],
     addr: &SocketAddr,
@@ -47,7 +53,7 @@ pub(crate) fn verify_retry_cookie(
     time_bytes.copy_from_slice(&cookie[0..8]);
     let cookie_time = u64::from_be_bytes(time_bytes);
 
-    if now < cookie_time || now - cookie_time > 30 {
+    if now < cookie_time || now - cookie_time > COOKIE_MAX_AGE_SECS {
         return false;
     }
 
@@ -81,7 +87,7 @@ mod tests {
         let addr = make_addr();
         let scid = b"client_scid";
         let cookie = make_retry_cookie(&key, &addr, scid, 1000);
-        assert!(!verify_retry_cookie(&key, &addr, scid, &cookie, 1031));
+        assert!(!verify_retry_cookie(&key, &addr, scid, &cookie, 1006));
     }
 
     #[test]
@@ -116,7 +122,7 @@ mod tests {
         let addr = make_addr();
         let scid = b"s";
         let cookie = make_retry_cookie(&key, &addr, scid, 1000);
-        assert!(verify_retry_cookie(&key, &addr, scid, &cookie, 1030));
-        assert!(!verify_retry_cookie(&key, &addr, scid, &cookie, 1031));
+        assert!(verify_retry_cookie(&key, &addr, scid, &cookie, 1005));
+        assert!(!verify_retry_cookie(&key, &addr, scid, &cookie, 1006));
     }
 }

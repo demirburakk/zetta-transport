@@ -203,6 +203,9 @@ impl CryptoContext {
 
     /// Attempts to decrypt the payload with the NEXT epoch's keys.
     /// If successful, commits the key rotation and returns Ok.
+    ///
+    /// The temporary ratcheted secret is wrapped in `Zeroizing` to ensure
+    /// it is scrubbed from memory whether or not decryption succeeds.
     pub(crate) fn trial_decrypt_and_rotate(
         &mut self,
         packet_number: u64,
@@ -210,17 +213,25 @@ impl CryptoContext {
         payload: &mut [u8],
         tag: &[u8; 16],
     ) -> Result<()> {
-        let mut next_secret = self.secret.clone();
-        next_secret = key_derivation::ratchet_secret(&mut next_secret);
+        use zeroize::Zeroizing;
+
+        let mut secret_clone = self.secret;
+        let next_secret = Zeroizing::new(key_derivation::ratchet_secret(&mut secret_clone));
         let next_epoch = self.epoch + 1;
         let keys = key_derivation::derive_epoch_keys(&next_secret, next_epoch, self.is_client);
         
         let nonce = self.make_nonce_from_iv(&keys.rx_iv, packet_number);
         let chacha_tag = chacha20poly1305::Tag::from_slice(tag);
         
-        keys.rx_cipher
+        let result = keys.rx_cipher
             .decrypt_in_place_detached(&nonce, aad, payload, chacha_tag)
-            .map_err(|e| ZtError::Crypto(format!("Trial decryption failed: {}", e)))?;
+            .map_err(|e| ZtError::Crypto(format!("Trial decryption failed: {}", e)));
+
+        // Explicitly zeroize before potential early return.
+        // (Zeroizing::drop would handle it, but being explicit is clearer.)
+        drop(next_secret);
+
+        result?;
             
         // Trial succeeded, commit rotation
         self.rotate_keys();
