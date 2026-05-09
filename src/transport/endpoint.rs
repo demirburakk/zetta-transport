@@ -304,7 +304,7 @@ impl ZtEndpoint {
         self.routing_table.insert(scid.clone(), actor_tx);
         tokio::spawn(actor.run());
 
-        match tokio::time::timeout(std::time::Duration::from_secs(5), wait_rx).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), wait_rx).await {
             Ok(Ok(_)) => {
                 let stream0 = ZtStream::new(self.clone(), scid.clone(), 0, data_rx, window_opened, conn_closed);
                 if stream_tx.try_send(stream0).is_err() {

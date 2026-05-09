@@ -19,6 +19,15 @@ pub(crate) enum UnackedPayload {
         max_data: u64,
     },
     Close,
+    Initial {
+        cookie: Option<Bytes>,
+    },
+    Handshake {
+        public_key: [u8; 32],
+        ed_public_key: [u8; 32],
+        transcript_hash: Vec<u8>,
+        signature: [u8; 64],
+    },
 }
 
 impl UnackedPayload {
@@ -28,7 +37,9 @@ impl UnackedPayload {
             UnackedPayload::MtuProbe { target_size } => *target_size,
             UnackedPayload::StreamClose { .. }
             | UnackedPayload::MaxStreamData { .. }
-            | UnackedPayload::Close => 0,
+            | UnackedPayload::Close
+            | UnackedPayload::Initial { .. }
+            | UnackedPayload::Handshake { .. } => 0,
         }
     }
 }

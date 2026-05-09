@@ -258,7 +258,7 @@ impl ZtConnectionActor {
                         stream_id: id,
                         max_data,
                     };
-                    let _ = self.retransmit_payload(payload);
+                    let _ = self.retransmit_payload(payload, 0);
                 }
 
                 self.pending_acks += 1;
@@ -280,8 +280,8 @@ impl ZtConnectionActor {
                 );
 
                 // Re-send the fast retransmits
-                for payload in fast_retransmits {
-                    if let Err(e) = self.retransmit_payload(payload) {
+                for (payload, retries) in fast_retransmits {
+                    if let Err(e) = self.retransmit_payload(payload, retries) {
                         tracing::warn!("Fast retransmit failed: {}", e);
                     }
                 }

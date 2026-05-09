@@ -35,6 +35,14 @@ impl ZtConnectionActor {
             tracing::warn!("Failed to send initial packet: {:?}", e);
         }
 
+        if let Some(wait) = self.flush_pacing_queue() {
+            pacing_deadline = TokioInstant::now() + wait;
+            pacing_timer.as_mut().reset(pacing_deadline);
+        } else {
+            pacing_deadline = TokioInstant::now() + SLEEP_FOREVER;
+            pacing_timer.as_mut().reset(pacing_deadline);
+        }
+
         loop {
             if self.state.state == ConnectionState::Closed {
                 let zombie_duration = self.state.rtt * 3;

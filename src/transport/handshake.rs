@@ -8,7 +8,7 @@ use crate::transport::connection::ZtConnection;
 use crate::transport::cookie;
 use crate::transport::endpoint::ZtEndpoint;
 use crate::transport::state::{ConnectionState, StreamState};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use rand::Rng;
 use sha2::Digest;
@@ -199,7 +199,26 @@ pub(crate) async fn handle_handshake(
             .streams
             .insert(0, StreamState::new(data_tx, window_opened.clone()));
 
-        let handshake_pn = new_conn.get_next_packet_number()?;
+        let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, &PROTOCOL_VERSION.to_be_bytes());
+        sha2::Digest::update(&mut hasher, &header.scid);
+        sha2::Digest::update(&mut hasher, &header.dcid);
+        sha2::Digest::update(&mut hasher, pk_bytes);
+        if let Some(ref c) = cookie_data {
+            sha2::Digest::update(&mut hasher, c);
+        }
+        sha2::Digest::update(&mut hasher, &scid);
+        sha2::Digest::update(&mut hasher, ephemeral_public.as_bytes());
+        let transcript_hash = sha2::Digest::finalize(hasher).to_vec();
+
+        let hs_payload = crate::transport::state::UnackedPayload::Handshake {
+            public_key: *ephemeral_public.as_bytes(),
+            ed_public_key: *endpoint.ed_public_key.as_bytes(),
+            transcript_hash: transcript_hash.clone(),
+            signature: endpoint.ed_signing_key.sign(&transcript_hash).to_bytes(),
+        };
+        new_conn.unpaced_queue.push_back(hs_payload);
+
         new_conn.mark_processed(header.packet_number);
         new_conn.state = ConnectionState::Active;
 
@@ -272,71 +291,6 @@ pub(crate) async fn handle_handshake(
             return Ok(()); // cleanup_guard will remove it from routing_table
         }
 
-        let pn_len = 1; // Handshake PN is typically 0, so 1 byte is enough.
-        let hs_header = PacketHeader {
-            p_type: PacketType::Handshake,
-            is_long: true,
-            version: PROTOCOL_VERSION,
-            dcid: header.scid.clone(),
-            scid: scid.clone(),
-            packet_number: handshake_pn,
-            key_phase: false,
-            pn_len,
-        };
-        let mut buf = BytesMut::with_capacity(256);
-        hs_header.encode(&mut buf);
-        let header_len = buf.len();
-
-        // Server transcript includes protocol version to prevent downgrade attacks.
-        let mut hasher = sha2::Sha256::new();
-        sha2::Digest::update(&mut hasher, &PROTOCOL_VERSION.to_be_bytes());
-        sha2::Digest::update(&mut hasher, &header.scid);
-        sha2::Digest::update(&mut hasher, &header.dcid);
-        sha2::Digest::update(&mut hasher, pk_bytes);
-        if let Some(ref c) = cookie_data {
-            sha2::Digest::update(&mut hasher, c);
-        }
-        sha2::Digest::update(&mut hasher, &scid);
-        sha2::Digest::update(&mut hasher, ephemeral_public.as_bytes());
-        let transcript_hash = sha2::Digest::finalize(hasher).to_vec();
-
-        let frame = Frame::Handshake {
-            public_key: *ephemeral_public.as_bytes(),
-            ed_public_key: *endpoint.ed_public_key.as_bytes(),
-            transcript_hash: transcript_hash.clone(),
-            signature: endpoint.ed_signing_key.sign(&transcript_hash).to_bytes(),
-        };
-        frame.encode(&mut buf);
-        let payload_len = buf.len() - header_len;
-        buf.put_bytes(0, 16); // tag
-
-        // SECURITY NOTE: The server's Handshake response is encrypted with
-        // Initial-level crypto (deterministic, publicly derivable from DCID).
-        // This is architecturally necessary because the client has not yet
-        // computed the session shared secret — it needs the server's ephemeral
-        // public key (carried in this packet) to do so. Confidentiality is NOT
-        // a goal here; authentication IS, and it is provided by:
-        //   1. The Ed25519 signature over the transcript hash
-        //   2. The transcript hash binding both parties' ephemeral keys and CIDs
-        // This mirrors QUIC's design where ServerHello is sent in Initial
-        // protection, with full confidentiality only after key exchange completes.
-        let crypto = CryptoContext::initial(&hs_header.dcid, false);
-        {
-            let packet_slice = buf.as_mut();
-            let (aad, rest) = packet_slice.split_at_mut(header_len);
-            let (payload, tag_space) = rest.split_at_mut(payload_len);
-            if let Ok(tag) = crypto.encrypt_in_place(handshake_pn, aad, payload) {
-                tag_space.copy_from_slice(&tag);
-            }
-        }
-
-        let packet_slice = buf.as_mut();
-        if let Some(offset) = PacketHeader::get_pn_offset(packet_slice) {
-            let _ = crypto.apply_header_protection(packet_slice, offset);
-        }
-        if let Err(e) = endpoint.socket.try_send_to(packet_slice, addr) {
-            tracing::debug!("Failed to send: {}", e);
-        }
         cleanup_guard.commit = true;
     }
     Ok(())

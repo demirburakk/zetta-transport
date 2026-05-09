@@ -29,7 +29,7 @@ impl ZtConnection {
         largest_acked_pn: u64,
         window_size: u32,
         sack_ranges: &[(u64, u64)],
-        fast_retransmits: &mut Vec<UnackedPayload>,
+        fast_retransmits: &mut Vec<(UnackedPayload, u32)>,
     ) {
         let mut bytes_acked = 0usize;
         let mut bytes_in_flight_acked = 0usize;
@@ -101,7 +101,7 @@ impl ZtConnection {
                 if up.is_mtu_probe {
                     self.mtu_probes.remove(&pn);
                 } else {
-                    fast_retransmits.push(up.payload);
+                    fast_retransmits.push((up.payload, 0));
                     loss_detected = true;
                 }
             }
@@ -171,9 +171,9 @@ impl ZtConnection {
         let old_remote_window = self.remote_window;
         self.remote_window = window_size;
 
-        // Only notify streams when the global remote window actually grew,
-        // avoiding unnecessary wakeups (Fix #7).
-        if window_size > old_remote_window {
+        // Notify streams if either the remote flow window grew, OR if we
+        // acked packets (which frees up congestion window space).
+        if window_size > old_remote_window || bytes_acked > 0 {
             for stream in self.streams.values() {
                 stream.window_opened.notify_waiters();
             }
