@@ -133,6 +133,10 @@ impl ZtConnection {
             } else {
                 // CUBIC congestion avoidance.
                 // Compute t relative to the ACK processing instant.
+                // Note: If last_congestion_time is None (before any loss occurs),
+                // t = 0.0, which means w_cubic_pkts will be evaluated below cubic_w_max.
+                // This correctly causes target_cwnd < cwnd, gracefully falling back
+                // to Reno-style additive increase during the initial congestion avoidance phase.
                 let c = 0.4;
                 let t = self
                     .last_congestion_time
@@ -147,6 +151,7 @@ impl ZtConnection {
                     let cubic_inc = target_cwnd - self.cwnd;
                     self.cwnd += cubic_inc.min(bytes_acked); // Bound the increase by acked amount
                 } else {
+                    // Reno fallback (additive increase)
                     self.cwnd += reno_inc;
                 }
             }

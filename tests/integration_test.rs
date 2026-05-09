@@ -149,3 +149,62 @@ async fn psk_mismatch_fails() {
     let recv_result = timeout(Duration::from_secs(2), server_stream.recv()).await;
     assert!(recv_result.is_err() || recv_result.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn packet_loss_retransmission() {
+    let server = ZtEndpoint::bind("127.0.0.1:0", None).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    // Create a simple UDP proxy that drops 20% of packets to test retransmission
+    let proxy = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        let mut client_addr = None;
+        let mut counter = 0;
+        
+        loop {
+            if let Ok((len, src)) = proxy.recv_from(&mut buf).await {
+                counter += 1;
+                // Drop every 5th packet (20% loss)
+                if counter % 5 == 0 {
+                    continue;
+                }
+                
+                if src != server_addr {
+                    client_addr = Some(src);
+                    let _ = proxy.send_to(&buf[..len], server_addr).await;
+                } else if let Some(ca) = client_addr {
+                    let _ = proxy.send_to(&buf[..len], ca).await;
+                }
+            }
+        }
+    });
+
+    let client_ep = ZtEndpoint::bind("127.0.0.1:0", None).await.unwrap();
+
+    let server_task = tokio::spawn(async move { 
+        let mut conn = server.accept().await.unwrap();
+        let mut stream = conn.accept_stream().await.unwrap();
+        let data = timeout(Duration::from_secs(10), stream.recv()).await.unwrap().unwrap();
+        assert_eq!(&data[..], b"lossy delivery success");
+        stream.send(b"server ack").await.unwrap();
+    });
+
+    // Connect to proxy instead of server
+    let mut client_conn = client_ep.connect(proxy_addr).await.unwrap();
+    let mut client_stream = client_conn.accept_stream().await.unwrap();
+    
+    // This payload is small but because of the handshake and subsequent ACKs, 
+    // packets will be dropped and must be retransmitted.
+    client_stream.send(b"lossy delivery success").await.unwrap();
+
+    let server_ack = timeout(Duration::from_secs(10), client_stream.recv())
+        .await
+        .expect("Timeout waiting for server ack")
+        .expect("Connection closed before server ack");
+    assert_eq!(&server_ack[..], b"server ack");
+
+    let _ = timeout(Duration::from_secs(10), server_task).await.unwrap();
+}

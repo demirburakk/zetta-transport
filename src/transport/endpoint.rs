@@ -285,7 +285,7 @@ impl ZtEndpoint {
             actor_rx,
             conn,
             ephemeral_public,
-            ephemeral_secret,
+            Some(ephemeral_secret),
             self.ed_signing_key.clone(),
             self.ed_public_key,
             self.psk,

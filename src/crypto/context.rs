@@ -21,7 +21,8 @@ impl Drop for FallbackRxKeys {
         self.rx_key.zeroize();
         self.rx_hp_key.zeroize();
         self.rx_iv.zeroize();
-        // Overwrite cipher with zero-key instance to clear key material
+        // ChaCha20Poly1305 does not implement Zeroize on Drop in the chacha20poly1305 crate.
+        // The idiomatic safe-Rust workaround is to overwrite the struct with a zero-key instance.
         let zero_key = chacha20poly1305::Key::from([0u8; 32]);
         self.rx_cipher = ChaCha20Poly1305::new(&zero_key);
     }
@@ -32,8 +33,10 @@ impl Drop for FallbackRxKeys {
 /// Holds the current epoch's keys and ciphers, plus fallback keys for
 /// out-of-order packets during key phase rotations.
 ///
-/// Supports two levels of fallback (prev and prev_prev) so that packets
-/// from two epochs ago can still be decrypted during network reordering.
+/// We retain exactly ONE level of fallback (`prev_rx`). A two-epoch fallback
+/// (`prev_prev`) is not practically reachable because a 1-bit key phase indicator
+/// aliases `epoch` and `epoch - 2`, making it impossible to distinguish without
+/// an expensive trial-decryption loop.
 pub(crate) struct CryptoContext {
     secret: [u8; 32],
     tx_key: [u8; 32],
@@ -47,9 +50,8 @@ pub(crate) struct CryptoContext {
     pub(crate) epoch: u64,
     is_client: bool,
 
-    // Two levels of fallback keys for out-of-order packets during key phase rotations.
+    // One level of fallback keys for out-of-order packets.
     prev_rx: Option<FallbackRxKeys>,
-    prev_prev_rx: Option<FallbackRxKeys>,
 }
 
 impl Drop for CryptoContext {
@@ -119,7 +121,6 @@ impl CryptoContext {
             epoch: 0,
             is_client,
             prev_rx: None,
-            prev_prev_rx: None,
         }
     }
 
@@ -137,14 +138,9 @@ impl CryptoContext {
         self.rx_cipher = keys.rx_cipher;
     }
 
-    /// Rotates keys forward: pushes current prev to prev_prev, saves current
-    /// RX keys as prev, ratchets the secret, and derives new epoch keys.
-    ///
-    /// Two levels of fallback are retained so that packets from up to two
-    /// epochs ago can still be decrypted during network reordering.
+    /// Rotates keys forward: saves current RX keys as prev, ratchets the secret,
+    /// and derives new epoch keys. Old prev gets dropped and zeroized automatically.
     pub(crate) fn rotate_keys(&mut self) {
-        // Shift prev → prev_prev (old prev_prev gets dropped and zeroized)
-        self.prev_prev_rx = self.prev_rx.take();
 
         // Save current RX keys as new prev
         self.prev_rx = Some(FallbackRxKeys {
@@ -178,8 +174,7 @@ impl CryptoContext {
 
     /// Decrypts payload in-place, verifying the AEAD tag.
     ///
-    /// When `use_prev_key` is true, tries the most recent fallback first,
-    /// then falls back to the older set if available.
+    /// When `use_prev_key` is true, tries the fallback RX key.
     pub(crate) fn decrypt_in_place(
         &self,
         packet_number: u64,
@@ -192,31 +187,13 @@ impl CryptoContext {
         let chacha_tag = chacha20poly1305::Tag::from_slice(tag);
 
         if use_prev_key {
-            // Try prev first, then prev_prev
             if let Some(ref prev) = self.prev_rx {
                 let prev_nonce = self.make_nonce_from_iv(&prev.rx_iv, packet_number);
-                let mut attempt = payload.to_vec();
-                if prev.rx_cipher
-                    .decrypt_in_place_detached(&prev_nonce, aad, &mut attempt, chacha_tag)
-                    .is_ok()
-                {
-                    payload.copy_from_slice(&attempt);
-                    return Ok(());
-                }
+                return prev.rx_cipher
+                    .decrypt_in_place_detached(&prev_nonce, aad, payload, chacha_tag)
+                    .map_err(|e| ZtError::Crypto(format!("Decryption with prev key failed: {}", e)));
             }
-            // Try prev_prev
-            if let Some(ref prev_prev) = self.prev_prev_rx {
-                let pp_nonce = self.make_nonce_from_iv(&prev_prev.rx_iv, packet_number);
-                let mut attempt = payload.to_vec();
-                if prev_prev.rx_cipher
-                    .decrypt_in_place_detached(&pp_nonce, aad, &mut attempt, chacha_tag)
-                    .is_ok()
-                {
-                    payload.copy_from_slice(&attempt);
-                    return Ok(());
-                }
-            }
-            return Err(ZtError::Crypto("No previous RX cipher could decrypt".into()));
+            return Err(ZtError::Crypto("No previous RX cipher available".into()));
         }
 
         self.rx_cipher
@@ -241,11 +218,8 @@ impl CryptoContext {
         use_prev_key: bool,
     ) -> Result<()> {
         let hp_key = if use_prev_key {
-            // Try prev first
             if let Some(ref prev) = self.prev_rx {
                 &prev.rx_hp_key
-            } else if let Some(ref prev_prev) = self.prev_prev_rx {
-                &prev_prev.rx_hp_key
             } else {
                 return Err(ZtError::Crypto("No previous RX HP key available".into()));
             }
@@ -354,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn key_rotation_allows_prev_key_decryption() {
+    fn one_epoch_fallback_works() {
         let (client, mut server) = make_context_pair();
         let aad = b"aad";
         let mut payload = b"old epoch data".to_vec();
@@ -362,20 +336,6 @@ mod tests {
 
         server.rotate_keys();
 
-        server.decrypt_in_place(0, aad, &mut payload, &tag, true).unwrap();
-    }
-
-    #[test]
-    fn two_epoch_fallback_works() {
-        let (client, mut server) = make_context_pair();
-        let aad = b"aad";
-        let mut payload = b"two epochs ago".to_vec();
-        let tag = client.encrypt_in_place(0, aad, &mut payload).unwrap();
-
-        server.rotate_keys(); // epoch 0 -> prev
-        server.rotate_keys(); // prev -> prev_prev, epoch 1 -> prev
-
-        // Should still decrypt using prev_prev
         server.decrypt_in_place(0, aad, &mut payload, &tag, true).unwrap();
     }
 

@@ -221,9 +221,8 @@ pub(crate) async fn handle_handshake(
         let conn_closed = new_conn.closed.clone();
 
         // Server-side actor does not need the ephemeral secret (already consumed).
-        // We generate a dummy keypair just to satisfy the actor constructor;
-        // the secret will never be used because the server handshake is complete.
-        let (server_actor_secret, server_actor_pk) = crate::crypto::keypair::generate_keypair();
+        // It is passed as None to eliminate the need for a dummy keypair.
+        let server_actor_pk = PublicKey::from(*endpoint.ed_public_key.as_bytes());
 
         let actor = ZtConnectionActor::new(
             endpoint.clone(),
@@ -231,7 +230,7 @@ pub(crate) async fn handle_handshake(
             actor_rx,
             new_conn,
             server_actor_pk,
-            server_actor_secret,
+            None,
             endpoint.ed_signing_key.clone(),
             endpoint.ed_public_key,
             endpoint.psk,
