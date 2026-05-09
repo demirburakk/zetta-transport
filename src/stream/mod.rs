@@ -48,6 +48,10 @@ pub struct ZtStream {
     pub(crate) stream_id: u32,
     receiver: mpsc::Receiver<Bytes>,
     window_opened: Arc<Notify>,
+    /// Shared closed signal. When the connection actor sets this to true,
+    /// all pending `window_opened.notified()` calls are unblocked and the
+    /// send loop returns `ActorFailed` instead of hanging forever.
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ZtStream {
@@ -57,6 +61,7 @@ impl ZtStream {
         stream_id: u32,
         receiver: mpsc::Receiver<Bytes>,
         window_opened: Arc<Notify>,
+        closed: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             endpoint,
@@ -64,6 +69,7 @@ impl ZtStream {
             stream_id,
             receiver,
             window_opened,
+            closed,
         }
     }
 
@@ -73,17 +79,25 @@ impl ZtStream {
     /// (`FlowControlBlocked`) or the local congestion window
     /// (`CongestionWindowFull`) is exhausted, the call yields until the
     /// respective window opens and then retries the chunk.
+    ///
+    /// Returns `ActorFailed` if the connection is closed while waiting,
+    /// preventing silent deadlocks.
     pub async fn send(&self, data: &[u8]) -> Result<()> {
         let mtu = self.endpoint.get_mtu(&self.cid).await;
         let chunk_size = mtu.saturating_sub(64).max(512);
         for chunk in data.chunks(chunk_size) {
             loop {
+                // Check if the connection has been closed before waiting
+                if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(crate::error::ZtError::ActorFailed);
+                }
                 match self.endpoint.send(&self.cid, self.stream_id, chunk).await {
                     Ok(_) => break,
                     Err(crate::error::ZtError::FlowControlBlocked)
                     | Err(crate::error::ZtError::CongestionWindowFull) => {
                         // Wait until either the peer opens its window (ACK
-                        // received) or the congestion window grows.
+                        // received), the congestion window grows, or the
+                        // connection is closed.
                         self.window_opened.notified().await;
                     }
                     Err(crate::error::ZtError::PacingBlocked(duration)) => {

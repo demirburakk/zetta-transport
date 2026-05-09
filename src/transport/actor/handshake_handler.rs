@@ -9,6 +9,9 @@ use sha2::Digest;
 use std::net::SocketAddr;
 use x25519_dalek::PublicKey;
 
+/// Current protocol version constant used in transcript binding.
+const PROTOCOL_VERSION: u32 = 1;
+
 impl ZtConnectionActor {
     pub(super) fn handle_handshake_response(
         &mut self,
@@ -17,7 +20,7 @@ impl ZtConnectionActor {
         aad: &[u8],
         addr: SocketAddr,
     ) -> Result<()> {
-        if header.version != 1 {
+        if header.version != PROTOCOL_VERSION {
             return Err(ZtError::InvalidPacket("Unsupported version".into()));
         }
         let crypto = crate::crypto::CryptoContext::initial(&header.dcid, true);
@@ -57,7 +60,9 @@ impl ZtConnectionActor {
         let old_scid = self.state.dcid.clone();
         let new_dcid = header.scid.clone();
         
+        // Build transcript hash including protocol version to prevent downgrade attacks.
         let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, &PROTOCOL_VERSION.to_be_bytes());
         sha2::Digest::update(&mut hasher, &self.state.scid);
         sha2::Digest::update(&mut hasher, &old_scid);
         sha2::Digest::update(&mut hasher, self.public_key.as_bytes());
@@ -77,8 +82,16 @@ impl ZtConnectionActor {
         remote_ed_pk
             .verify(&expected_hash, &Signature::from_bytes(&remote_sig_bytes))
             .map_err(|_| ZtError::Crypto("Invalid Sig".into()))?;
+
+        // Consume the ephemeral secret — it is moved into diffie_hellman and
+        // destroyed, enforcing forward secrecy at the type level.
+        let ephemeral_secret = self
+            .ephemeral_secret
+            .take()
+            .ok_or_else(|| ZtError::Crypto("Ephemeral secret already consumed".into()))?;
+
         let shared = crate::crypto::keypair::compute_shared_secret(
-            &self.static_secret,
+            ephemeral_secret,
             PublicKey::from(pk_bytes),
         );
         self.state.dcid = new_dcid.clone();

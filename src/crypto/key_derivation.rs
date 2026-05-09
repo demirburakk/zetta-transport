@@ -141,10 +141,13 @@ pub(super) fn derive_epoch_keys(secret: &[u8; 32], epoch: u64, is_client: bool) 
 /// Ratchets the secret forward, zeroizing the old secret.
 ///
 /// Returns the new secret to use for subsequent epochs.
+///
+/// Uses a domain-separated, version-specific label to avoid accidental
+/// collisions with other HKDF-Expand calls in the protocol.
 pub(super) fn ratchet_secret(current_secret: &mut [u8; 32]) -> [u8; 32] {
     let mut next_secret = [0u8; 32];
     Hkdf::<Sha256>::new(None, current_secret)
-        .expand(b"ratchet", &mut next_secret)
+        .expand(b"ZettaTransport v1 ratchet secret", &mut next_secret)
         .expect("HKDF ratchet failed");
     current_secret.zeroize();
     next_secret

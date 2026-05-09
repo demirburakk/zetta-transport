@@ -90,6 +90,7 @@ impl ZtConnectionActor {
                                 stream_id,
                                 data_rx,
                                 window_opened,
+                                self.state.closed.clone(),
                             );
                             let _ = respond_to.send(Ok(stream));
                         }
@@ -125,6 +126,16 @@ impl ZtConnectionActor {
                 _ = &mut idle_timer => { break; }
             }
         }
+
+        // Signal all streams that the connection is closed, preventing
+        // silent deadlocks in ZtStream::send() (Fix #10).
+        self.state
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        for stream in self.state.streams.values() {
+            stream.window_opened.notify_waiters();
+        }
+
         self.routing_table.remove(&self.scid);
     }
 }

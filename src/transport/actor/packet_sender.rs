@@ -445,7 +445,9 @@ impl ZtConnectionActor {
         h.encode(&mut p);
         let h_len = p.len();
 
+        // Include protocol version in transcript to prevent downgrade attacks.
         let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, &1u32.to_be_bytes());
         sha2::Digest::update(&mut hasher, &self.state.scid);
         sha2::Digest::update(&mut hasher, &self.state.dcid);
         sha2::Digest::update(&mut hasher, self.public_key.as_bytes());

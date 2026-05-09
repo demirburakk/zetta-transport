@@ -35,7 +35,7 @@ impl ZtConnectionActor {
         } else if let Some(offset) = PacketHeader::get_pn_offset(&mutable_data)
             && let Some(dcid) = crate::protocol::routing::extract_dcid_fast(&mutable_data)
         {
-            let is_retry = ((mutable_data[0] >> 2) & 0x0F) == 0x07;
+            let is_retry = ((mutable_data[0] >> 2) & 0x0F) == 0x0C;
             if !is_retry {
                 let crypto = crate::crypto::CryptoContext::initial(&dcid, true);
                 crypto.remove_header_protection(&mut mutable_data, offset, false)?;
@@ -166,6 +166,7 @@ impl ZtConnectionActor {
                         id,
                         data_rx,
                         window_opened,
+                        self.state.closed.clone(),
                     );
                     let _ = self.incoming_streams_tx.try_send(stream);
                 }
@@ -264,6 +265,14 @@ impl ZtConnectionActor {
             }
             Frame::ConnectionClose => {
                 self.state.state = ConnectionState::Closed;
+                // Signal all streams that the connection is closing so their
+                // send() loops don't hang forever waiting for window_opened.
+                self.state
+                    .closed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                for stream in self.state.streams.values() {
+                    stream.window_opened.notify_waiters();
+                }
             }
             Frame::StreamClose { id } => {
                 self.state.streams.remove(&id);

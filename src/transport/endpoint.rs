@@ -132,7 +132,12 @@ impl ZtEndpoint {
                         let mut routed = false;
                         if let Some(tx) = local_routing_table.get(&dcid) {
                             let tx: &mpsc::Sender<ActorMessage> = tx;
-                            if tx.try_send(ActorMessage::IncomingPacket { data: data.clone(), addr }).is_ok() {
+                            // Validate the cached sender is still alive before using it.
+                            // A closed channel means the actor dropped (possibly via
+                            // cleanup_guard rollback), so the local cache is stale.
+                            if tx.is_closed() {
+                                local_routing_table.remove(&dcid);
+                            } else if tx.try_send(ActorMessage::IncomingPacket { data: data.clone(), addr }).is_ok() {
                                 routed = true;
                             } else {
                                 // Channel full or closed, remove from local cache
@@ -142,8 +147,14 @@ impl ZtEndpoint {
                         
                         if !routed {
                             if let Some(tx) = endpoint.routing_table.get(&dcid) {
-                                local_routing_table.insert(dcid.clone(), tx.clone());
-                                let _ = tx.try_send(ActorMessage::IncomingPacket { data, addr });
+                                if tx.is_closed() {
+                                    // Stale entry in global table — clean it up
+                                    drop(tx);
+                                    endpoint.routing_table.remove(&dcid);
+                                } else {
+                                    local_routing_table.insert(dcid.clone(), tx.clone());
+                                    let _ = tx.try_send(ActorMessage::IncomingPacket { data, addr });
+                                }
                             } else {
                                 let ep_clone = endpoint.clone();
                                 tokio::spawn(async move {
@@ -262,6 +273,7 @@ impl ZtEndpoint {
 
         let (actor_tx, actor_rx) = mpsc::channel(1024);
         let (stream_tx, stream_rx) = mpsc::channel(128);
+        let conn_closed = conn.closed.clone();
 
         let (wait_tx, wait_rx) = oneshot::channel();
 
@@ -289,7 +301,7 @@ impl ZtEndpoint {
 
         match tokio::time::timeout(std::time::Duration::from_secs(5), wait_rx).await {
             Ok(Ok(_)) => {
-                let stream0 = ZtStream::new(self.clone(), scid.clone(), 0, data_rx, window_opened);
+                let stream0 = ZtStream::new(self.clone(), scid.clone(), 0, data_rx, window_opened, conn_closed);
                 if stream_tx.try_send(stream0).is_err() {
                     tracing::warn!("Stream 0 channel full; dropping preallocated stream");
                 }

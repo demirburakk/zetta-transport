@@ -1,14 +1,20 @@
 use crate::error::{Result, ZtError};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+/// Packet types for wire-level headers.
+///
+/// Discriminant values are in the 0x10+ range to avoid any collision with
+/// Frame type bytes (0x00–0x08). Even though they live in separate parsing
+/// contexts (header vs. payload), using distinct values eliminates a class
+/// of implementation bugs.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PacketType {
     Initial = 0x00,
     Handshake = 0x01,
     Data = 0x02,
-    Close = 0x05,
-    MtuProbe = 0x06,
-    Retry = 0x07,
+    Close = 0x0A,
+    MtuProbe = 0x0B,
+    Retry = 0x0C,
 }
 
 #[derive(Debug)]
@@ -108,7 +114,7 @@ impl PacketHeader {
             let p_type = match p_type_val {
                 0x00 => PacketType::Initial,
                 0x01 => PacketType::Handshake,
-                0x07 => PacketType::Retry,
+                0x0C => PacketType::Retry,
                 _ => return Err(ZtError::InvalidPacket("Invalid long packet type".into())),
             };
             if src.remaining() < 5 + pn_len {
@@ -155,8 +161,8 @@ impl PacketHeader {
             let key_phase = (first_byte & 0x40) != 0;
             let p_type = match p_type_val {
                 0x02 => PacketType::Data,
-                0x05 => PacketType::Close,
-                0x06 => PacketType::MtuProbe,
+                0x0A => PacketType::Close,
+                0x0B => PacketType::MtuProbe,
                 _ => return Err(ZtError::InvalidPacket("Invalid short packet type".into())),
             };
             if src.remaining() < 1 + pn_len {

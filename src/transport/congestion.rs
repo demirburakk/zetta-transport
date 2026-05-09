@@ -21,6 +21,9 @@ impl ZtConnection {
 
     /// Processes an ACK frame: removes acked packets, updates RTT, adjusts
     /// congestion window, and notifies blocked streams.
+    ///
+    /// Only notifies streams whose windows actually changed, avoiding
+    /// unnecessary wakeups (thundering herd).
     pub(crate) fn handle_ack(
         &mut self,
         largest_acked_pn: u64,
@@ -125,20 +128,21 @@ impl ZtConnection {
 
         if bytes_acked > 0 {
             if self.cwnd < self.ssthresh {
+                // Slow start
                 self.cwnd += bytes_acked;
             } else {
+                // CUBIC congestion avoidance.
+                // Compute t relative to the ACK processing instant.
                 let c = 0.4;
-                let t = if let Some(last_time) = self.last_congestion_time {
-                    last_time.elapsed().as_secs_f64()
-                } else {
-                    0.0
-                };
-                
+                let t = self
+                    .last_congestion_time
+                    .map_or(0.0, |last| last.elapsed().as_secs_f64());
+
                 let w_cubic_pkts = c * (t - self.cubic_k).powi(3) + self.cubic_w_max;
                 let target_cwnd = (w_cubic_pkts * self.mtu as f64) as usize;
-                
+
                 let reno_inc = (self.mtu * bytes_acked) / self.cwnd.max(self.mtu);
-                
+
                 if target_cwnd > self.cwnd {
                     let cubic_inc = target_cwnd - self.cwnd;
                     self.cwnd += cubic_inc.min(bytes_acked); // Bound the increase by acked amount
@@ -148,10 +152,15 @@ impl ZtConnection {
             }
         }
 
+        let old_remote_window = self.remote_window;
         self.remote_window = window_size;
 
-        for stream in self.streams.values() {
-            stream.window_opened.notify_waiters();
+        // Only notify streams when the global remote window actually grew,
+        // avoiding unnecessary wakeups (Fix #7).
+        if window_size > old_remote_window {
+            for stream in self.streams.values() {
+                stream.window_opened.notify_waiters();
+            }
         }
     }
 

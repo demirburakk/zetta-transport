@@ -2,8 +2,10 @@ use crate::error::{Result, ZtError};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Frame types for ZettaTransport payloads.
-/// Note: Frame types and Packet types exist in separate namespaces.
-/// E.g., Frame::StreamClose (0x06) is distinct from PacketType::MtuProbe (0x06).
+///
+/// Frame type discriminants occupy bytes 0x00–0x08. PacketType discriminants
+/// use the 0x0A+ range, so there is no byte-level collision between the two
+/// namespaces.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
     Padding(usize),

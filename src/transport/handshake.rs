@@ -17,6 +17,9 @@ use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
 use x25519_dalek::PublicKey;
 
+/// Current protocol version constant used in transcript binding.
+const PROTOCOL_VERSION: u32 = 1;
+
 /// Server-side handshake processing.
 ///
 /// Handles incoming Initial packets: validates the anti-amplification minimum,
@@ -63,7 +66,7 @@ pub(crate) async fn handle_handshake(
     if !header.is_long || header.p_type != PacketType::Initial {
         return Ok(());
     }
-    if header.version != 1 {
+    if header.version != PROTOCOL_VERSION {
         return Ok(());
     }
 
@@ -146,7 +149,9 @@ pub(crate) async fn handle_handshake(
             .map_err(|_| ZtError::Crypto("Invalid Ed25519 Public Key".into()))?;
         let remote_sig = Signature::from_bytes(&remote_sig_bytes);
 
+        // Client transcript includes protocol version to prevent downgrade attacks.
         let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, &PROTOCOL_VERSION.to_be_bytes());
         sha2::Digest::update(&mut hasher, &header.scid);
         sha2::Digest::update(&mut hasher, &header.dcid);
         sha2::Digest::update(&mut hasher, pk_bytes);
@@ -169,9 +174,11 @@ pub(crate) async fn handle_handshake(
             return Err(ZtError::Unauthorized);
         }
 
+        // Generate an ephemeral keypair. The secret is consumed by
+        // compute_shared_secret and immediately dropped — true PFS.
         let (ephemeral_secret, ephemeral_public) = crate::crypto::keypair::generate_keypair();
         let shared = crate::crypto::keypair::compute_shared_secret(
-            &ephemeral_secret,
+            ephemeral_secret,
             PublicKey::from(pk_bytes),
         );
 
@@ -211,14 +218,20 @@ pub(crate) async fn handle_handshake(
 
         let (actor_tx, actor_rx) = mpsc::channel(1024);
         let (stream_tx, stream_rx) = mpsc::channel(128);
+        let conn_closed = new_conn.closed.clone();
+
+        // Server-side actor does not need the ephemeral secret (already consumed).
+        // We generate a dummy keypair just to satisfy the actor constructor;
+        // the secret will never be used because the server handshake is complete.
+        let (server_actor_secret, server_actor_pk) = crate::crypto::keypair::generate_keypair();
 
         let actor = ZtConnectionActor::new(
             endpoint.clone(),
             endpoint.socket.clone(),
             actor_rx,
             new_conn,
-            ephemeral_public,
-            ephemeral_secret,
+            server_actor_pk,
+            server_actor_secret,
             endpoint.ed_signing_key.clone(),
             endpoint.ed_public_key,
             endpoint.psk,
@@ -252,7 +265,7 @@ pub(crate) async fn handle_handshake(
         tokio::spawn(actor.run());
 
         let conn_handle = ZtConnectionHandle::new(endpoint.clone(), scid.clone(), stream_rx);
-        let stream0 = ZtStream::new(endpoint.clone(), scid.clone(), 0, data_rx, window_opened);
+        let stream0 = ZtStream::new(endpoint.clone(), scid.clone(), 0, data_rx, window_opened, conn_closed);
         if stream_tx.try_send(stream0).is_err() {
             tracing::warn!("Stream 0 channel full; dropping preallocated stream");
         }
@@ -269,7 +282,7 @@ pub(crate) async fn handle_handshake(
         let hs_header = PacketHeader {
             p_type: PacketType::Handshake,
             is_long: true,
-            version: 1,
+            version: PROTOCOL_VERSION,
             dcid: header.scid.clone(),
             scid: scid.clone(),
             packet_number: handshake_pn,
@@ -280,7 +293,9 @@ pub(crate) async fn handle_handshake(
         hs_header.encode(&mut buf);
         let header_len = buf.len();
 
+        // Server transcript includes protocol version to prevent downgrade attacks.
         let mut hasher = sha2::Sha256::new();
+        sha2::Digest::update(&mut hasher, &PROTOCOL_VERSION.to_be_bytes());
         sha2::Digest::update(&mut hasher, &header.scid);
         sha2::Digest::update(&mut hasher, &header.dcid);
         sha2::Digest::update(&mut hasher, pk_bytes);
@@ -337,7 +352,7 @@ fn send_retry(
     let retry_header = PacketHeader {
         p_type: PacketType::Retry,
         is_long: true,
-        version: 1,
+        version: PROTOCOL_VERSION,
         dcid: client_scid.to_vec(),
         scid: Vec::new(),
         packet_number: pn,

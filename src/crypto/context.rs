@@ -7,10 +7,33 @@ use chacha20poly1305::{
 use super::header_protection;
 use super::key_derivation;
 
+/// Fallback RX keys retained from a previous epoch during key rotation.
+struct FallbackRxKeys {
+    rx_key: [u8; 32],
+    rx_hp_key: [u8; 16],
+    rx_iv: [u8; 12],
+    rx_cipher: ChaCha20Poly1305,
+}
+
+impl Drop for FallbackRxKeys {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.rx_key.zeroize();
+        self.rx_hp_key.zeroize();
+        self.rx_iv.zeroize();
+        // Overwrite cipher with zero-key instance to clear key material
+        let zero_key = chacha20poly1305::Key::from([0u8; 32]);
+        self.rx_cipher = ChaCha20Poly1305::new(&zero_key);
+    }
+}
+
 /// Core cryptographic context for a connection.
 ///
 /// Holds the current epoch's keys and ciphers, plus fallback keys for
 /// out-of-order packets during key phase rotations.
+///
+/// Supports two levels of fallback (prev and prev_prev) so that packets
+/// from two epochs ago can still be decrypted during network reordering.
 pub(crate) struct CryptoContext {
     secret: [u8; 32],
     tx_key: [u8; 32],
@@ -24,11 +47,9 @@ pub(crate) struct CryptoContext {
     pub(crate) epoch: u64,
     is_client: bool,
 
-    // Fallback keys for out-of-order packets during key phase rotations.
-    prev_rx_key: Option<[u8; 32]>,
-    prev_rx_hp_key: Option<[u8; 16]>,
-    prev_rx_iv: Option<[u8; 12]>,
-    prev_rx_cipher: Option<ChaCha20Poly1305>,
+    // Two levels of fallback keys for out-of-order packets during key phase rotations.
+    prev_rx: Option<FallbackRxKeys>,
+    prev_prev_rx: Option<FallbackRxKeys>,
 }
 
 impl Drop for CryptoContext {
@@ -41,23 +62,12 @@ impl Drop for CryptoContext {
         self.rx_hp_key.zeroize();
         self.tx_iv.zeroize();
         self.rx_iv.zeroize();
-        if let Some(ref mut k) = self.prev_rx_key {
-            k.zeroize();
-        }
-        if let Some(ref mut k) = self.prev_rx_hp_key {
-            k.zeroize();
-        }
-        if let Some(ref mut k) = self.prev_rx_iv {
-            k.zeroize();
-        }
         
         // Overwrite ciphers with zero-key instances to clear key material
         let zero_key = chacha20poly1305::Key::from([0u8; 32]);
         self.tx_cipher = ChaCha20Poly1305::new(&zero_key);
         self.rx_cipher = ChaCha20Poly1305::new(&zero_key);
-        if let Some(ref mut prev_cipher) = self.prev_rx_cipher {
-            *prev_cipher = ChaCha20Poly1305::new(&zero_key);
-        }
+        // FallbackRxKeys have their own Drop impl
     }
 }
 
@@ -108,10 +118,8 @@ impl CryptoContext {
             rx_cipher: ChaCha20Poly1305::new([0u8; 32].as_slice().into()),
             epoch: 0,
             is_client,
-            prev_rx_key: None,
-            prev_rx_hp_key: None,
-            prev_rx_iv: None,
-            prev_rx_cipher: None,
+            prev_rx: None,
+            prev_prev_rx: None,
         }
     }
 
@@ -129,13 +137,22 @@ impl CryptoContext {
         self.rx_cipher = keys.rx_cipher;
     }
 
-    /// Rotates keys forward: saves current RX keys as fallback, ratchets
-    /// the secret, and derives new epoch keys.
+    /// Rotates keys forward: pushes current prev to prev_prev, saves current
+    /// RX keys as prev, ratchets the secret, and derives new epoch keys.
+    ///
+    /// Two levels of fallback are retained so that packets from up to two
+    /// epochs ago can still be decrypted during network reordering.
     pub(crate) fn rotate_keys(&mut self) {
-        self.prev_rx_key = Some(self.rx_key);
-        self.prev_rx_hp_key = Some(self.rx_hp_key);
-        self.prev_rx_iv = Some(self.rx_iv);
-        self.prev_rx_cipher = Some(self.rx_cipher.clone());
+        // Shift prev → prev_prev (old prev_prev gets dropped and zeroized)
+        self.prev_prev_rx = self.prev_rx.take();
+
+        // Save current RX keys as new prev
+        self.prev_rx = Some(FallbackRxKeys {
+            rx_key: self.rx_key,
+            rx_hp_key: self.rx_hp_key,
+            rx_iv: self.rx_iv,
+            rx_cipher: self.rx_cipher.clone(),
+        });
 
         self.secret = key_derivation::ratchet_secret(&mut self.secret);
         self.apply_epoch_keys(self.epoch + 1);
@@ -160,6 +177,9 @@ impl CryptoContext {
     }
 
     /// Decrypts payload in-place, verifying the AEAD tag.
+    ///
+    /// When `use_prev_key` is true, tries the most recent fallback first,
+    /// then falls back to the older set if available.
     pub(crate) fn decrypt_in_place(
         &self,
         packet_number: u64,
@@ -171,15 +191,35 @@ impl CryptoContext {
         let nonce = self.generate_nonce(packet_number, false, use_prev_key);
         let chacha_tag = chacha20poly1305::Tag::from_slice(tag);
 
-        let cipher = if use_prev_key {
-            self.prev_rx_cipher
-                .as_ref()
-                .ok_or_else(|| ZtError::Crypto("No previous RX cipher available".into()))?
-        } else {
-            &self.rx_cipher
-        };
+        if use_prev_key {
+            // Try prev first, then prev_prev
+            if let Some(ref prev) = self.prev_rx {
+                let prev_nonce = self.make_nonce_from_iv(&prev.rx_iv, packet_number);
+                let mut attempt = payload.to_vec();
+                if prev.rx_cipher
+                    .decrypt_in_place_detached(&prev_nonce, aad, &mut attempt, chacha_tag)
+                    .is_ok()
+                {
+                    payload.copy_from_slice(&attempt);
+                    return Ok(());
+                }
+            }
+            // Try prev_prev
+            if let Some(ref prev_prev) = self.prev_prev_rx {
+                let pp_nonce = self.make_nonce_from_iv(&prev_prev.rx_iv, packet_number);
+                let mut attempt = payload.to_vec();
+                if prev_prev.rx_cipher
+                    .decrypt_in_place_detached(&pp_nonce, aad, &mut attempt, chacha_tag)
+                    .is_ok()
+                {
+                    payload.copy_from_slice(&attempt);
+                    return Ok(());
+                }
+            }
+            return Err(ZtError::Crypto("No previous RX cipher could decrypt".into()));
+        }
 
-        cipher
+        self.rx_cipher
             .decrypt_in_place_detached(&nonce, aad, payload, chacha_tag)
             .map_err(|e| ZtError::Crypto(format!("Decryption failed: {}", e)))
     }
@@ -201,9 +241,14 @@ impl CryptoContext {
         use_prev_key: bool,
     ) -> Result<()> {
         let hp_key = if use_prev_key {
-            self.prev_rx_hp_key
-                .as_ref()
-                .ok_or_else(|| ZtError::Crypto("No previous RX HP key available".into()))?
+            // Try prev first
+            if let Some(ref prev) = self.prev_rx {
+                &prev.rx_hp_key
+            } else if let Some(ref prev_prev) = self.prev_prev_rx {
+                &prev_prev.rx_hp_key
+            } else {
+                return Err(ZtError::Crypto("No previous RX HP key available".into()));
+            }
         } else {
             &self.rx_hp_key
         };
@@ -216,11 +261,17 @@ impl CryptoContext {
         let iv = if is_tx {
             &self.tx_iv
         } else if use_prev_key {
-            self.prev_rx_iv.as_ref().unwrap_or(&self.rx_iv)
+            // Default to prev, fallback to current
+            self.prev_rx.as_ref().map_or(&self.rx_iv, |p| &p.rx_iv)
         } else {
             &self.rx_iv
         };
 
+        self.make_nonce_from_iv(iv, packet_number)
+    }
+
+    /// Constructs a nonce from an arbitrary IV and packet number.
+    fn make_nonce_from_iv(&self, iv: &[u8; 12], packet_number: u64) -> Nonce {
         let mut nonce_bytes = [0u8; 12];
         let pn_bytes = packet_number.to_be_bytes();
 
@@ -240,8 +291,8 @@ mod tests {
     fn make_context_pair() -> (CryptoContext, CryptoContext) {
         let (secret, public) = crate::crypto::keypair::generate_keypair();
         let (server_secret, server_public) = crate::crypto::keypair::generate_keypair();
-        let client_shared = crate::crypto::keypair::compute_shared_secret(&secret, server_public);
-        let server_shared = crate::crypto::keypair::compute_shared_secret(&server_secret, public);
+        let client_shared = crate::crypto::keypair::compute_shared_secret(secret, server_public);
+        let server_shared = crate::crypto::keypair::compute_shared_secret(server_secret, public);
 
         let client_scid = b"client01";
         let server_scid = b"server01";
@@ -311,6 +362,20 @@ mod tests {
 
         server.rotate_keys();
 
+        server.decrypt_in_place(0, aad, &mut payload, &tag, true).unwrap();
+    }
+
+    #[test]
+    fn two_epoch_fallback_works() {
+        let (client, mut server) = make_context_pair();
+        let aad = b"aad";
+        let mut payload = b"two epochs ago".to_vec();
+        let tag = client.encrypt_in_place(0, aad, &mut payload).unwrap();
+
+        server.rotate_keys(); // epoch 0 -> prev
+        server.rotate_keys(); // prev -> prev_prev, epoch 1 -> prev
+
+        // Should still decrypt using prev_prev
         server.decrypt_in_place(0, aad, &mut payload, &tag, true).unwrap();
     }
 

@@ -1,4 +1,5 @@
 use bytes::{Bytes, BytesMut};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Notify, mpsc};
@@ -13,12 +14,16 @@ pub(crate) enum ConnectionState {
 }
 
 /// A pre-allocated circular buffer for receiving out-of-order stream data.
+///
+/// Uses a `BTreeMap` for tracking received ranges instead of a sorted Vec,
+/// providing O(log n) insertion and merge operations instead of O(n²).
 pub(crate) struct StreamReceiveBuffer {
     buffer: Vec<u8>,
     pub(crate) read_head: u64,
     pub(crate) write_head: u64,
-    /// List of received ranges (start, end)
-    pub(crate) received_ranges: Vec<std::ops::Range<u64>>,
+    /// Received ranges keyed by start offset. Value is the end offset (exclusive).
+    /// BTreeMap ensures O(log n) lookups and ordered iteration.
+    received_ranges: BTreeMap<u64, u64>,
 }
 
 impl StreamReceiveBuffer {
@@ -27,7 +32,7 @@ impl StreamReceiveBuffer {
             buffer: vec![0; capacity],
             read_head: 0,
             write_head: 0,
-            received_ranges: Vec::new(),
+            received_ranges: BTreeMap::new(),
         }
     }
 
@@ -52,49 +57,64 @@ impl StreamReceiveBuffer {
             self.buffer[pos as usize] = b;
         }
 
-        let added = self.add_range(offset..end_offset);
+        let added = self.add_range(offset, end_offset);
         Some(added)
     }
 
-    fn add_range(&mut self, mut new_range: std::ops::Range<u64>) -> usize {
-        let original_start = new_range.start;
-        let original_end = new_range.end;
+    /// Inserts a range [start, end) into the BTreeMap and merges overlapping/adjacent ranges.
+    /// Returns the number of new (non-overlapping) bytes added.
+    fn add_range(&mut self, start: u64, end: u64) -> usize {
+        let original_len = end - start;
+        let mut merged_start = start;
+        let mut merged_end = end;
         let mut overlap = 0u64;
-        let mut i = 0;
-        while i < self.received_ranges.len() {
-            let r = &self.received_ranges[i];
-            if new_range.start <= r.end && r.start <= new_range.end {
-                let overlap_start = original_start.max(r.start);
-                let overlap_end = original_end.min(r.end);
+
+        // Collect all ranges that overlap or are adjacent to [start, end).
+        // A range (rs, re) overlaps if rs <= end && re >= start.
+        let mut to_remove = Vec::new();
+
+        // Check ranges starting at or before `end` that might overlap.
+        // BTreeMap::range gives us efficient access.
+        for (&rs, &re) in self.received_ranges.range(..=end) {
+            if re >= start {
+                // This range overlaps or is adjacent
+                let overlap_start = start.max(rs);
+                let overlap_end = end.min(re);
                 if overlap_end > overlap_start {
                     overlap += overlap_end - overlap_start;
                 }
-                // Merge
-                new_range.start = std::cmp::min(new_range.start, r.start);
-                new_range.end = std::cmp::max(new_range.end, r.end);
-                self.received_ranges.remove(i);
-            } else {
-                i += 1;
+                merged_start = merged_start.min(rs);
+                merged_end = merged_end.max(re);
+                to_remove.push(rs);
             }
         }
-        self.received_ranges.push(new_range);
-        self.received_ranges.sort_by_key(|r| r.start);
-        let new_len = original_end.saturating_sub(original_start);
-        new_len.saturating_sub(overlap) as usize
+
+        // Also check if there's a range starting just after `end` that's adjacent
+        if let Some((&rs, &re)) = self.received_ranges.range(end..).next() {
+            if rs <= merged_end {
+                merged_end = merged_end.max(re);
+                to_remove.push(rs);
+            }
+        }
+
+        for key in to_remove {
+            self.received_ranges.remove(&key);
+        }
+
+        self.received_ranges.insert(merged_start, merged_end);
+        original_len.saturating_sub(overlap) as usize
     }
 
     pub(crate) fn read_contiguous(&mut self) -> Option<Bytes> {
-        if self.received_ranges.is_empty() {
-            return None;
-        }
-        
-        if self.received_ranges[0].start <= self.read_head && self.received_ranges[0].end > self.read_head {
-            let end = self.received_ranges[0].end;
-            let len = (end - self.read_head) as usize;
-            
+        // Check if the first range covers read_head
+        let (&first_start, &first_end) = self.received_ranges.iter().next()?;
+
+        if first_start <= self.read_head && first_end > self.read_head {
+            let len = (first_end - self.read_head) as usize;
+
             let mut out = BytesMut::with_capacity(len);
             let cap = self.buffer.len() as u64;
-            
+
             let start_idx = (self.read_head % cap) as usize;
             let end_idx = ((self.read_head + len as u64) % cap) as usize;
 
@@ -104,20 +124,31 @@ impl StreamReceiveBuffer {
                 out.extend_from_slice(&self.buffer[start_idx..]);
                 out.extend_from_slice(&self.buffer[..end_idx]);
             }
-            
-            self.read_head = end;
-            
+
+            self.read_head = first_end;
+
             // Clean up old ranges
-            self.received_ranges.retain(|r| r.end > self.read_head);
-            if !self.received_ranges.is_empty() && self.received_ranges[0].start < self.read_head {
-                 self.received_ranges[0].start = self.read_head;
+            let stale_keys: Vec<u64> = self
+                .received_ranges
+                .range(..=self.read_head)
+                .filter(|&(_, &end)| end <= self.read_head)
+                .map(|(&k, _)| k)
+                .collect();
+            for key in stale_keys {
+                self.received_ranges.remove(&key);
             }
-            
+            // Trim the first remaining range if it starts before read_head
+            if let Some((&rs, &re)) = self.received_ranges.iter().next() {
+                if rs < self.read_head && re > self.read_head {
+                    self.received_ranges.remove(&rs);
+                    self.received_ranges.insert(self.read_head, re);
+                }
+            }
+
             return Some(out.freeze());
         }
         None
     }
-
 }
 
 /// Per-stream receive/transmit state.

@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
-use x25519_dalek::{PublicKey, StaticSecret};
+use x25519_dalek::{EphemeralSecret, PublicKey};
 
 /// Messages exchanged between the endpoint API layer and the per-connection actor.
 pub(crate) enum ActorMessage {
@@ -47,7 +47,9 @@ pub(crate) struct ZtConnectionActor {
     pub(super) state: ZtConnection,
     pub(super) pending_acks: u32,
     pub(super) public_key: PublicKey,
-    pub(super) static_secret: StaticSecret,
+    /// Ephemeral secret is consumed after DH exchange. Stored as Option
+    /// so it can be taken (moved) exactly once, then dropped.
+    pub(super) ephemeral_secret: Option<EphemeralSecret>,
     pub(super) ed_signing_key: SigningKey,
     pub(super) ed_public_key: VerifyingKey,
     pub(super) psk: Option<[u8; 32]>,
@@ -68,7 +70,7 @@ impl ZtConnectionActor {
         receiver: mpsc::Receiver<ActorMessage>,
         state: ZtConnection,
         public_key: PublicKey,
-        static_secret: StaticSecret,
+        ephemeral_secret: EphemeralSecret,
         ed_signing_key: SigningKey,
         ed_public_key: VerifyingKey,
         psk: Option<[u8; 32]>,
@@ -88,7 +90,7 @@ impl ZtConnectionActor {
             state,
             pending_acks: 0,
             public_key,
-            static_secret,
+            ephemeral_secret: Some(ephemeral_secret),
             ed_signing_key,
             ed_public_key,
             psk,
