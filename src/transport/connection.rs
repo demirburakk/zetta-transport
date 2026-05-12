@@ -39,8 +39,6 @@ pub(crate) struct ZtConnection {
     pub(crate) cubic_k: f64,
     pub(crate) last_congestion_time: Option<std::time::Instant>,
     pub(crate) last_cubic_update: Option<std::time::Instant>,
-    /// Start of the current CUBIC congestion-avoidance epoch.
-    /// Reset on each loss event; `t` in W_cubic is measured from here.
     pub(crate) cubic_epoch_start: Option<std::time::Instant>,
     pub(crate) target_cwnd: usize,
     pub(crate) pacing_tokens: f64,
@@ -60,6 +58,7 @@ pub(crate) struct ZtConnection {
     pub(crate) current_key_epoch: u64,
     pub(crate) packets_since_key_update: u64,
     pub(crate) cookie: Option<bytes::Bytes>,
+    pub(crate) handshake_packet: Option<bytes::Bytes>,
     /// Shared closed flag for all streams. Set to true when the connection
     /// is closing/closed to unblock pending ZtStream::send() calls.
     pub(crate) closed: Arc<AtomicBool>,
@@ -115,6 +114,7 @@ impl ZtConnection {
             current_key_epoch: 0,
             packets_since_key_update: 0,
             cookie: None,
+            handshake_packet: None,
             closed: Arc::new(AtomicBool::new(false)),
         }
     }

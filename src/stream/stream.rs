@@ -63,7 +63,7 @@ impl ZtStream {
                         // received), the congestion window grows, or the
                         // connection is closed.
                         if tokio::time::timeout(
-                            std::time::Duration::from_secs(15),
+                            std::time::Duration::from_secs(60),
                             self.window_opened.notified(),
                         )
                         .await

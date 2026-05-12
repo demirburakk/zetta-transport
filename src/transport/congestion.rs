@@ -61,30 +61,6 @@ impl ZtConnection {
             }
         }
 
-        // 2. Process cumulative ACK (everything <= largest_acked_pn)
-        let acked_pns: Vec<u64> = self
-            .unacked_packets
-            .keys()
-            .take_while(|&pn| pn <= largest_acked_pn)
-            .collect();
-
-        for pn in acked_pns {
-            if let Some(up) = self.unacked_packets.remove(pn) {
-                bytes_acked += up.payload.len();
-                bytes_in_flight_acked += up.sent_bytes;
-                if sample_rtt.is_none() && up.retries == 0 {
-                    sample_rtt = Some(up.sent_at.elapsed());
-                }
-                if up.is_mtu_probe
-                    && self.mtu_probes.remove(&pn).is_some()
-                    && up.payload.len() > self.mtu
-                {
-                    self.mtu = up.payload.len();
-                    tracing::info!("MTU upgraded to {} via PMTUD", self.mtu);
-                }
-            }
-        }
-
         // 3. Fast Retransmit Detection (SACK-based gap detection)
         // Any unacked packet that is strictly less than largest_acked_pn - 3
         // is considered lost and must be retransmitted immediately.

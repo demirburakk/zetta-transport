@@ -36,7 +36,11 @@ impl ZtConnectionActor {
             && let Some(dcid) = crate::protocol::routing::extract_dcid_fast(&mutable_data)
         {
             let is_retry = ((mutable_data[0] >> 2) & 0x0F) == 0x0C;
-            if !is_retry {
+            let is_initial = ((mutable_data[0] >> 2) & 0x0F) == 0;
+            if !is_retry && !is_initial {
+                let crypto = crate::crypto::CryptoContext::initial(&dcid, true);
+                crypto.remove_header_protection(&mut mutable_data, offset, false)?;
+            } else if is_initial {
                 let crypto = crate::crypto::CryptoContext::initial(&dcid, true);
                 crypto.remove_header_protection(&mut mutable_data, offset, false)?;
             }
@@ -49,6 +53,13 @@ impl ZtConnectionActor {
 
         let mut payload_buf = mutable_data.split_off(header_len);
         let aad = mutable_data.freeze();
+
+        if header.p_type == PacketType::Initial && self.state.state == ConnectionState::Active && !self.is_client {
+            if let Some(hs) = self.state.handshake_packet.clone() {
+                let _ = self.sendmsg_vectored(&[std::io::IoSlice::new(&hs)]);
+            }
+            return Ok(());
+        }
 
         let highest = self.state.replay_window.highest_processed.unwrap_or(0);
         header.packet_number =
@@ -221,30 +232,11 @@ impl ZtConnectionActor {
                 }
 
                 let mut forwarded = false;
-                loop {
-                    if let Some(chunk) = stream.receive_buffer.read_contiguous() {
-                        let chunk_len = chunk.len();
-                        let chunk_offset = stream.receive_buffer.read_head - chunk_len as u64;
-                        stream.buffered_bytes =
-                            stream.buffered_bytes.saturating_sub(chunk_len);
-                        match stream.app_tx.try_send(chunk.clone()) {
-                            Ok(()) => {
-                                forwarded = true;
-                            }
-                            Err(_) => {
-                                // Application channel is full. Put the chunk back into
-                                // the receive buffer at the correct offset so it is
-                                // not lost and can be forwarded on the next attempt.
-                                stream.receive_buffer.unread(chunk_offset, &chunk);
-                                stream.buffered_bytes =
-                                    stream.buffered_bytes.saturating_add(chunk_len);
-                                tracing::debug!(
-                                    "Stream {} app channel full, deferring {} bytes",
-                                    id, chunk_len
-                                );
-                                break;
-                            }
-                        }
+                while let Some(chunk) = stream.receive_buffer.read_contiguous() {
+                    stream.buffered_bytes =
+                        stream.buffered_bytes.saturating_sub(chunk.len());
+                    if stream.app_tx.try_send(chunk).is_ok() {
+                        forwarded = true;
                     } else {
                         break;
                     }
@@ -271,7 +263,7 @@ impl ZtConnectionActor {
                 window_size,
                 ack_ranges,
             } => {
-                let mut fast_retransmits = Vec::new();
+                let mut fast_retransmits: Vec<(UnackedPayload, u32)> = Vec::new();
                 self.state.handle_ack(
                     largest_acked,
                     window_size,

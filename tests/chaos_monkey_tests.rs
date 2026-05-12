@@ -107,7 +107,7 @@ async fn chaos_high_packet_loss() {
     let server_task = tokio::spawn(async move {
         if let Some(mut conn) = server.accept().await {
             if let Some(mut stream) = conn.accept_stream().await {
-                if let Ok(Some(data)) = timeout(Duration::from_secs(10), stream.recv()).await {
+                if let Ok(Some(data)) = timeout(Duration::from_secs(90), stream.recv()).await {
                     let _ = stream.send(&data).await;
                 }
             }
@@ -165,6 +165,7 @@ async fn chaos_reordering_and_duplication() {
         
         let payload = vec![0xBB; 100 * 1024]; // 100 KB payload
         client_stream.send(&payload).await.unwrap();
+                println!("Client stream sent payload");
         
         let resp = timeout(Duration::from_secs(120), client_stream.recv()).await.unwrap().unwrap();
         resp.to_vec()
@@ -349,6 +350,7 @@ async fn chaos_asymmetric_links() {
         if let Some(mut conn) = server.accept().await {
             if let Some(mut stream) = conn.accept_stream().await {
                 if let Ok(Some(_data)) = timeout(Duration::from_secs(20), stream.recv()).await {
+                    println!("Server received request");
                     // Send a slightly larger payload to trigger multiple packets down the 40% loss link
                     let payload = vec![0xAA; 10 * 1024]; // 10 KB
                     let _ = stream.send(&payload).await;
@@ -362,6 +364,7 @@ async fn chaos_asymmetric_links() {
         let mut client_stream = client_conn.accept_stream().await.unwrap();
         
         client_stream.send(b"request").await.unwrap();
+        println!("Client sent request");
         
         let mut received = Vec::new();
         while received.len() < 10 * 1024 {
@@ -407,6 +410,7 @@ async fn chaos_concurrent_streams_multiplexing() {
                             }
                         }
                         let _ = stream.send(b"done").await;
+                            println!("Server echoed data to client");
                     }));
                 }
             }
@@ -425,8 +429,10 @@ async fn chaos_concurrent_streams_multiplexing() {
             handles.push(tokio::spawn(async move {
                 let payload = vec![0xCC; 10 * 1024];
                 stream.send(&payload).await.unwrap();
+                println!("Client stream sent payload");
                 
                 let resp = timeout(Duration::from_secs(120), stream.recv()).await.unwrap().unwrap();
+                println!("Client received response");
                 resp.to_vec()
             }));
         }

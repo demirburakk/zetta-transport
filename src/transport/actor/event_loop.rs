@@ -35,19 +35,11 @@ impl ZtConnectionActor {
             tracing::warn!("Failed to send initial packet: {:?}", e);
         }
 
-        if let Some(wait) = self.flush_pacing_queue() {
-            pacing_deadline = TokioInstant::now() + wait;
-            pacing_timer.as_mut().reset(pacing_deadline);
-        } else {
-            pacing_deadline = TokioInstant::now() + SLEEP_FOREVER;
-            pacing_timer.as_mut().reset(pacing_deadline);
-        }
-
         loop {
             if self.state.state == ConnectionState::Closed {
                 let zombie_duration = self.state.rtt * 3;
                 let _ = tokio::time::timeout(zombie_duration, async {
-                    while let Some(_) = self.receiver.recv().await {
+                    while self.receiver.recv().await.is_some() {
                         // In zombie state, just drain and drop messages
                     }
                 }).await;
@@ -118,6 +110,9 @@ impl ZtConnectionActor {
                             );
                             let _ = respond_to.send(Ok(stream));
                         }
+                        ActorMessage::SetHandshakePacket(hs) => {
+                            self.state.handshake_packet = Some(hs);
+                        }
                         ActorMessage::Close => {
                             let _ = self.initiate_close();
                             idle_deadline = TokioInstant::now() + Duration::from_secs(5);
@@ -134,6 +129,13 @@ impl ZtConnectionActor {
 
                 _ = &mut rto_timer => {
                     if self.handle_retransmits().is_err() { break; }
+                    
+                    if self.state.state == ConnectionState::Handshaking {
+                        if let Some(hs) = self.state.handshake_packet.clone() {
+                            let _ = self.sendmsg_vectored(&[std::io::IoSlice::new(&hs)]);
+                        }
+                    }
+
                     let rto = self.state.rtt + self.state.rttvar * 4;
                     rto_deadline = TokioInstant::now() + rto.max(Duration::from_millis(50));
                     rto_timer.as_mut().reset(rto_deadline);
@@ -143,11 +145,7 @@ impl ZtConnectionActor {
                     if let Err(e) = self.send_mtu_probe() {
                         tracing::debug!("Failed to send MTU probe: {}", e);
                     }
-                    // RTT-adaptive probe interval: max(5s, 10 * smoothed_rtt).
-                    // Avoids wasting bandwidth on slow links while still probing
-                    // quickly on fast ones.
-                    let probe_interval = (self.state.rtt * 10).max(Duration::from_secs(5));
-                    mtu_probe_deadline = TokioInstant::now() + probe_interval;
+                    mtu_probe_deadline = TokioInstant::now() + Duration::from_secs(15);
                     mtu_probe_timer.as_mut().reset(mtu_probe_deadline);
                 }
 

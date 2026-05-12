@@ -62,7 +62,7 @@ impl ZtConnectionActor {
         
         // Build transcript hash including protocol version to prevent downgrade attacks.
         let mut hasher = sha2::Sha256::new();
-        sha2::Digest::update(&mut hasher, &PROTOCOL_VERSION.to_be_bytes());
+        sha2::Digest::update(&mut hasher, PROTOCOL_VERSION.to_be_bytes());
         sha2::Digest::update(&mut hasher, &self.state.scid);
         sha2::Digest::update(&mut hasher, &old_scid);
         sha2::Digest::update(&mut hasher, self.public_key.as_bytes());
