@@ -1,6 +1,14 @@
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use std::net::SocketAddr;
+use std::time::Instant;
+use std::sync::OnceLock;
+
+/// Returns a monotonic time in milliseconds since the process started.
+pub(crate) fn current_time_millis() -> u64 {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -30,15 +38,15 @@ pub(crate) fn make_retry_cookie(
     cookie
 }
 
-/// Maximum age in seconds for a retry cookie to remain valid.
+/// Maximum age in milliseconds for a retry cookie to remain valid.
 ///
-/// A tight window (5s) limits replay attack surface while comfortably
+/// A tight window (5000ms) limits replay attack surface while comfortably
 /// covering even high-latency network round-trips.
-const COOKIE_MAX_AGE_SECS: u64 = 5;
+const COOKIE_MAX_AGE_MS: u64 = 5000;
 
 /// Verifies a retry cookie against the client's address and SCID.
 ///
-/// Returns false if the cookie is expired (>5s) or the HMAC doesn't match.
+/// Returns false if the cookie is expired (>5000ms) or the HMAC doesn't match.
 pub(crate) fn verify_retry_cookie(
     cookie_key: &[u8; 32],
     addr: &SocketAddr,
@@ -53,7 +61,7 @@ pub(crate) fn verify_retry_cookie(
     time_bytes.copy_from_slice(&cookie[0..8]);
     let cookie_time = u64::from_be_bytes(time_bytes);
 
-    if now < cookie_time || now - cookie_time > COOKIE_MAX_AGE_SECS {
+    if now < cookie_time || now - cookie_time > COOKIE_MAX_AGE_MS {
         return false;
     }
 
@@ -87,7 +95,7 @@ mod tests {
         let addr = make_addr();
         let scid = b"client_scid";
         let cookie = make_retry_cookie(&key, &addr, scid, 1000);
-        assert!(!verify_retry_cookie(&key, &addr, scid, &cookie, 1006));
+        assert!(!verify_retry_cookie(&key, &addr, scid, &cookie, 6001));
     }
 
     #[test]
@@ -122,7 +130,7 @@ mod tests {
         let addr = make_addr();
         let scid = b"s";
         let cookie = make_retry_cookie(&key, &addr, scid, 1000);
-        assert!(verify_retry_cookie(&key, &addr, scid, &cookie, 1005));
-        assert!(!verify_retry_cookie(&key, &addr, scid, &cookie, 1006));
+        assert!(verify_retry_cookie(&key, &addr, scid, &cookie, 6000));
+        assert!(!verify_retry_cookie(&key, &addr, scid, &cookie, 6001));
     }
 }

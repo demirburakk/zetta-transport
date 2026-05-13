@@ -158,11 +158,19 @@ impl ZtConnection {
 
     /// Adjusts congestion window after packet loss detection.
     pub(crate) fn handle_loss(&mut self) {
+        let now = std::time::Instant::now();
+        if let Some(last_loss) = self.last_congestion_time {
+            if now.duration_since(last_loss) < self.rtt {
+                return; // Reduce cwnd at most once per RTT
+            }
+        }
+        self.last_congestion_time = Some(now);
+
         let beta = 0.7;
-        let c = 0.4;
-        
+        let _c = 0.4;
+
         let current_cwnd_pkts = self.cwnd as f64 / self.mtu as f64;
-        
+
         // Fast convergence
         if current_cwnd_pkts < self.cubic_w_max {
             self.cubic_w_max = current_cwnd_pkts * (1.0 + beta) / 2.0;
@@ -172,10 +180,8 @@ impl ZtConnection {
 
         self.ssthresh = ((self.cwnd as f64 * beta) as usize).max(self.mtu * 2);
         self.cwnd = self.ssthresh;
-        
-        self.cubic_k = (self.cubic_w_max * (1.0 - beta) / c).cbrt();
-        self.last_congestion_time = Some(std::time::Instant::now());
-        // Reset the CUBIC epoch so t starts fresh after recovery.
+
+        self.cubic_k = 0.0;
         self.cubic_epoch_start = None;
         self.last_cubic_update = None;
     }

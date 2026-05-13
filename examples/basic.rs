@@ -30,10 +30,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = ZtEndpoint::bind("127.0.0.1:0", None).await?;
     let target: SocketAddr = server_addr.parse()?;
 
-    let mut conn = client.connect(target).await?;
+    let conn = client.connect(target).await?;
     println!("Connecting to server...");
 
-    let mut stream = conn.accept_stream().await.expect("Stream 0 not received");
+    let mut stream = conn.open_stream().await.expect("Failed to open stream");
 
     stream.send(b"Hello ZettaTransport!").await?;
 

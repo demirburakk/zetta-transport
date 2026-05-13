@@ -187,7 +187,12 @@ impl ZtConnectionActor {
                         window_opened,
                         self.state.closed.clone(),
                     );
-                    let _ = self.incoming_streams_tx.try_send(stream);
+                    if let Err(e) = self.incoming_streams_tx.try_send(stream) {
+                        tracing::error!("Failed to deliver incoming stream: {}. Closing connection.", e);
+                        self.state.streams.remove(&id);
+                        let _ = self.initiate_close();
+                        return Err(ZtError::Io(std::io::Error::other("Application dropped connection handle")));
+                    }
                 }
 
                 let Some(stream) = self.state.streams.get_mut(&id) else {

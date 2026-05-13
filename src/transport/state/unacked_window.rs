@@ -94,3 +94,68 @@ impl UnackedWindow {
         self.iter().map(|(pn, _)| pn)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::UnackedWindow;
+    use crate::transport::state::{UnackedPacket, UnackedPayload};
+    use bytes::Bytes;
+    use std::time::Instant;
+
+    fn make_packet() -> UnackedPacket {
+        UnackedPacket {
+            payload: UnackedPayload::Stream {
+                stream_id: 0,
+                offset: 0,
+                data: Bytes::from_static(b"x"),
+            },
+            sent_at: Instant::now(),
+            retries: 0,
+            is_mtu_probe: false,
+            sent_bytes: 1,
+        }
+    }
+
+    #[test]
+    fn insert_remove_shifts_base_forward() {
+        let mut w = UnackedWindow::new();
+        w.insert(10, make_packet());
+        w.insert(11, make_packet());
+        w.insert(12, make_packet());
+
+        assert!(w.remove(10).is_some());
+        let keys: Vec<u64> = w.keys().collect();
+        assert_eq!(keys, vec![11, 12]);
+    }
+
+    #[test]
+    fn insert_with_gap_preserves_keys() {
+        let mut w = UnackedWindow::new();
+        w.insert(5, make_packet());
+        w.insert(7, make_packet());
+
+        let keys: Vec<u64> = w.keys().collect();
+        assert_eq!(keys, vec![5, 7]);
+
+        assert!(w.remove(5).is_some());
+        let keys: Vec<u64> = w.keys().collect();
+        assert_eq!(keys, vec![7]);
+    }
+
+    #[test]
+    fn remove_missing_keeps_len() {
+        let mut w = UnackedWindow::new();
+        w.insert(1, make_packet());
+
+        assert!(w.remove(0).is_none());
+        assert_eq!(w.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_insert_does_not_grow_len() {
+        let mut w = UnackedWindow::new();
+        w.insert(3, make_packet());
+        w.insert(3, make_packet());
+        assert_eq!(w.len(), 1);
+    }
+}

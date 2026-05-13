@@ -93,3 +93,13 @@ impl ZtStream {
         self.endpoint.close_stream(&self.cid, self.stream_id).await
     }
 }
+
+impl Drop for ZtStream {
+    fn drop(&mut self) {
+        if let Some(tx) = self.endpoint.routing_table.get(&self.cid) {
+            let _ = tx.try_send(crate::transport::actor::ActorMessage::CloseStream {
+                stream_id: self.stream_id,
+            });
+        }
+    }
+}

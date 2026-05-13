@@ -10,7 +10,7 @@ use super::key_derivation;
 /// Fallback RX keys retained from a previous epoch during key rotation.
 struct FallbackRxKeys {
     rx_key: [u8; 32],
-    rx_hp_key: [u8; 16],
+    rx_hp_key: [u8; 32],
     rx_iv: [u8; 12],
     rx_cipher: ChaCha20Poly1305,
 }
@@ -41,8 +41,8 @@ pub(crate) struct CryptoContext {
     secret: [u8; 32],
     tx_key: [u8; 32],
     rx_key: [u8; 32],
-    tx_hp_key: [u8; 16],
-    rx_hp_key: [u8; 16],
+    tx_hp_key: [u8; 32],
+    rx_hp_key: [u8; 32],
     tx_iv: [u8; 12],
     rx_iv: [u8; 12],
     tx_cipher: ChaCha20Poly1305,
@@ -112,8 +112,8 @@ impl CryptoContext {
             secret,
             tx_key: [0u8; 32],
             rx_key: [0u8; 32],
-            tx_hp_key: [0u8; 16],
-            rx_hp_key: [0u8; 16],
+            tx_hp_key: [0u8; 32],
+            rx_hp_key: [0u8; 32],
             tx_iv: [0u8; 12],
             rx_iv: [0u8; 12],
             tx_cipher: ChaCha20Poly1305::new([0u8; 32].as_slice().into()),

@@ -109,15 +109,14 @@ impl ZtConnectionActor {
         if self.state.state != ConnectionState::Active {
             return Ok(());
         }
-        let probe_sizes = [1200, 1350, 1400, 1450, 1500];
-        let target_size = probe_sizes
-            .iter()
-            .copied()
-            .find(|&s| s > self.state.mtu)
-            .unwrap_or(self.state.mtu + 50);
-        if target_size > 1500 {
-            return Ok(());
+        
+        // Binary search based PMTUD
+        if self.state.mtu_max <= self.state.mtu_min + 10 {
+            return Ok(()); // Converged
         }
+        
+        let target_size = self.state.mtu_min + (self.state.mtu_max - self.state.mtu_min) / 2;
+        
         let pn = self.state.get_next_packet_number()?;
         let key_phase = self.current_key_phase();
         let total_buffered = self.state.get_total_buffered_bytes();
@@ -338,11 +337,10 @@ impl ZtConnectionActor {
         }
 
         if !payloads_to_resend.is_empty() {
-            println!("RTO Retransmitting {} packets", payloads_to_resend.len());
+            tracing::debug!("RTO Retransmitting {} packets", payloads_to_resend.len());
             self.state.handle_loss();
             for (payload, retries) in payloads_to_resend {
                 if let Err(e) = self.retransmit_payload(payload, retries) {
-                    println!("Failed to retransmit: {}", e);
                     tracing::warn!("Failed to retransmit: {}", e);
                 }
             }
@@ -490,7 +488,7 @@ impl ZtConnectionActor {
             public_key: *self.public_key.as_bytes(),
             ed_public_key: *self.ed_public_key.as_bytes(),
             transcript_hash: transcript_hash.clone(),
-            signature: self.ed_signing_key.sign(&transcript_hash).to_bytes(),
+            signature: self.ed_signing_key.take().expect("Signing key already consumed").sign(&transcript_hash).to_bytes(),
         }
         .encode(&mut p);
         if let Some(c) = cookie {

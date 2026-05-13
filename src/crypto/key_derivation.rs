@@ -63,8 +63,8 @@ pub(super) fn derive_initial_secret(dcid: &[u8]) -> [u8; 32] {
 pub(super) struct EpochKeys {
     pub tx_key: [u8; 32],
     pub rx_key: [u8; 32],
-    pub tx_hp_key: [u8; 16],
-    pub rx_hp_key: [u8; 16],
+    pub tx_hp_key: [u8; 32],
+    pub rx_hp_key: [u8; 32],
     pub tx_iv: [u8; 12],
     pub rx_iv: [u8; 12],
     pub tx_cipher: ChaCha20Poly1305,
@@ -109,8 +109,8 @@ pub(super) fn derive_epoch_keys(secret: &[u8; 32], epoch: u64, is_client: bool) 
     let mut keys = EpochKeys {
         tx_key: [0u8; 32],
         rx_key: [0u8; 32],
-        tx_hp_key: [0u8; 16],
-        rx_hp_key: [0u8; 16],
+        tx_hp_key: [0u8; 32],
+        rx_hp_key: [0u8; 32],
         tx_iv: [0u8; 12],
         rx_iv: [0u8; 12],
         tx_cipher: ChaCha20Poly1305::new([0u8; 32].as_slice().into()),

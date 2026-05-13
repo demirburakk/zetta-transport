@@ -2,7 +2,7 @@ use crate::crypto::CryptoContext;
 use crate::error::{Result, ZtError};
 use crate::protocol::frame::Frame;
 use crate::protocol::packet::{PacketHeader, PacketType};
-use crate::stream::{ZtConnectionHandle, ZtStream};
+use crate::stream::ZtConnectionHandle;
 use crate::transport::actor::ZtConnectionActor;
 use crate::transport::connection::ZtConnection;
 use crate::transport::cookie;
@@ -116,10 +116,7 @@ pub(crate) async fn handle_handshake(
         ));
     }
 
-    let current_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let current_time = cookie::current_time_millis();
 
     let is_cookie_valid = cookie_data.as_deref().is_some_and(|c| {
         cookie::verify_retry_cookie(&endpoint.cookie_key, &addr, &header.scid, c, current_time)
@@ -193,7 +190,7 @@ pub(crate) async fn handle_handshake(
         let mut new_conn = ZtConnection::new(addr, scid.clone(), header.scid.clone());
         new_conn.bytes_received = original_data.len();
 
-        let (data_tx, data_rx) = mpsc::channel(2048);
+        let (data_tx, _data_rx) = mpsc::channel(2048);
         let window_opened = Arc::new(Notify::new());
         new_conn
             .streams
@@ -213,7 +210,6 @@ pub(crate) async fn handle_handshake(
 
         let (actor_tx, actor_rx) = mpsc::channel(1024);
         let (stream_tx, stream_rx) = mpsc::channel(128);
-        let conn_closed = new_conn.closed.clone();
 
         // Server-side actor does not need the ephemeral secret (already consumed).
         // It is passed as None to eliminate the need for a dummy keypair.
@@ -226,7 +222,7 @@ pub(crate) async fn handle_handshake(
             new_conn,
             server_actor_pk,
             None,
-            endpoint.ed_signing_key.clone(),
+            None,
             endpoint.ed_public_key,
             endpoint.psk,
             None,
@@ -259,10 +255,6 @@ pub(crate) async fn handle_handshake(
         tokio::spawn(actor.run());
 
         let conn_handle = ZtConnectionHandle::new(endpoint.clone(), scid.clone(), stream_rx);
-        let stream0 = ZtStream::new(endpoint.clone(), scid.clone(), 0, data_rx, window_opened, conn_closed);
-        if stream_tx.try_send(stream0).is_err() {
-            tracing::warn!("Stream 0 channel full; dropping preallocated stream");
-        }
 
         if endpoint.incoming_tx.try_send(conn_handle).is_err() {
             tracing::warn!(

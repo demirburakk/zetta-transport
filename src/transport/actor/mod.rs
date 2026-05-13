@@ -51,7 +51,7 @@ pub(crate) struct ZtConnectionActor {
     /// Ephemeral secret is consumed after DH exchange. Stored as Option
     /// so it can be taken (moved) exactly once, then dropped.
     pub(super) ephemeral_secret: Option<EphemeralSecret>,
-    pub(super) ed_signing_key: SigningKey,
+    pub(super) ed_signing_key: Option<SigningKey>,
     pub(super) ed_public_key: VerifyingKey,
     pub(super) psk: Option<[u8; 32]>,
     pub(super) handshake_waiter: Option<oneshot::Sender<()>>,
@@ -72,7 +72,7 @@ impl ZtConnectionActor {
         state: ZtConnection,
         public_key: PublicKey,
         ephemeral_secret: Option<EphemeralSecret>,
-        ed_signing_key: SigningKey,
+        ed_signing_key: Option<SigningKey>,
         ed_public_key: VerifyingKey,
         psk: Option<[u8; 32]>,
         handshake_waiter: Option<oneshot::Sender<()>>,

@@ -64,7 +64,7 @@
 //!     // Connect to the remote server
 //!     let target = "127.0.0.1:8080".parse()?;
 //!     let mut conn = client.connect(target).await?;
-//!     let mut stream = conn.accept_stream().await.unwrap();
+//!     let mut stream = conn.open_stream().await.unwrap();
 //!     
 //!     // Send data reliably over the multiplexed stream
 //!     stream.send(b"Hello Zetta!").await?;

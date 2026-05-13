@@ -1,8 +1,9 @@
 pub(crate) fn truncate_pn(pn: u64, largest_acked: u64) -> (u32, usize) {
     let unacked = pn.saturating_sub(largest_acked);
-    let num_bits = 64 - unacked.leading_zeros();
+    // The packet number size must represent more than twice the unacked range.
+    let num_bits = 64 - (unacked * 2).leading_zeros();
 
-    let mut pn_len = num_bits.div_ceil(8);
+    let mut pn_len = (num_bits as usize).div_ceil(8);
     if pn_len == 0 {
         pn_len = 1;
     }
@@ -18,7 +19,7 @@ pub(crate) fn truncate_pn(pn: u64, largest_acked: u64) -> (u32, usize) {
         _ => unreachable!(),
     };
 
-    ((pn & mask) as u32, pn_len as usize)
+    ((pn & mask) as u32, pn_len)
 }
 
 pub(crate) fn expand_pn(pn_truncated: u64, pn_len: usize, largest_pn: u64) -> u64 {
@@ -31,7 +32,7 @@ pub(crate) fn expand_pn(pn_truncated: u64, pn_len: usize, largest_pn: u64) -> u6
     let candidate_pn = (expected_pn & !pn_mask) | pn_truncated;
 
     if candidate_pn + pn_hwin <= expected_pn {
-        candidate_pn + pn_win
+        candidate_pn.wrapping_add(pn_win)
     } else if candidate_pn > expected_pn + pn_hwin && candidate_pn >= pn_win {
         candidate_pn - pn_win
     } else {
@@ -71,5 +72,23 @@ mod tests {
     fn expand_pn_wraparound_u8() {
         let expanded = expand_pn(0, 1, 254);
         assert_eq!(expanded, 256);
+    }
+    
+    #[test]
+    fn fuzz_packet_numbers() {
+        // Pseudo-fuzzing with edge cases and random leaps
+        let mut largest_acked = 0;
+        for i in 1..100_000 {
+            let step = (i % 250) as u64; // leap up to 250
+            let pn = largest_acked + step;
+            let (truncated, len) = truncate_pn(pn, largest_acked);
+            let expanded = expand_pn(truncated as u64, len, largest_acked);
+            assert_eq!(expanded, pn, "Failed to expand step {step} from {largest_acked} (len {len}, trunc {truncated})");
+            
+            // Advance largest acked arbitrarily occasionally
+            if i % 10 == 0 {
+                largest_acked = pn;
+            }
+        }
     }
 }

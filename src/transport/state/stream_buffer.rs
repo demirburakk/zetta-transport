@@ -25,7 +25,6 @@ impl StreamReceiveBuffer {
     }
 
     pub(crate) fn write(&mut self, offset: u64, data: &[u8]) -> Option<usize> {
-        println!("StreamReceiveBuffer write offset={} len={}", offset, data.len());
         if data.is_empty() {
             return Some(0);
         }

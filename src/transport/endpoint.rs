@@ -2,7 +2,7 @@ use crate::error::{Result, ZtError};
 use crate::stream::{ZtConnectionHandle, ZtStream};
 use crate::transport::actor::{ActorMessage, ZtConnectionActor};
 use crate::transport::connection::ZtConnection;
-use crate::transport::state::{ConnectionState, StreamState};
+use crate::transport::state::ConnectionState;
 use bytes::Bytes;
 use dashmap::DashMap;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -10,7 +10,7 @@ use rand::Rng;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, Notify, Semaphore, mpsc, oneshot};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 
 /// Type alias for the optional peer key verification callback.
 pub type PeerKeyVerifier = Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>;
@@ -83,7 +83,10 @@ impl ZtEndpoint {
         // Since we already have 1 task on main socket, start cores - 1 more
         for _ in 1..cores {
             let task_socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+            #[cfg(unix)]
             task_socket.set_reuse_port(true)?;
+            #[cfg(not(unix))]
+            task_socket.set_reuse_address(true)?;
             task_socket.set_nonblocking(true)?;
             task_socket.bind(&actual_addr.into())?;
             let tokio_socket = Arc::new(UdpSocket::from_std(task_socket.into())?);
@@ -140,6 +143,7 @@ impl ZtEndpoint {
                             } else if tx.try_send(ActorMessage::IncomingPacket { data: data.clone(), addr }).is_ok() {
                                 routed = true;
                             } else {
+                                tracing::debug!("Local routing cache try_send failed for dcid, removing from cache");
                                 // Channel full or closed, remove from local cache
                                 local_routing_table.remove(&dcid);
                             }
@@ -271,18 +275,16 @@ impl ZtEndpoint {
         let mut conn = ZtConnection::new(addr, scid.clone(), dcid);
         conn.state = ConnectionState::Handshaking;
 
-        let (data_tx, data_rx) = mpsc::channel(2048);
-        let window_opened = Arc::new(Notify::new());
-        conn.streams
-            .insert(0, StreamState::new(data_tx, window_opened.clone()));
-
         let (actor_tx, actor_rx) = mpsc::channel(1024);
         let (stream_tx, stream_rx) = mpsc::channel(128);
-        let conn_closed = conn.closed.clone();
 
         let (wait_tx, wait_rx) = oneshot::channel();
 
         let (ephemeral_secret, ephemeral_public) = crate::crypto::keypair::generate_keypair();
+        
+        let mut csprng = rand::rngs::OsRng;
+        let client_ed_signing_key = SigningKey::generate(&mut csprng);
+        let client_ed_public_key = client_ed_signing_key.verifying_key();
 
         let actor = ZtConnectionActor::new(
             self.clone(),
@@ -291,8 +293,8 @@ impl ZtEndpoint {
             conn,
             ephemeral_public,
             Some(ephemeral_secret),
-            self.ed_signing_key.clone(),
-            self.ed_public_key,
+            Some(client_ed_signing_key),
+            client_ed_public_key,
             self.psk,
             Some(wait_tx),
             self.routing_table.clone(),
@@ -306,10 +308,6 @@ impl ZtEndpoint {
 
         match tokio::time::timeout(std::time::Duration::from_secs(5), wait_rx).await {
             Ok(Ok(_)) => {
-                let stream0 = ZtStream::new(self.clone(), scid.clone(), 0, data_rx, window_opened, conn_closed);
-                if stream_tx.try_send(stream0).is_err() {
-                    tracing::warn!("Stream 0 channel full; dropping preallocated stream");
-                }
                 Ok(ZtConnectionHandle::new(self.clone(), scid, stream_rx))
             }
             _ => {

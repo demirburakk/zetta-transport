@@ -1,6 +1,48 @@
 use crate::error::{Result, ZtError};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+pub(crate) fn put_varint(dst: &mut BytesMut, val: u64) {
+    if val < 64 {
+        dst.put_u8(val as u8);
+    } else if val < 16384 {
+        dst.put_u16((val as u16) | 0x4000);
+    } else if val < 1073741824 {
+        dst.put_u32((val as u32) | 0x80000000);
+    } else {
+        dst.put_u64(val | 0xC000000000000000);
+    }
+}
+
+pub(crate) fn get_varint(src: &mut Bytes) -> Result<u64> {
+    if src.remaining() < 1 {
+        return Err(ZtError::InvalidPacket("Truncated varint".into()));
+    }
+    let first = src.chunk()[0];
+    let tag = first >> 6;
+    match tag {
+        0 => Ok(src.get_u8() as u64),
+        1 => {
+            if src.remaining() < 2 {
+                return Err(ZtError::InvalidPacket("Truncated varint 2".into()));
+            }
+            Ok((src.get_u16() & 0x3FFF) as u64)
+        }
+        2 => {
+            if src.remaining() < 4 {
+                return Err(ZtError::InvalidPacket("Truncated varint 4".into()));
+            }
+            Ok((src.get_u32() & 0x3FFFFFFF) as u64)
+        }
+        3 => {
+            if src.remaining() < 8 {
+                return Err(ZtError::InvalidPacket("Truncated varint 8".into()));
+            }
+            Ok(src.get_u64() & 0x3FFFFFFFFFFFFFFF)
+        }
+        _ => unreachable!(),
+    }
+}
+
 /// Frame types for ZettaTransport payloads.
 ///
 /// Frame type discriminants occupy bytes 0x00–0x08. PacketType discriminants
@@ -53,7 +95,7 @@ impl Frame {
                 dst.put_u8(0x01);
                 dst.put_u32(*id);
                 dst.put_u64(*offset);
-                dst.put_u16(data.len() as u16);
+                put_varint(dst, data.len() as u64);
                 dst.put_slice(data);
             }
             Frame::Ack {
@@ -124,12 +166,12 @@ impl Frame {
                 Ok(Frame::Padding(padding_len))
             }
             0x01 => {
-                if src.remaining() < 14 {
+                if src.remaining() < 13 {
                     return Err(ZtError::InvalidPacket("Stream frame too short".into()));
                 }
                 let id = src.get_u32();
                 let offset = src.get_u64();
-                let len = src.get_u16() as usize;
+                let len = get_varint(src)? as usize;
                 if src.remaining() < len {
                     return Err(ZtError::InvalidPacket("Stream frame truncated".into()));
                 }
