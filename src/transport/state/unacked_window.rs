@@ -55,6 +55,12 @@ impl UnackedWindow {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.deque.clear();
+        self.len = 0;
+        self.base_pn = 0;
+    }
+
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.len

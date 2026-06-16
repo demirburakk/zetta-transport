@@ -105,12 +105,9 @@ impl ZtConnectionActor {
         self.state.addr = addr;
         self.state.state = ConnectionState::Active;
         self.state.mark_processed(header.packet_number);
-        if old_scid != new_dcid {
-            self.routing_table.remove(&old_scid);
-            if let Some(actor_tx) = self.routing_table.get(&self.scid) {
-                self.routing_table.insert(new_dcid, actor_tx.clone());
-            }
-        }
+        // Handshake complete: clear the Initial packet from unacked_packets
+        self.state.unacked_packets.clear();
+        self.state.bytes_in_flight = 0;
         if let Some(tx) = self.handshake_waiter.take() {
             let _ = tx.send(());
         }

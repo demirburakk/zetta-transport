@@ -61,6 +61,26 @@ impl ZtConnection {
             }
         }
 
+        // 2. Cumulative ACK: Acknowledge packets that are older than the 2048-packet window tracking limit.
+        // Since the receiver advanced largest_acked_pn past them by >2048, they must have been received
+        // or skipped, and they are no longer trackable in SACK ranges.
+        let oldest_tracked = largest_acked_pn.saturating_sub(2047);
+        let mut cumulative_acked = Vec::new();
+        for (pn, _) in self.unacked_packets.iter() {
+            if pn < oldest_tracked {
+                cumulative_acked.push(pn);
+            }
+        }
+        for pn in cumulative_acked {
+            if let Some(up) = self.unacked_packets.remove(pn) {
+                bytes_acked += up.payload.len();
+                bytes_in_flight_acked += up.sent_bytes;
+                if sample_rtt.is_none() && up.retries == 0 {
+                    sample_rtt = Some(up.sent_at.elapsed());
+                }
+            }
+        }
+
         // 3. Fast Retransmit Detection (SACK-based gap and time-based threshold detection)
         let mut lost_pns = Vec::new();
         let now = std::time::Instant::now();

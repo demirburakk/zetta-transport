@@ -139,12 +139,6 @@ impl ZtConnectionActor {
 
                 _ = &mut rto_timer => {
                     if self.handle_retransmits().is_err() { break; }
-                    
-                    if self.state.state == ConnectionState::Handshaking {
-                        if let Some(hs) = self.state.handshake_packet.clone() {
-                            let _ = self.sendmsg_vectored(&[std::io::IoSlice::new(&hs)]);
-                        }
-                    }
                 }
 
                 _ = &mut mtu_probe_timer => {

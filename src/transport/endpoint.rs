@@ -12,6 +12,8 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 
+const MAX_ACTIVE_CONNECTIONS: usize = 1000;
+
 /// Type alias for the optional peer key verification callback.
 pub type PeerKeyVerifier = Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>;
 
@@ -123,7 +125,7 @@ impl ZtEndpoint {
     fn start_router(endpoint: Arc<Self>, socket: Arc<UdpSocket>) {
         tokio::spawn(async move {
             let mut local_routing_table = std::collections::HashMap::new();
-            let mut buf = bytes::BytesMut::zeroed(65536); // Large buffer for vectored/batched reading
+            let mut buf = bytes::BytesMut::zeroed(2048); // Optimized from 65536 to 2048 to minimize zero-fill CPU overhead
             loop {
                 // Batch up to 64 packets before yielding context
                 let mut processed = 0;
@@ -148,9 +150,9 @@ impl ZtEndpoint {
 
                     let data = buf.split_to(len);
                     if buf.capacity() < 2048 {
-                        buf = bytes::BytesMut::zeroed(65536);
+                        buf = bytes::BytesMut::zeroed(2048);
                     } else {
-                        buf.resize(65536, 0);
+                        buf.resize(2048, 0);
                     }
 
                     if let Some(dcid) = crate::protocol::routing::extract_dcid_fast(&data) {
@@ -182,22 +184,30 @@ impl ZtEndpoint {
                                     let _ = tx.try_send(ActorMessage::IncomingPacket { data, addr });
                                 }
                             } else {
-                                if let Ok(permit) = endpoint.handshake_semaphore.clone().try_acquire_owned() {
-                                    let ep_clone = endpoint.clone();
-                                    tokio::spawn(async move {
-                                        let _permit = permit;
-                                        if let Err(e) = crate::transport::handshake::handle_handshake(
-                                            ep_clone,
-                                            data.freeze(),
-                                            addr,
-                                        )
-                                        .await
-                                        {
-                                            tracing::debug!("Handshake failed: {:?}", e);
-                                        }
-                                    });
-                                } else {
-                                    tracing::debug!("Dropped incoming handshake: server at capacity");
+                                // DoS Protection fast check: Only spawn handshakes for Initial packets of size >= 1200
+                                let is_initial = data.len() >= 1200
+                                    && (data[0] & 0x80) != 0; // Long header
+
+                                if is_initial {
+                                    if endpoint.routing_table.len() >= MAX_ACTIVE_CONNECTIONS {
+                                        tracing::warn!("Dropped incoming handshake: server at maximum connection capacity");
+                                    } else if let Ok(permit) = endpoint.handshake_semaphore.clone().try_acquire_owned() {
+                                        let ep_clone = endpoint.clone();
+                                        tokio::spawn(async move {
+                                            let _permit = permit;
+                                            if let Err(e) = crate::transport::handshake::handle_handshake(
+                                                ep_clone,
+                                                data.freeze(),
+                                                addr,
+                                            )
+                                            .await
+                                            {
+                                                tracing::debug!("Handshake failed: {:?}", e);
+                                            }
+                                        });
+                                    } else {
+                                        tracing::debug!("Dropped incoming handshake: server at capacity");
+                                    }
                                 }
                             }
                         }

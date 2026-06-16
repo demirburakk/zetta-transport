@@ -399,6 +399,10 @@ impl ZtConnectionActor {
     }
 
     fn send_payload_with_retries(&mut self, payload: UnackedPayload, retries: u32) -> Result<()> {
+        if let UnackedPayload::Initial { cookie } = &payload {
+            let cookie_clone = cookie.clone();
+            return self.send_initial_packet_internal(cookie_clone, retries);
+        }
         let pn = self.state.get_next_packet_number()?;
         let kp = self.current_key_phase();
         let lowest_unacked = self.state.unacked_packets.keys().next().unwrap_or(pn);
@@ -420,6 +424,10 @@ impl ZtConnectionActor {
         let h_len = packet.len();
 
         match &payload {
+            UnackedPayload::Initial { .. } => {
+                // Initial packets are intercepted at the beginning of the function
+                unreachable!()
+            }
             UnackedPayload::Stream {
                 stream_id,
                 offset,
@@ -494,6 +502,10 @@ impl ZtConnectionActor {
     }
 
     pub(super) fn send_initial_packet(&mut self, cookie: Option<bytes::Bytes>) -> Result<()> {
+        self.send_initial_packet_internal(cookie, 0)
+    }
+
+    fn send_initial_packet_internal(&mut self, cookie: Option<bytes::Bytes>, retries: u32) -> Result<()> {
         let pn = self.state.get_next_packet_number()?;
         let lowest_unacked = self.state.unacked_packets.keys().next().unwrap_or(pn);
         let (_, pn_len) =
@@ -530,7 +542,7 @@ impl ZtConnectionActor {
             signature: self.ed_signing_key.as_ref().expect("Signing key missing").sign(&transcript_hash).to_bytes(),
         }
         .encode(&mut p);
-        if let Some(c) = cookie {
+        if let Some(c) = cookie.clone() {
             Frame::Cookie { cookie: c }.encode(&mut p);
         }
         let pad_len = 1200usize.saturating_sub(p.len() + 16);
@@ -555,6 +567,20 @@ impl ZtConnectionActor {
         if let Err(e) = self.sendmsg_vectored(&[IoSlice::new(frozen.as_ref())]) {
             tracing::debug!("Initial send error: {}", e);
         }
+
+        self.state.unacked_packets.insert(
+            pn,
+            UnackedPacket {
+                payload: UnackedPayload::Initial { cookie },
+                sent_at: std::time::Instant::now(),
+                retries,
+                is_mtu_probe: false,
+                sent_bytes: frozen.len(),
+            },
+        );
+        self.state.bytes_in_flight += frozen.len();
+        self.note_packet_sent();
+
         Ok(())
     }
 }

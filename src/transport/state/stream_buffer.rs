@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 /// providing O(log n) insertion and merge operations instead of O(n^2).
 pub(crate) struct StreamReceiveBuffer {
     buffer: Vec<u8>,
+    capacity: usize,
     pub(crate) read_head: u64,
     pub(crate) write_head: u64,
     /// Received ranges keyed by start offset. Value is the end offset (exclusive).
@@ -17,7 +18,8 @@ pub(crate) struct StreamReceiveBuffer {
 impl StreamReceiveBuffer {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
-            buffer: vec![0; capacity],
+            buffer: Vec::new(), // Start empty to prevent pre-allocation OOM!
+            capacity,
             read_head: 0,
             write_head: 0,
             received_ranges: BTreeMap::new(),
@@ -31,21 +33,26 @@ impl StreamReceiveBuffer {
         let end_offset = offset + data.len() as u64;
 
         // Cannot fit in the buffer.
-        if end_offset > self.read_head + self.buffer.len() as u64 {
+        if end_offset > self.read_head + self.capacity as u64 {
             return None;
+        }
+
+        // Lazy allocation on first write
+        if self.buffer.is_empty() {
+            self.buffer = vec![0; self.capacity];
         }
 
         if end_offset > self.write_head {
             self.write_head = end_offset;
         }
 
-        let cap = self.buffer.len() as u64;
+        let cap = self.capacity as u64;
         let start_idx = (offset % cap) as usize;
         let mut data_offset = 0;
         let mut write_idx = start_idx;
 
         while data_offset < data.len() {
-            let chunk_len = std::cmp::min(data.len() - data_offset, self.buffer.len() - write_idx);
+            let chunk_len = std::cmp::min(data.len() - data_offset, self.capacity - write_idx);
             self.buffer[write_idx..write_idx + chunk_len]
                 .copy_from_slice(&data[data_offset..data_offset + chunk_len]);
             data_offset += chunk_len;
@@ -101,6 +108,9 @@ impl StreamReceiveBuffer {
     }
 
     pub(crate) fn read_contiguous(&mut self) -> Option<Bytes> {
+        if self.buffer.is_empty() {
+            return None;
+        }
         // Check if the first range covers read_head.
         let (&first_start, &first_end) = self.received_ranges.iter().next()?;
 
@@ -108,7 +118,7 @@ impl StreamReceiveBuffer {
             let len = (first_end - self.read_head) as usize;
 
             let mut out = BytesMut::with_capacity(len);
-            let cap = self.buffer.len() as u64;
+            let cap = self.capacity as u64;
 
             let start_idx = (self.read_head % cap) as usize;
             let end_idx = ((self.read_head + len as u64) % cap) as usize;

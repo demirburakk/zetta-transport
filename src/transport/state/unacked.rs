@@ -4,6 +4,9 @@ use std::time::Instant;
 /// Describes the content of an unacknowledged packet.
 #[derive(Debug, Clone)]
 pub(crate) enum UnackedPayload {
+    Initial {
+        cookie: Option<Bytes>,
+    },
     Stream {
         stream_id: u32,
         offset: u64,
@@ -25,6 +28,7 @@ pub(crate) enum UnackedPayload {
 impl UnackedPayload {
     pub(crate) fn len(&self) -> usize {
         match self {
+            UnackedPayload::Initial { .. } => 0,
             UnackedPayload::Stream { data, .. } => data.len(),
             UnackedPayload::MtuProbe { target_size } => *target_size,
             UnackedPayload::StreamClose { .. }
