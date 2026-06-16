@@ -335,6 +335,7 @@ impl ZtEndpoint {
             scid.clone(),
             stream_tx.clone(),
             true,
+            actor_tx.clone(),
         );
 
         self.routing_table.insert(scid.clone(), actor_tx);

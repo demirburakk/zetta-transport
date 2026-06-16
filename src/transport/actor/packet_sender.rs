@@ -28,8 +28,7 @@ impl ZtConnectionActor {
         }
     }
 
-    #[cfg(unix)]
-    pub(super) fn sendmsg_vectored(&mut self, iov: &[IoSlice]) -> Result<()> {
+    pub(super) fn sendmsg_vectored(&mut self, iov: &[std::io::IoSlice]) -> Result<()> {
         let total_len: usize = iov.iter().map(|s| s.len()).sum();
         if !self.is_client
             && self.state.state == ConnectionState::Handshaking
@@ -38,71 +37,31 @@ impl ZtConnectionActor {
             tracing::warn!("Amplification limit reached, dropping packet");
             return Ok(());
         }
-        use libc::{c_void, iovec, msghdr, sendmsg, sockaddr_in, sockaddr_in6};
-        use std::os::unix::io::AsRawFd;
-        let fd = self.socket.as_raw_fd();
-        let mut msg: msghdr = unsafe { std::mem::zeroed() };
-        let mut iovecs: Vec<iovec> = iov
-            .iter()
-            .map(|s| iovec {
-                iov_base: s.as_ptr() as *mut c_void,
-                iov_len: s.len(),
-            })
-            .collect();
-        msg.msg_iov = iovecs.as_mut_ptr();
-        msg.msg_iovlen = iovecs.len() as _;
-        let mut addr_v4: sockaddr_in = unsafe { std::mem::zeroed() };
-        let mut addr_v6: sockaddr_in6 = unsafe { std::mem::zeroed() };
-        match self.state.addr {
-            std::net::SocketAddr::V4(v4) => {
-                addr_v4.sin_family = libc::AF_INET as _;
-                addr_v4.sin_port = v4.port().to_be();
-                addr_v4.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
-                msg.msg_name = &mut addr_v4 as *mut _ as *mut c_void;
-                msg.msg_namelen = std::mem::size_of::<sockaddr_in>() as _;
+
+        let res = if iov.len() == 1 {
+            self.socket.try_send_to(&iov[0], self.state.addr)
+        } else {
+            let mut buf = Vec::with_capacity(total_len);
+            for slice in iov {
+                buf.extend_from_slice(slice);
             }
-            std::net::SocketAddr::V6(v6) => {
-                addr_v6.sin6_family = libc::AF_INET6 as _;
-                addr_v6.sin6_port = v6.port().to_be();
-                addr_v6.sin6_addr.s6_addr = v6.ip().octets();
-                msg.msg_name = &mut addr_v6 as *mut _ as *mut c_void;
-                msg.msg_namelen = std::mem::size_of::<sockaddr_in6>() as _;
+            self.socket.try_send_to(&buf, self.state.addr)
+        };
+
+        match res {
+            Ok(_) => {
+                self.state.bytes_sent += total_len;
+                Ok(())
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                self.socket_blocked = true;
+                Err(ZtError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)))
+            }
+            Err(e) => {
+                tracing::debug!("Failed to send packet: {}", e);
+                Err(ZtError::Io(e))
             }
         }
-        let res = unsafe { sendmsg(fd, &msg, 0) };
-        if res < 0 {
-            let err = std::io::Error::last_os_error();
-            tracing::debug!("Failed to send vectored: {}", err);
-            return Err(ZtError::Io(err));
-        } else {
-            self.state.bytes_sent += total_len;
-        }
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    pub(super) fn sendmsg_vectored(&mut self, iov: &[IoSlice]) -> Result<()> {
-        let mut buf = Vec::new();
-        for slice in iov {
-            buf.extend_from_slice(slice);
-        }
-        self.send_to_socket(&buf)
-    }
-
-    #[cfg(not(unix))]
-    fn send_to_socket(&mut self, packet: &[u8]) -> Result<()> {
-        if self.state.state == ConnectionState::Handshaking
-            && self.state.bytes_sent + packet.len() > 3 * self.state.bytes_received.max(1)
-        {
-            return Ok(());
-        }
-        if let Err(e) = self.socket.try_send_to(packet, self.state.addr) {
-            tracing::debug!("Failed to send: {}", e);
-            return Err(ZtError::Io(e));
-        } else {
-            self.state.bytes_sent += packet.len();
-        }
-        Ok(())
     }
 
     pub(super) fn send_mtu_probe(&mut self) -> Result<()> {
@@ -267,6 +226,9 @@ impl ZtConnectionActor {
     }
 
     pub(super) fn flush_pacing_queue(&mut self) -> Option<std::time::Duration> {
+        if self.socket_blocked {
+            return None;
+        }
         let now = StdInstant::now();
         // 1.25x pacing multiplier to ensure full window utilization under timer jitter
         let rate = (self.state.cwnd as f64 * 1.25) / self.state.rtt.as_secs_f64().max(0.00001);
@@ -290,6 +252,9 @@ impl ZtConnectionActor {
             if self.state.pacing_tokens >= len {
                 let (p, _) = self.state.unpaced_queue.front().unwrap().clone();
                 if let Err(e) = self.send_payload_with_retries(p, retries) {
+                    if self.socket_blocked {
+                        return None;
+                    }
                     tracing::warn!("Failed to send paced payload: {}. Retrying in 1ms.", e);
                     return Some(std::time::Duration::from_millis(1));
                 }
@@ -303,6 +268,9 @@ impl ZtConnectionActor {
                 if wait_secs < 0.001 {
                     let (p, _) = self.state.unpaced_queue.front().unwrap().clone();
                     if let Err(e) = self.send_payload_with_retries(p, retries) {
+                        if self.socket_blocked {
+                            return None;
+                        }
                         tracing::warn!("Failed to send paced payload: {}. Retrying in 1ms.", e);
                         return Some(std::time::Duration::from_millis(1));
                     }
@@ -337,6 +305,7 @@ impl ZtConnectionActor {
                     }
                     if up.retries > 3 {
                         self.state.mtu = 1200; // MTU Fallback
+                        self.state.shared_mtu.store(1200, std::sync::atomic::Ordering::Relaxed);
                     }
                     up.sent_at = now;
                     to_drop.push(pn);

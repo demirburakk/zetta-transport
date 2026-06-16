@@ -41,10 +41,16 @@ impl ZtConnectionActor {
             }
         }
 
-        let mut data_cursor = Bytes::copy_from_slice(&mutable_data[..]);
-        let initial_len = data_cursor.len();
+        let offset = PacketHeader::get_pn_offset(&mutable_data)
+            .ok_or_else(|| ZtError::InvalidPacket("Malformed header offset".into()))?;
+        let pn_len = (mutable_data[0] & 0x03) as usize + 1;
+        let header_len = offset + pn_len;
+        if mutable_data.len() < header_len {
+            return Err(ZtError::InvalidPacket("Header truncated".into()));
+        }
+
+        let mut data_cursor = Bytes::copy_from_slice(&mutable_data[..header_len]);
         let mut header = PacketHeader::decode(&mut data_cursor)?;
-        let header_len = initial_len - data_cursor.len();
 
         let mut payload_buf = mutable_data.split_off(header_len);
         let aad = mutable_data.freeze();
@@ -182,12 +188,12 @@ impl ZtConnectionActor {
                         .insert(id, StreamState::new(data_tx, window_opened.clone()));
 
                     let stream = ZtStream::new(
-                        self.endpoint.clone(),
-                        self.scid.clone(),
                         id,
                         data_rx,
                         window_opened,
                         self.state.closed.clone(),
+                        self.actor_tx.clone(),
+                        self.state.shared_mtu.clone(),
                     );
                     if let Err(e) = self.incoming_streams_tx.try_send(stream) {
                         tracing::error!("Failed to deliver incoming stream: {}. Closing connection.", e);

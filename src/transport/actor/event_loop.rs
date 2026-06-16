@@ -47,6 +47,8 @@ impl ZtConnectionActor {
                 break;
             }
 
+            let mut unacked_changed = false;
+
             tokio::select! {
                 Some(msg) = self.receiver.recv() => {
                     idle_deadline = TokioInstant::now() + Duration::from_secs(60);
@@ -55,6 +57,7 @@ impl ZtConnectionActor {
                     match msg {
                         ActorMessage::IncomingPacket { data, addr } => {
                             let _ = self.process_incoming_packet(data, addr);
+                            unacked_changed = true;
                             if self.pending_acks > 0 {
                                 let next_ack = TokioInstant::now() + Duration::from_millis(25);
                                 if ack_deadline > next_ack {
@@ -73,6 +76,7 @@ impl ZtConnectionActor {
                         ActorMessage::OutgoingData { stream_id, data, respond_to } => {
                             self.last_active_stream_id = stream_id;
                             let result = self.process_outgoing_data(stream_id, data);
+                            unacked_changed = true;
                             if let Some(wait) = self.flush_pacing_queue() {
                                 pacing_deadline = TokioInstant::now() + wait;
                                 pacing_timer.as_mut().reset(pacing_deadline);
@@ -96,6 +100,7 @@ impl ZtConnectionActor {
                                 idle_deadline = TokioInstant::now() + Duration::from_secs(5);
                                 idle_timer.as_mut().reset(idle_deadline);
                             }
+                            unacked_changed = true;
                         }
                         ActorMessage::OpenStream { respond_to } => {
                             let stream_id = self.next_stream_id;
@@ -109,12 +114,12 @@ impl ZtConnectionActor {
                             );
 
                             let stream = ZtStream::new(
-                                self.endpoint.clone(),
-                                self.scid.clone(),
                                 stream_id,
                                 data_rx,
                                 window_opened,
                                 self.state.closed.clone(),
+                                self.actor_tx.clone(),
+                                self.state.shared_mtu.clone(),
                             );
                             let _ = respond_to.send(Ok(stream));
                         }
@@ -128,18 +133,23 @@ impl ZtConnectionActor {
                             let _ = self.initiate_close();
                             idle_deadline = TokioInstant::now() + Duration::from_secs(5);
                             idle_timer.as_mut().reset(idle_deadline);
+                            unacked_changed = true;
                         }
                     }
                 }
 
                 _ = &mut delayed_ack_timer => {
-                    if self.pending_acks > 0 { let _ = self.flush_acks(); }
+                    if self.pending_acks > 0 {
+                        let _ = self.flush_acks();
+                        unacked_changed = true;
+                    }
                     ack_deadline = TokioInstant::now() + SLEEP_FOREVER;
                     delayed_ack_timer.as_mut().reset(ack_deadline);
                 }
 
                 _ = &mut rto_timer => {
                     if self.handle_retransmits().is_err() { break; }
+                    unacked_changed = true;
                 }
 
                 _ = &mut mtu_probe_timer => {
@@ -148,6 +158,7 @@ impl ZtConnectionActor {
                     }
                     mtu_probe_deadline = TokioInstant::now() + Duration::from_secs(15);
                     mtu_probe_timer.as_mut().reset(mtu_probe_deadline);
+                    unacked_changed = true;
                 }
 
                 _ = &mut pacing_timer => {
@@ -158,11 +169,26 @@ impl ZtConnectionActor {
                         pacing_deadline = TokioInstant::now() + SLEEP_FOREVER;
                         pacing_timer.as_mut().reset(pacing_deadline);
                     }
+                    unacked_changed = true;
+                }
+
+                _ = self.socket.writable(), if self.socket_blocked => {
+                    self.socket_blocked = false;
+                    if let Some(wait) = self.flush_pacing_queue() {
+                        pacing_deadline = TokioInstant::now() + wait;
+                        pacing_timer.as_mut().reset(pacing_deadline);
+                    } else {
+                        pacing_deadline = TokioInstant::now() + SLEEP_FOREVER;
+                        pacing_timer.as_mut().reset(pacing_deadline);
+                    }
+                    unacked_changed = true;
                 }
 
                 _ = &mut idle_timer => { break; }
             }
-            self.update_rto_timer(rto_timer.as_mut());
+            if unacked_changed {
+                self.update_rto_timer(rto_timer.as_mut());
+            }
         }
 
         // Signal all streams that the connection is closed, preventing

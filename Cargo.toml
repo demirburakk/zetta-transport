@@ -1,6 +1,6 @@
 [package]
 name = "zetta-transport"
-version = "0.1.18"
+version = "0.1.19"
 edition = "2024"
 authors = ["Burak Demir <demirburak8338@gmail.com>"]
 description = "A high-performance, secure, and fault-tolerant UDP-based transport protocol written in Rust 2024."

@@ -64,6 +64,8 @@ pub(crate) struct ZtConnectionActor {
     pub(super) incoming_streams_tx: mpsc::Sender<ZtStream>,
     pub(super) next_stream_id: u32,
     pub(super) is_client: bool,
+    pub(super) actor_tx: mpsc::Sender<ActorMessage>,
+    pub(super) socket_blocked: bool,
 }
 
 impl ZtConnectionActor {
@@ -83,6 +85,7 @@ impl ZtConnectionActor {
         scid: Vec<u8>,
         incoming_streams_tx: mpsc::Sender<ZtStream>,
         is_client: bool,
+        actor_tx: mpsc::Sender<ActorMessage>,
     ) -> Self {
         // Client uses even stream IDs, Server uses odd stream IDs.
         // Stream 0 is explicitly created during handshake, so client starts at 2.
@@ -105,6 +108,8 @@ impl ZtConnectionActor {
             incoming_streams_tx,
             next_stream_id,
             is_client,
+            actor_tx,
+            socket_blocked: false,
         }
     }
 

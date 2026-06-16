@@ -1,5 +1,4 @@
 use crate::error::Result;
-use crate::transport::endpoint::ZtEndpoint;
 use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
@@ -7,8 +6,6 @@ use tokio::sync::{Notify, mpsc};
 /// Represents a reliable, encrypted, and multiplexed data stream over a UDP connection.
 /// Behaves similarly to a TCP stream but operates within the ZettaTransport protocol.
 pub struct ZtStream {
-    endpoint: Arc<ZtEndpoint>,
-    cid: Vec<u8>,
     pub(crate) stream_id: u32,
     receiver: mpsc::Receiver<Bytes>,
     window_opened: Arc<Notify>,
@@ -16,24 +13,28 @@ pub struct ZtStream {
     /// all pending `window_opened.notified()` calls are unblocked and the
     /// send loop returns `ActorFailed` instead of hanging forever.
     closed: Arc<std::sync::atomic::AtomicBool>,
+
+    // Optimized fields to bypass global routing table DashMap lookups and oneshot channel allocations
+    actor_tx: mpsc::Sender<crate::transport::actor::ActorMessage>,
+    mtu: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ZtStream {
     pub(crate) fn new(
-        endpoint: Arc<ZtEndpoint>,
-        cid: Vec<u8>,
         stream_id: u32,
         receiver: mpsc::Receiver<Bytes>,
         window_opened: Arc<Notify>,
         closed: Arc<std::sync::atomic::AtomicBool>,
+        actor_tx: mpsc::Sender<crate::transport::actor::ActorMessage>,
+        mtu: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
         Self {
-            endpoint,
-            cid,
             stream_id,
             receiver,
             window_opened,
             closed,
+            actor_tx,
+            mtu,
         }
     }
 
@@ -47,7 +48,7 @@ impl ZtStream {
     /// Returns `ActorFailed` if the connection is closed while waiting,
     /// preventing silent deadlocks.
     pub async fn send(&self, data: &[u8]) -> Result<()> {
-        let mtu = self.endpoint.get_mtu(&self.cid).await;
+        let mtu = self.mtu.load(std::sync::atomic::Ordering::Relaxed);
         let chunk_size = mtu.saturating_sub(64).max(512);
         for chunk in data.chunks(chunk_size) {
             loop {
@@ -55,7 +56,20 @@ impl ZtStream {
                 if self.closed.load(std::sync::atomic::Ordering::Acquire) {
                     return Err(crate::error::ZtError::ActorFailed);
                 }
-                match self.endpoint.send(&self.cid, self.stream_id, chunk).await {
+                
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                if self.actor_tx.send(crate::transport::actor::ActorMessage::OutgoingData {
+                    stream_id: self.stream_id,
+                    data: Bytes::copy_from_slice(chunk),
+                    respond_to: resp_tx,
+                })
+                .await
+                .is_err()
+                {
+                    return Err(crate::error::ZtError::ActorFailed);
+                }
+
+                match resp_rx.await.unwrap_or(Err(crate::error::ZtError::ActorFailed)) {
                     Ok(_) => break,
                     Err(crate::error::ZtError::FlowControlBlocked)
                     | Err(crate::error::ZtError::CongestionWindowFull) => {
@@ -84,27 +98,25 @@ impl ZtStream {
 
     pub async fn recv(&mut self) -> Option<Bytes> {
         let chunk = self.receiver.recv().await?;
-        let sender = self.endpoint.routing_table.get(&self.cid).map(|r| r.value().clone());
-        if let Some(tx) = sender {
-            let _ = tx.send(crate::transport::actor::ActorMessage::StreamDataRead {
-                stream_id: self.stream_id,
-            }).await;
-        }
+        let _ = self.actor_tx.send(crate::transport::actor::ActorMessage::StreamDataRead {
+            stream_id: self.stream_id,
+        }).await;
         Some(chunk)
     }
 
     /// Gracefully closes the stream.
     pub async fn close(&self) -> Result<()> {
-        self.endpoint.close_stream(&self.cid, self.stream_id).await
+        let _ = self.actor_tx.send(crate::transport::actor::ActorMessage::CloseStream {
+            stream_id: self.stream_id,
+        }).await;
+        Ok(())
     }
 }
 
 impl Drop for ZtStream {
     fn drop(&mut self) {
-        if let Some(tx) = self.endpoint.routing_table.get(&self.cid) {
-            let _ = tx.try_send(crate::transport::actor::ActorMessage::CloseStream {
-                stream_id: self.stream_id,
-            });
-        }
+        let _ = self.actor_tx.try_send(crate::transport::actor::ActorMessage::CloseStream {
+            stream_id: self.stream_id,
+        });
     }
 }

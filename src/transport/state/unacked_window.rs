@@ -4,8 +4,8 @@ use std::collections::VecDeque;
 /// A sliding window ring buffer for tracking unacknowledged packets.
 /// Provides O(1) access by sequence number and avoids BTreeMap overhead.
 pub(crate) struct UnackedWindow {
-    base_pn: u64,
-    deque: VecDeque<Option<UnackedPacket>>,
+    pub(crate) base_pn: u64,
+    pub(crate) deque: VecDeque<Option<UnackedPacket>>,
     len: usize,
 }
 

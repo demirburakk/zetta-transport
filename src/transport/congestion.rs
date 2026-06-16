@@ -37,25 +37,25 @@ impl ZtConnection {
 
         // 1. Process SACK ranges first (Selective ACK)
         for &(start, end) in sack_ranges {
-            let mut range = Vec::new();
-            for (pn, _) in self.unacked_packets.iter() {
-                if pn >= start && pn <= end {
-                    range.push(pn);
-                }
-            }
-            for pn in range {
-                if let Some(up) = self.unacked_packets.remove(pn) {
-                    bytes_acked += up.payload.len();
-                    bytes_in_flight_acked += up.sent_bytes;
-                    if sample_rtt.is_none() && up.retries == 0 {
-                        sample_rtt = Some(up.sent_at.elapsed());
-                    }
-                    if up.is_mtu_probe
-                        && self.mtu_probes.remove(&pn).is_some()
-                        && up.payload.len() > self.mtu
-                    {
-                        self.mtu = up.payload.len();
-                        tracing::info!("MTU upgraded to {} via SACK'd PMTUD", self.mtu);
+            let lower = start.max(self.unacked_packets.base_pn);
+            let upper = end.min(self.unacked_packets.base_pn + self.unacked_packets.deque.len() as u64);
+            if lower <= upper {
+                for pn in lower..=upper {
+                    if let Some(up) = self.unacked_packets.remove(pn) {
+                        bytes_acked += up.payload.len();
+                        bytes_in_flight_acked += up.sent_bytes;
+                        if sample_rtt.is_none() && up.retries == 0 {
+                            sample_rtt = Some(up.sent_at.elapsed());
+                        }
+                        if up.is_mtu_probe
+                            && self.mtu_probes.remove(&pn).is_some()
+                            && up.payload.len() > self.mtu
+                        {
+                            let new_mtu = up.payload.len();
+                            self.mtu = new_mtu;
+                            self.shared_mtu.store(new_mtu, std::sync::atomic::Ordering::Relaxed);
+                            tracing::info!("MTU upgraded to {} via SACK'd PMTUD", self.mtu);
+                        }
                     }
                 }
             }
@@ -69,6 +69,8 @@ impl ZtConnection {
         for (pn, _) in self.unacked_packets.iter() {
             if pn < oldest_tracked {
                 cumulative_acked.push(pn);
+            } else {
+                break; // Iterator yields sorted PNs, so stop early.
             }
         }
         for pn in cumulative_acked {
@@ -93,6 +95,8 @@ impl ZtConnection {
                 if packet_threshold || time_threshold_met {
                     lost_pns.push(pn);
                 }
+            } else {
+                break; // Iterator yields sorted PNs, so stop early.
             }
         }
         let mut loss_detected = false;

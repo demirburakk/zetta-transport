@@ -48,6 +48,11 @@ pub(crate) struct CryptoContext {
     pub(crate) epoch: u64,
     is_client: bool,
 
+    // Pre-derived RX keys for the next epoch to prevent CPU DoS during trial decryption
+    next_rx_key: [u8; 32],
+    next_rx_iv: [u8; 12],
+    next_rx_cipher: ChaCha20Poly1305,
+
     // One level of fallback keys for out-of-order packets.
     prev_rx: Option<FallbackRxKeys>,
 }
@@ -62,11 +67,14 @@ impl Drop for CryptoContext {
         self.rx_hp_key.zeroize();
         self.tx_iv.zeroize();
         self.rx_iv.zeroize();
+        self.next_rx_key.zeroize();
+        self.next_rx_iv.zeroize();
         
         // Overwrite ciphers with zero-key instances to clear key material
         let zero_key = chacha20poly1305::Key::from([0u8; 32]);
         self.tx_cipher = ChaCha20Poly1305::new(&zero_key);
         self.rx_cipher = ChaCha20Poly1305::new(&zero_key);
+        self.next_rx_cipher = ChaCha20Poly1305::new(&zero_key);
         // FallbackRxKeys have their own Drop impl
     }
 }
@@ -119,6 +127,9 @@ impl CryptoContext {
             rx_cipher: ChaCha20Poly1305::new([0u8; 32].as_slice().into()),
             epoch: 0,
             is_client,
+            next_rx_key: [0u8; 32],
+            next_rx_iv: [0u8; 12],
+            next_rx_cipher: ChaCha20Poly1305::new([0u8; 32].as_slice().into()),
             prev_rx: None,
         }
     }
@@ -133,6 +144,14 @@ impl CryptoContext {
         self.rx_iv = keys.rx_iv;
         self.tx_cipher = keys.tx_cipher;
         self.rx_cipher = keys.rx_cipher;
+
+        // Pre-derive next epoch's RX key material for trial decryption
+        let mut next_secret = self.secret;
+        let next_secret_val = key_derivation::ratchet_secret(&mut next_secret);
+        let next_keys = key_derivation::derive_epoch_keys(&next_secret_val, epoch + 1, self.is_client);
+        self.next_rx_key = next_keys.rx_key;
+        self.next_rx_iv = next_keys.rx_iv;
+        self.next_rx_cipher = next_keys.rx_cipher;
     }
 
     /// Rotates keys forward: saves current RX keys as prev, ratchets the secret,
@@ -198,9 +217,6 @@ impl CryptoContext {
 
     /// Attempts to decrypt the payload with the NEXT epoch's keys.
     /// If successful, commits the key rotation and returns Ok.
-    ///
-    /// The temporary ratcheted secret is wrapped in `Zeroizing` to ensure
-    /// it is scrubbed from memory whether or not decryption succeeds.
     pub(crate) fn trial_decrypt_and_rotate(
         &mut self,
         packet_number: u64,
@@ -208,26 +224,13 @@ impl CryptoContext {
         payload: &mut [u8],
         tag: &[u8; 16],
     ) -> Result<()> {
-        use zeroize::Zeroizing;
-
-        let mut secret_clone = self.secret;
-        let next_secret = Zeroizing::new(key_derivation::ratchet_secret(&mut secret_clone));
-        let next_epoch = self.epoch + 1;
-        let keys = key_derivation::derive_epoch_keys(&next_secret, next_epoch, self.is_client);
-        
-        let nonce = self.make_nonce_from_iv(&keys.rx_iv, packet_number);
+        let nonce = self.make_nonce_from_iv(&self.next_rx_iv, packet_number);
         let chacha_tag = chacha20poly1305::Tag::from_slice(tag);
         
-        let result = keys.rx_cipher
+        self.next_rx_cipher
             .decrypt_in_place_detached(&nonce, aad, payload, chacha_tag)
-            .map_err(|e| ZtError::Crypto(format!("Trial decryption failed: {}", e)));
-
-        // Explicitly zeroize before potential early return.
-        // (Zeroizing::drop would handle it, but being explicit is clearer.)
-        drop(next_secret);
-
-        result?;
-            
+            .map_err(|e| ZtError::Crypto(format!("Trial decryption failed: {}", e)))?;
+             
         // Trial succeeded, commit rotation
         self.rotate_keys();
         Ok(())

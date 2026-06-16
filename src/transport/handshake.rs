@@ -140,10 +140,12 @@ pub(crate) async fn handle_handshake(
         if c.len() == 40 {
             let cookie_hmac: [u8; 32] = c[8..40].try_into().unwrap();
             
-            // Periodically clean up expired entries
-            endpoint.handshake_replay_filter.retain(|_, &mut timestamp| {
-                current_time.saturating_sub(timestamp) <= 5000
-            });
+            // Periodically clean up expired entries (probabilistically to avoid lock contention on every packet)
+            if rand::thread_rng().gen_ratio(1, 128) {
+                endpoint.handshake_replay_filter.retain(|_, &mut timestamp| {
+                    current_time.saturating_sub(timestamp) <= 5000
+                });
+            }
 
             if endpoint.handshake_replay_filter.contains_key(&cookie_hmac) {
                 tracing::debug!("Replayed handshake attempt from {:?} with SCID={:?} dropped", addr, header.scid);
@@ -248,6 +250,7 @@ pub(crate) async fn handle_handshake(
             scid.clone(),
             stream_tx.clone(),
             false,
+            actor_tx.clone(),
         );
 
         endpoint.routing_table.insert(scid.clone(), actor_tx.clone());
