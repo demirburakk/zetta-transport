@@ -10,7 +10,6 @@ use super::key_derivation;
 /// Fallback RX keys retained from a previous epoch during key rotation.
 struct FallbackRxKeys {
     rx_key: [u8; 32],
-    rx_hp_key: [u8; 32],
     rx_iv: [u8; 12],
     rx_cipher: ChaCha20Poly1305,
 }
@@ -19,7 +18,6 @@ impl Drop for FallbackRxKeys {
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.rx_key.zeroize();
-        self.rx_hp_key.zeroize();
         self.rx_iv.zeroize();
         // ChaCha20Poly1305 does not implement Zeroize on Drop in the chacha20poly1305 crate.
         // The idiomatic safe-Rust workaround is to overwrite the struct with a zero-key instance.
@@ -76,7 +74,7 @@ impl Drop for CryptoContext {
 impl CryptoContext {
     /// Creates a crypto context from a completed DH shared secret.
     pub(crate) fn from_shared_secret(
-        shared_secret: [u8; 32],
+        shared_secret: zeroize::Zeroizing<[u8; 32]>,
         my_scid: &[u8],
         peer_dcid: &[u8],
         psk: Option<[u8; 32]>,
@@ -108,12 +106,13 @@ impl CryptoContext {
 
     /// Creates a zeroed context with the given secret; keys are NOT derived yet.
     fn with_secret(secret: [u8; 32], is_client: bool) -> Self {
+        let (tx_hp_key, rx_hp_key) = key_derivation::derive_hp_keys(&secret, is_client);
         Self {
             secret,
             tx_key: [0u8; 32],
             rx_key: [0u8; 32],
-            tx_hp_key: [0u8; 32],
-            rx_hp_key: [0u8; 32],
+            tx_hp_key,
+            rx_hp_key,
             tx_iv: [0u8; 12],
             rx_iv: [0u8; 12],
             tx_cipher: ChaCha20Poly1305::new([0u8; 32].as_slice().into()),
@@ -130,8 +129,6 @@ impl CryptoContext {
         let keys = key_derivation::derive_epoch_keys(&self.secret, epoch, self.is_client);
         self.tx_key = keys.tx_key;
         self.rx_key = keys.rx_key;
-        self.tx_hp_key = keys.tx_hp_key;
-        self.rx_hp_key = keys.rx_hp_key;
         self.tx_iv = keys.tx_iv;
         self.rx_iv = keys.rx_iv;
         self.tx_cipher = keys.tx_cipher;
@@ -141,11 +138,9 @@ impl CryptoContext {
     /// Rotates keys forward: saves current RX keys as prev, ratchets the secret,
     /// and derives new epoch keys. Old prev gets dropped and zeroized automatically.
     pub(crate) fn rotate_keys(&mut self) {
-
         // Save current RX keys as new prev
         self.prev_rx = Some(FallbackRxKeys {
             rx_key: self.rx_key,
-            rx_hp_key: self.rx_hp_key,
             rx_iv: self.rx_iv,
             rx_cipher: self.rx_cipher.clone(),
         });
@@ -247,24 +242,13 @@ impl CryptoContext {
         header_protection::apply_header_protection(packet, pn_offset, &self.tx_hp_key)
     }
 
-    /// Removes header protection from a packet using the current or previous RX HP key.
+    /// Removes header protection from a received packet in-place using the static RX HP key.
     pub(crate) fn remove_header_protection(
         &self,
         packet: &mut [u8],
         pn_offset: usize,
-        use_prev_key: bool,
     ) -> Result<()> {
-        let hp_key = if use_prev_key {
-            if let Some(ref prev) = self.prev_rx {
-                &prev.rx_hp_key
-            } else {
-                return Err(ZtError::Crypto("No previous RX HP key available".into()));
-            }
-        } else {
-            &self.rx_hp_key
-        };
-
-        header_protection::remove_header_protection(packet, pn_offset, hp_key)
+        header_protection::remove_header_protection(packet, pn_offset, &self.rx_hp_key)
     }
 
     /// Generates a QUIC-style nonce: IV XOR PacketNumber (right-aligned, big-endian).

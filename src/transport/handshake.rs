@@ -41,7 +41,7 @@ pub(crate) async fn handle_handshake(
         let dcid_opt = crate::protocol::routing::extract_dcid_fast(&mutable_packet);
         if let Some(dcid) = dcid_opt {
             let crypto = CryptoContext::initial(&dcid, false);
-            crypto.remove_header_protection(&mut mutable_packet, offset, false)?;
+            crypto.remove_header_protection(&mut mutable_packet, offset)?;
         }
     }
     let original_data = Bytes::from(mutable_packet);
@@ -135,6 +135,24 @@ pub(crate) async fn handle_handshake(
         return Ok(());
     }
 
+    // Handshake replay protection: Check if cookie has been processed before
+    if let Some(ref c) = cookie_data {
+        if c.len() == 40 {
+            let cookie_hmac: [u8; 32] = c[8..40].try_into().unwrap();
+            
+            // Periodically clean up expired entries
+            endpoint.handshake_replay_filter.retain(|_, &mut timestamp| {
+                current_time.saturating_sub(timestamp) <= 5000
+            });
+
+            if endpoint.handshake_replay_filter.contains_key(&cookie_hmac) {
+                tracing::debug!("Replayed handshake attempt from {:?} with SCID={:?} dropped", addr, header.scid);
+                return Ok(());
+            }
+            endpoint.handshake_replay_filter.insert(cookie_hmac, current_time);
+        }
+    }
+
     {
         // Verify Ed25519 signature
         let remote_ed_pk = VerifyingKey::from_bytes(&remote_ed_pk_bytes)
@@ -198,7 +216,7 @@ pub(crate) async fn handle_handshake(
 
         let handshake_pn = new_conn.get_next_packet_number()?;
         new_conn.mark_processed(header.packet_number);
-        new_conn.state = ConnectionState::Active;
+        new_conn.state = ConnectionState::Handshaking;
 
         new_conn.crypto = Some(CryptoContext::from_shared_secret(
             shared,

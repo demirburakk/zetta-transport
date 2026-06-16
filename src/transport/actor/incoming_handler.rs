@@ -19,15 +19,10 @@ impl ZtConnectionActor {
         self.state.bytes_received += mutable_data.len();
         let is_short_header = !mutable_data.is_empty() && (mutable_data[0] & 0x80) == 0;
 
-        // Phase hint from the first byte (before HP removal).
-        let pre_hp_key_phase = is_short_header && (mutable_data[0] & 0x40) != 0;
-        let expected_kp = !self.state.current_key_epoch.is_multiple_of(2);
-        let hp_use_prev = is_short_header && pre_hp_key_phase != expected_kp;
-
         if is_short_header {
             if let Some(crypto) = self.state.crypto.as_ref() {
                 if let Some(offset) = PacketHeader::get_pn_offset(&mutable_data) {
-                    crypto.remove_header_protection(&mut mutable_data, offset, hp_use_prev)?;
+                    crypto.remove_header_protection(&mut mutable_data, offset)?;
                 }
             } else {
                 return Err(ZtError::Unauthorized);
@@ -39,10 +34,10 @@ impl ZtConnectionActor {
             let is_initial = ((mutable_data[0] >> 2) & 0x0F) == 0;
             if !is_retry && !is_initial {
                 let crypto = crate::crypto::CryptoContext::initial(&dcid, true);
-                crypto.remove_header_protection(&mut mutable_data, offset, false)?;
+                crypto.remove_header_protection(&mut mutable_data, offset)?;
             } else if is_initial {
                 let crypto = crate::crypto::CryptoContext::initial(&dcid, true);
-                crypto.remove_header_protection(&mut mutable_data, offset, false)?;
+                crypto.remove_header_protection(&mut mutable_data, offset)?;
             }
         }
 
@@ -54,7 +49,7 @@ impl ZtConnectionActor {
         let mut payload_buf = mutable_data.split_off(header_len);
         let aad = mutable_data.freeze();
 
-        if header.p_type == PacketType::Initial && self.state.state == ConnectionState::Active && !self.is_client {
+        if header.p_type == PacketType::Initial && !self.is_client {
             if let Some(hs) = self.state.handshake_packet.clone() {
                 let _ = self.sendmsg_vectored(&[std::io::IoSlice::new(&hs)]);
             }
@@ -71,6 +66,7 @@ impl ZtConnectionActor {
         let mut use_prev_key = false;
         let mut trial_rotate = false;
 
+        let expected_kp = !self.state.current_key_epoch.is_multiple_of(2);
         if is_short_header && header.key_phase != expected_kp {
             if header.packet_number >= highest {
                 trial_rotate = true;
@@ -87,7 +83,8 @@ impl ZtConnectionActor {
                 self.handle_retry_packet(header, payload_buf.freeze(), addr)
             }
             PacketType::Data | PacketType::MtuProbe | PacketType::Close
-                if self.state.state == ConnectionState::Active =>
+                if self.state.state == ConnectionState::Active
+                    || (self.state.state == ConnectionState::Handshaking && !self.is_client) =>
             {
                 let mut crypto = self.state.crypto.take().ok_or(ZtError::Unauthorized)?;
                 if payload_buf.len() < 16 {
@@ -132,6 +129,11 @@ impl ZtConnectionActor {
                 }
                 
                 self.state.crypto = Some(crypto);
+
+                // Transition server to Active upon successful decryption of 1-RTT packet.
+                if self.state.state == ConnectionState::Handshaking && !self.is_client {
+                    self.state.state = ConnectionState::Active;
+                }
 
                 self.state.addr = addr;
                 self.state.mark_processed(header.packet_number);

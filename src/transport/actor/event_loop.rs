@@ -29,7 +29,8 @@ impl ZtConnectionActor {
         tokio::pin!(mtu_probe_timer);
         tokio::pin!(pacing_timer);
 
-        if self.state.state == ConnectionState::Handshaking
+        if self.is_client
+            && self.state.state == ConnectionState::Handshaking
             && let Err(e) = self.send_initial_packet(None)
         {
             tracing::warn!("Failed to send initial packet: {:?}", e);

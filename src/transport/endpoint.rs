@@ -32,6 +32,7 @@ pub struct ZtEndpoint {
     pub(crate) cookie_key: [u8; 32],
     pub verify_peer_key: Option<PeerKeyVerifier>,
     pub(crate) handshake_semaphore: Arc<Semaphore>,
+    pub(crate) handshake_replay_filter: Arc<DashMap<[u8; 32], u64>>,
 
     incoming_rx: Mutex<mpsc::Receiver<ZtConnectionHandle>>,
     pub(crate) incoming_tx: mpsc::Sender<ZtConnectionHandle>,
@@ -85,6 +86,7 @@ impl ZtEndpoint {
             cookie_key,
             verify_peer_key: None,
             handshake_semaphore: Arc::new(Semaphore::new(256)),
+            handshake_replay_filter: Arc::new(DashMap::new()),
             incoming_rx: Mutex::new(rx),
             incoming_tx: tx,
         });

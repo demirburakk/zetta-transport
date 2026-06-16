@@ -63,8 +63,6 @@ pub(super) fn derive_initial_secret(dcid: &[u8]) -> [u8; 32] {
 pub(super) struct EpochKeys {
     pub tx_key: [u8; 32],
     pub rx_key: [u8; 32],
-    pub tx_hp_key: [u8; 32],
-    pub rx_hp_key: [u8; 32],
     pub tx_iv: [u8; 12],
     pub rx_iv: [u8; 12],
     pub tx_cipher: ChaCha20Poly1305,
@@ -94,12 +92,6 @@ pub(super) fn derive_epoch_keys(secret: &[u8; 32], epoch: u64, is_client: bool) 
         (mk_label("server_key"), mk_label("client_key"))
     };
 
-    let (tx_hp_label, rx_hp_label) = if is_client {
-        (mk_label("client_hp"), mk_label("server_hp"))
-    } else {
-        (mk_label("server_hp"), mk_label("client_hp"))
-    };
-
     let (tx_iv_label, rx_iv_label) = if is_client {
         (mk_label("client_iv"), mk_label("server_iv"))
     } else {
@@ -109,8 +101,6 @@ pub(super) fn derive_epoch_keys(secret: &[u8; 32], epoch: u64, is_client: bool) 
     let mut keys = EpochKeys {
         tx_key: [0u8; 32],
         rx_key: [0u8; 32],
-        tx_hp_key: [0u8; 32],
-        rx_hp_key: [0u8; 32],
         tx_iv: [0u8; 12],
         rx_iv: [0u8; 12],
         tx_cipher: ChaCha20Poly1305::new([0u8; 32].as_slice().into()),
@@ -125,17 +115,32 @@ pub(super) fn derive_epoch_keys(secret: &[u8; 32], epoch: u64, is_client: bool) 
         .expect("HKDF expand rx_key failed");
     keys.rx_cipher = ChaCha20Poly1305::new(keys.rx_key.as_slice().into());
 
-    hk.expand(&tx_hp_label, &mut keys.tx_hp_key)
-        .expect("HKDF expand tx_hp failed");
-    hk.expand(&rx_hp_label, &mut keys.rx_hp_key)
-        .expect("HKDF expand rx_hp failed");
-
     hk.expand(&tx_iv_label, &mut keys.tx_iv)
         .expect("HKDF expand tx_iv failed");
     hk.expand(&rx_iv_label, &mut keys.rx_iv)
         .expect("HKDF expand rx_iv failed");
 
     keys
+}
+
+/// Derives static HP keys from the master secret without epoch suffixes.
+pub(super) fn derive_hp_keys(secret: &[u8; 32], is_client: bool) -> ([u8; 32], [u8; 32]) {
+    let hk = Hkdf::<Sha256>::from_prk(secret).expect("Invalid PRK");
+    let mut tx_hp_key = [0u8; 32];
+    let mut rx_hp_key = [0u8; 32];
+
+    let (tx_hp_label, rx_hp_label) = if is_client {
+        (b"client_hp".as_slice(), b"server_hp".as_slice())
+    } else {
+        (b"server_hp".as_slice(), b"client_hp".as_slice())
+    };
+
+    hk.expand(tx_hp_label, &mut tx_hp_key)
+        .expect("HKDF expand tx_hp failed");
+    hk.expand(rx_hp_label, &mut rx_hp_key)
+        .expect("HKDF expand rx_hp failed");
+
+    (tx_hp_key, rx_hp_key)
 }
 
 /// Ratchets the secret forward, zeroizing the old secret.
@@ -185,7 +190,15 @@ mod tests {
         let server_keys = derive_epoch_keys(&secret, 0, false);
         assert_eq!(client_keys.tx_key, server_keys.rx_key);
         assert_eq!(client_keys.rx_key, server_keys.tx_key);
-        assert_eq!(client_keys.tx_hp_key, server_keys.rx_hp_key);
+    }
+
+    #[test]
+    fn hp_keys_client_server_differ() {
+        let secret = [7u8; 32];
+        let (c_tx, c_rx) = derive_hp_keys(&secret, true);
+        let (s_tx, s_rx) = derive_hp_keys(&secret, false);
+        assert_eq!(c_tx, s_rx);
+        assert_eq!(c_rx, s_tx);
     }
 
     #[test]
