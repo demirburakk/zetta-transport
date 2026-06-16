@@ -51,7 +51,7 @@ pub(crate) struct ZtConnection {
     pub(crate) bytes_sent: usize,
     pub(crate) conn_tx_offset: u64,
 
-    pub(crate) unpaced_queue: std::collections::VecDeque<UnackedPayload>,
+    pub(crate) unpaced_queue: std::collections::VecDeque<(UnackedPayload, u32)>,
     pub(crate) queued_bytes: usize,
 
     pub(crate) replay_window: ReplayWindow,

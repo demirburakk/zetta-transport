@@ -53,6 +53,17 @@ impl ZtEndpoint {
         };
         let std_socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
         std_socket.set_reuse_port(true)?;
+        
+        let buf_size = 2 * 1024 * 1024;
+        if let Err(e) = std_socket.set_recv_buffer_size(buf_size) {
+            tracing::debug!("Failed to set socket receive buffer size to {}: {:?}", buf_size, e);
+            let _ = std_socket.set_recv_buffer_size(256 * 1024);
+        }
+        if let Err(e) = std_socket.set_send_buffer_size(buf_size) {
+            tracing::debug!("Failed to set socket send buffer size to {}: {:?}", buf_size, e);
+            let _ = std_socket.set_send_buffer_size(256 * 1024);
+        }
+
         std_socket.set_nonblocking(true)?;
         std_socket.bind(&socket_addr.into())?;
         
@@ -87,6 +98,17 @@ impl ZtEndpoint {
             task_socket.set_reuse_port(true)?;
             #[cfg(not(unix))]
             task_socket.set_reuse_address(true)?;
+
+            let buf_size = 2 * 1024 * 1024;
+            if let Err(e) = task_socket.set_recv_buffer_size(buf_size) {
+                tracing::debug!("Failed to set task socket receive buffer size to {}: {:?}", buf_size, e);
+                let _ = task_socket.set_recv_buffer_size(256 * 1024);
+            }
+            if let Err(e) = task_socket.set_send_buffer_size(buf_size) {
+                tracing::debug!("Failed to set task socket send buffer size to {}: {:?}", buf_size, e);
+                let _ = task_socket.set_send_buffer_size(256 * 1024);
+            }
+
             task_socket.set_nonblocking(true)?;
             task_socket.bind(&actual_addr.into())?;
             let tokio_socket = Arc::new(UdpSocket::from_std(task_socket.into())?);

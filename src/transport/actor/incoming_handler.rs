@@ -236,27 +236,7 @@ impl ZtConnectionActor {
                     }
                 }
 
-                let mut forwarded = false;
-                while let Some(chunk) = stream.receive_buffer.read_contiguous() {
-                    stream.buffered_bytes =
-                        stream.buffered_bytes.saturating_sub(chunk.len());
-                    if stream.app_tx.try_send(chunk).is_ok() {
-                        forwarded = true;
-                    } else {
-                        break;
-                    }
-                }
-                
-                stream.expected_rx_offset = stream.receive_buffer.read_head;
-
-                if forwarded {
-                    let max_data = stream.expected_rx_offset + stream.window_size;
-                    let payload = UnackedPayload::MaxStreamData {
-                        stream_id: id,
-                        max_data,
-                    };
-                    let _ = self.retransmit_payload(payload, 0);
-                }
+                self.forward_stream_data(id)?;
 
                 self.pending_acks += 1;
                 if self.pending_acks >= 10 {
@@ -318,6 +298,39 @@ impl ZtConnectionActor {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    pub(super) fn forward_stream_data(&mut self, stream_id: u32) -> Result<()> {
+        let Some(stream) = self.state.streams.get_mut(&stream_id) else {
+            return Ok(());
+        };
+
+        let mut forwarded = false;
+        while let Some(chunk) = stream.receive_buffer.read_contiguous() {
+            stream.buffered_bytes =
+                stream.buffered_bytes.saturating_sub(chunk.len());
+            if stream.app_tx.try_send(chunk).is_ok() {
+                forwarded = true;
+            } else {
+                break;
+            }
+        }
+        
+        stream.expected_rx_offset = stream.receive_buffer.read_head;
+
+        let max_data = stream.expected_rx_offset + stream.window_size;
+        // Only update peer with MAX_STREAM_DATA when the window can be extended
+        // by a significant fraction (at least 1/4th of the window size, i.e., 256KB)
+        // to avoid Silly Window Syndrome and massive packet volume.
+        if forwarded && max_data.saturating_sub(stream.last_sent_max_data) >= stream.window_size / 4 {
+            stream.last_sent_max_data = max_data;
+            let payload = UnackedPayload::MaxStreamData {
+                stream_id,
+                max_data,
+            };
+            self.retransmit_payload(payload, 0)?;
         }
         Ok(())
     }

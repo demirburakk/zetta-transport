@@ -36,6 +36,9 @@ pub(crate) enum ActorMessage {
         respond_to: oneshot::Sender<Result<ZtStream>>,
     },
     SetHandshakePacket(Bytes),
+    StreamDataRead {
+        stream_id: u32,
+    },
     Close,
 }
 

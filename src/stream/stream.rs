@@ -82,10 +82,15 @@ impl ZtStream {
         Ok(())
     }
 
-    /// Receives a decrypted, in-order chunk of data from the remote peer.
-    /// Returns `None` if the stream is closed.
     pub async fn recv(&mut self) -> Option<Bytes> {
-        self.receiver.recv().await
+        let chunk = self.receiver.recv().await?;
+        let sender = self.endpoint.routing_table.get(&self.cid).map(|r| r.value().clone());
+        if let Some(tx) = sender {
+            let _ = tx.send(crate::transport::actor::ActorMessage::StreamDataRead {
+                stream_id: self.stream_id,
+            }).await;
+        }
+        Some(chunk)
     }
 
     /// Gracefully closes the stream.

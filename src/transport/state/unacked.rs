@@ -2,6 +2,7 @@ use bytes::Bytes;
 use std::time::Instant;
 
 /// Describes the content of an unacknowledged packet.
+#[derive(Debug, Clone)]
 pub(crate) enum UnackedPayload {
     Stream {
         stream_id: u32,

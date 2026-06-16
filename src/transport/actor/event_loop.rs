@@ -11,7 +11,7 @@ const SLEEP_FOREVER: Duration = Duration::from_secs(86400 * 365);
 
 impl ZtConnectionActor {
     pub(crate) async fn run(mut self) {
-        let mut rto_deadline = TokioInstant::now() + self.state.rtt;
+        let rto_deadline = TokioInstant::now() + self.state.rtt;
         let mut idle_deadline = TokioInstant::now() + Duration::from_secs(60);
         let mut ack_deadline = TokioInstant::now() + SLEEP_FOREVER;
         let mut mtu_probe_deadline = TokioInstant::now() + Duration::from_secs(15);
@@ -60,6 +60,13 @@ impl ZtConnectionActor {
                                     ack_deadline = next_ack;
                                     delayed_ack_timer.as_mut().reset(ack_deadline);
                                 }
+                            }
+                            if let Some(wait) = self.flush_pacing_queue() {
+                                pacing_deadline = TokioInstant::now() + wait;
+                                pacing_timer.as_mut().reset(pacing_deadline);
+                            } else {
+                                pacing_deadline = TokioInstant::now() + SLEEP_FOREVER;
+                                pacing_timer.as_mut().reset(pacing_deadline);
                             }
                         }
                         ActorMessage::OutgoingData { stream_id, data, respond_to } => {
@@ -113,6 +120,9 @@ impl ZtConnectionActor {
                         ActorMessage::SetHandshakePacket(hs) => {
                             self.state.handshake_packet = Some(hs);
                         }
+                        ActorMessage::StreamDataRead { stream_id } => {
+                            let _ = self.forward_stream_data(stream_id);
+                        }
                         ActorMessage::Close => {
                             let _ = self.initiate_close();
                             idle_deadline = TokioInstant::now() + Duration::from_secs(5);
@@ -135,10 +145,6 @@ impl ZtConnectionActor {
                             let _ = self.sendmsg_vectored(&[std::io::IoSlice::new(&hs)]);
                         }
                     }
-
-                    let rto = self.state.rtt + self.state.rttvar * 4;
-                    rto_deadline = TokioInstant::now() + rto.max(Duration::from_millis(50));
-                    rto_timer.as_mut().reset(rto_deadline);
                 }
 
                 _ = &mut mtu_probe_timer => {
@@ -161,6 +167,7 @@ impl ZtConnectionActor {
 
                 _ = &mut idle_timer => { break; }
             }
+            self.update_rto_timer(rto_timer.as_mut());
         }
 
         // Signal all streams that the connection is closed, preventing
@@ -173,5 +180,32 @@ impl ZtConnectionActor {
         }
 
         self.routing_table.remove(&self.scid);
+    }
+
+    pub(super) fn get_next_rto_deadline(&self) -> Option<tokio::time::Instant> {
+        let rto = (self.state.rtt + self.state.rttvar * 4).max(Duration::from_millis(50));
+        let mut min_deadline: Option<std::time::Instant> = None;
+
+        for (_, up) in self.state.unacked_packets.iter() {
+            let backoff_multiplier = 1_u32.checked_shl(up.retries).unwrap_or(64).min(64);
+            let packet_rto = (rto * backoff_multiplier).min(Duration::from_secs(10));
+            let deadline = up.sent_at + packet_rto;
+            if let Some(min) = min_deadline {
+                if deadline < min {
+                    min_deadline = Some(deadline);
+                }
+            } else {
+                min_deadline = Some(deadline);
+            }
+        }
+        min_deadline.map(|d| d.into())
+    }
+
+    pub(super) fn update_rto_timer(&self, timer: std::pin::Pin<&mut tokio::time::Sleep>) {
+        if let Some(deadline) = self.get_next_rto_deadline() {
+            timer.reset(deadline);
+        } else {
+            timer.reset(tokio::time::Instant::now() + SLEEP_FOREVER);
+        }
     }
 }

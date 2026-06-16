@@ -13,6 +13,7 @@ pub(crate) struct StreamState {
     pub(crate) buffered_bytes: usize,
     pub(crate) window_opened: Arc<Notify>,
     pub(crate) app_tx: mpsc::Sender<Bytes>,
+    pub(crate) last_sent_max_data: u64,
 }
 
 impl StreamState {
@@ -27,6 +28,7 @@ impl StreamState {
             buffered_bytes: 0,
             window_opened,
             app_tx,
+            last_sent_max_data: window_size,
         }
     }
 }

@@ -61,13 +61,18 @@ impl ZtConnection {
             }
         }
 
-        // 3. Fast Retransmit Detection (SACK-based gap detection)
-        // Any unacked packet that is strictly less than largest_acked_pn - 3
-        // is considered lost and must be retransmitted immediately.
+        // 3. Fast Retransmit Detection (SACK-based gap and time-based threshold detection)
         let mut lost_pns = Vec::new();
-        for (pn, _up) in self.unacked_packets.iter() {
-            if pn + 3 <= largest_acked_pn {
-                lost_pns.push(pn);
+        let now = std::time::Instant::now();
+        // Time threshold is 1.25 * SRTT (min 15ms)
+        let time_threshold = self.rtt.mul_f64(1.25).max(std::time::Duration::from_millis(15));
+        for (pn, up) in self.unacked_packets.iter() {
+            if pn < largest_acked_pn {
+                let packet_threshold = pn + 3 <= largest_acked_pn;
+                let time_threshold_met = now.duration_since(up.sent_at) > time_threshold;
+                if packet_threshold || time_threshold_met {
+                    lost_pns.push(pn);
+                }
             }
         }
         let mut loss_detected = false;
@@ -77,7 +82,7 @@ impl ZtConnection {
                 if up.is_mtu_probe {
                     self.mtu_probes.remove(&pn);
                 } else {
-                    fast_retransmits.push((up.payload, 0));
+                    fast_retransmits.push((up.payload, up.retries));
                     loss_detected = true;
                 }
             }
@@ -167,7 +172,7 @@ impl ZtConnection {
         self.last_congestion_time = Some(now);
 
         let beta = 0.7;
-        let _c = 0.4;
+        let c = 0.4;
 
         let current_cwnd_pkts = self.cwnd as f64 / self.mtu as f64;
 
@@ -181,7 +186,7 @@ impl ZtConnection {
         self.ssthresh = ((self.cwnd as f64 * beta) as usize).max(self.mtu * 2);
         self.cwnd = self.ssthresh;
 
-        self.cubic_k = 0.0;
+        self.cubic_k = ((self.cubic_w_max * (1.0 - beta)) / c).powf(1.0 / 3.0);
         self.cubic_epoch_start = None;
         self.last_cubic_update = None;
     }

@@ -261,14 +261,15 @@ impl ZtConnectionActor {
             offset: start,
             data,
         };
-        self.state.unpaced_queue.push_back(payload);
+        self.state.unpaced_queue.push_back((payload, 0));
         self.state.queued_bytes += payload_len;
         Ok(())
     }
 
     pub(super) fn flush_pacing_queue(&mut self) -> Option<std::time::Duration> {
         let now = StdInstant::now();
-        let rate = self.state.cwnd as f64 / self.state.rtt.as_secs_f64().max(0.001);
+        // 1.25x pacing multiplier to ensure full window utilization under timer jitter
+        let rate = (self.state.cwnd as f64 * 1.25) / self.state.rtt.as_secs_f64().max(0.00001);
         if let Some(last) = self.state.last_pacing_update {
             let elapsed = now.duration_since(last).as_secs_f64();
             self.state.pacing_tokens += rate * elapsed;
@@ -281,19 +282,35 @@ impl ZtConnectionActor {
         }
         self.state.last_pacing_update = Some(now);
 
-        while let Some(payload) = self.state.unpaced_queue.front() {
+        while let Some((payload, retries)) = self.state.unpaced_queue.front() {
             let len = payload.len() as f64;
             let payload_len = payload.len();
+            let retries = *retries;
+            
             if self.state.pacing_tokens >= len {
-                let p = self.state.unpaced_queue.pop_front().unwrap();
+                let (p, _) = self.state.unpaced_queue.front().unwrap().clone();
+                if let Err(e) = self.send_payload_with_retries(p, retries) {
+                    tracing::warn!("Failed to send paced payload: {}. Retrying in 1ms.", e);
+                    return Some(std::time::Duration::from_millis(1));
+                }
+                self.state.unpaced_queue.pop_front();
                 self.state.queued_bytes = self.state.queued_bytes.saturating_sub(payload_len);
                 self.state.pacing_tokens -= len;
-                if let Err(e) = self.send_payload(p) {
-                    tracing::debug!("Failed to send paced payload: {}", e);
-                }
             } else {
                 let deficit = len - self.state.pacing_tokens;
                 let wait_secs = deficit / rate;
+                // Sub-millisecond timer bypass
+                if wait_secs < 0.001 {
+                    let (p, _) = self.state.unpaced_queue.front().unwrap().clone();
+                    if let Err(e) = self.send_payload_with_retries(p, retries) {
+                        tracing::warn!("Failed to send paced payload: {}. Retrying in 1ms.", e);
+                        return Some(std::time::Duration::from_millis(1));
+                    }
+                    self.state.unpaced_queue.pop_front();
+                    self.state.queued_bytes = self.state.queued_bytes.saturating_sub(payload_len);
+                    self.state.pacing_tokens = 0.0;
+                    continue;
+                }
                 return Some(std::time::Duration::from_secs_f64(wait_secs));
             }
         }
@@ -305,6 +322,7 @@ impl ZtConnectionActor {
         let rto = (self.state.rtt + self.state.rttvar * 4).max(Duration::from_millis(50));
         let mut to_retransmit = std::collections::HashSet::new();
         let mut to_drop = Vec::new();
+        let mut timed_out = false;
         for (pn, up) in self.state.unacked_packets.iter_mut() {
             let backoff_multiplier = 1_u32.checked_shl(up.retries).unwrap_or(64).min(64);
             let packet_rto = (rto * backoff_multiplier).min(Duration::from_secs(10));
@@ -313,6 +331,10 @@ impl ZtConnectionActor {
                     to_drop.push(pn);
                 } else {
                     up.retries += 1;
+                    if up.retries > 10 {
+                        timed_out = true;
+                        break;
+                    }
                     if up.retries > 3 {
                         self.state.mtu = 1200; // MTU Fallback
                     }
@@ -321,6 +343,11 @@ impl ZtConnectionActor {
                     to_retransmit.insert(pn);
                 }
             }
+        }
+
+        if timed_out {
+            let _ = self.initiate_close();
+            return Err(ZtError::Timeout);
         }
 
         let mut payloads_to_resend = Vec::new();
@@ -356,11 +383,19 @@ impl ZtConnectionActor {
     }
 
     pub(crate) fn retransmit_payload(&mut self, payload: UnackedPayload, retries: u32) -> Result<()> {
-        self.send_payload_with_retries(payload, retries)
+        if let Err(e) = self.send_payload_with_retries(payload.clone(), retries) {
+            tracing::warn!("Failed to retransmit payload: {}. Queueing to pacing queue.", e);
+            self.state.unpaced_queue.push_front((payload, retries));
+        }
+        Ok(())
     }
 
     fn send_payload(&mut self, payload: UnackedPayload) -> Result<()> {
-        self.send_payload_with_retries(payload, 0)
+        if let Err(e) = self.send_payload_with_retries(payload.clone(), 0) {
+            tracing::warn!("Failed to send payload: {}. Queueing to pacing queue.", e);
+            self.state.unpaced_queue.push_front((payload, 0));
+        }
+        Ok(())
     }
 
     fn send_payload_with_retries(&mut self, payload: UnackedPayload, retries: u32) -> Result<()> {
@@ -427,7 +462,11 @@ impl ZtConnectionActor {
         let frozen = packet.freeze();
         let packet_len = frozen.len();
 
-        self.sendmsg_vectored(&[IoSlice::new(&frozen)])?;
+        let is_client_str = if self.is_client { "CLIENT" } else { "SERVER" };
+        println!("[{}] sendmsg_vectored: pn={}, len={}", is_client_str, pn, packet_len);
+        let res = self.sendmsg_vectored(&[IoSlice::new(&frozen)]);
+        println!("[{}] sendmsg_vectored res: pn={}, {:?}", is_client_str, pn, res);
+        res?;
         let is_mtu_probe = matches!(payload, UnackedPayload::MtuProbe { .. });
         self.state.unacked_packets.insert(
             pn,
@@ -488,7 +527,7 @@ impl ZtConnectionActor {
             public_key: *self.public_key.as_bytes(),
             ed_public_key: *self.ed_public_key.as_bytes(),
             transcript_hash: transcript_hash.clone(),
-            signature: self.ed_signing_key.take().expect("Signing key already consumed").sign(&transcript_hash).to_bytes(),
+            signature: self.ed_signing_key.as_ref().expect("Signing key missing").sign(&transcript_hash).to_bytes(),
         }
         .encode(&mut p);
         if let Some(c) = cookie {
