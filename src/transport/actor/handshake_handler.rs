@@ -83,11 +83,10 @@ impl ZtConnectionActor {
             .verify(&expected_hash, &Signature::from_bytes(&remote_sig_bytes))
             .map_err(|_| ZtError::Crypto("Invalid Sig".into()))?;
 
-        if let Some(verifier) = &self.endpoint.verify_peer_key {
-            if !verifier(&remote_ed_pk_bytes) {
+        if let Some(verifier) = &self.endpoint.verify_peer_key
+            && !verifier(&remote_ed_pk_bytes) {
                 return Err(ZtError::Unauthorized);
             }
-        }
 
         // Consume the ephemeral secret — it is moved into diffie_hellman and
         // destroyed, enforcing forward secrecy at the type level.

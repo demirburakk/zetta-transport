@@ -33,14 +33,29 @@ pub struct ZtEndpoint {
     pub verify_peer_key: Option<PeerKeyVerifier>,
     pub(crate) handshake_semaphore: Arc<Semaphore>,
     pub(crate) handshake_replay_filter: Arc<DashMap<[u8; 32], u64>>,
+    pub(crate) cc_algo: crate::transport::congestion::CongestionControlAlgorithm,
 
     incoming_rx: Mutex<mpsc::Receiver<ZtConnectionHandle>>,
     pub(crate) incoming_tx: mpsc::Sender<ZtConnectionHandle>,
 }
 
 impl ZtEndpoint {
-    /// Binds an endpoint to the given local address.
+    /// Binds an endpoint to the given local address, defaulting to the `Cubic`
+    /// congestion control algorithm.
     pub async fn bind(addr: &str, psk: Option<[u8; 32]>) -> Result<Arc<Self>> {
+        Self::bind_with_config(addr, psk, crate::transport::congestion::CongestionControlAlgorithm::Cubic).await
+    }
+
+    /// Binds an endpoint with the specified configuration, including a custom
+    /// pre-shared key (PSK) and selection of the pluggable congestion control algorithm.
+    ///
+    /// The specified `cc_algo` (e.g. `Cubic` or `Reno`) will govern the transmission rate
+    /// and backpressure management of all connections accepted or initiated by this endpoint.
+    pub async fn bind_with_config(
+        addr: &str,
+        psk: Option<[u8; 32]>,
+        cc_algo: crate::transport::congestion::CongestionControlAlgorithm,
+    ) -> Result<Arc<Self>> {
         let mut csprng = rand::rngs::OsRng;
         let ed_signing_key = SigningKey::generate(&mut csprng);
         let ed_public_key = ed_signing_key.verifying_key();
@@ -89,6 +104,7 @@ impl ZtEndpoint {
             handshake_replay_filter: Arc::new(DashMap::new()),
             incoming_rx: Mutex::new(rx),
             incoming_tx: tx,
+            cc_algo,
         });
 
         // Main socket routing
@@ -127,24 +143,21 @@ impl ZtEndpoint {
     fn start_router(endpoint: Arc<Self>, socket: Arc<UdpSocket>) {
         tokio::spawn(async move {
             let mut local_routing_table = std::collections::HashMap::new();
-            let mut buf = bytes::BytesMut::zeroed(2048); // Optimized from 65536 to 2048 to minimize zero-fill CPU overhead
+            let mut buf = bytes::BytesMut::zeroed(2048);
             loop {
-                // Batch up to 64 packets before yielding context
                 let mut processed = 0;
                 while processed < 64 {
-                    // Try to read immediately without awaiting if possible to simulate vectored I/O
                     let recv_result = socket.try_recv_from(&mut buf);
                     let (len, addr) = match recv_result {
                         Ok(res) => res,
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             if processed == 0 {
-                                // Await the next packet if we haven't processed any yet
                                 match socket.recv_from(&mut buf).await {
                                     Ok(res) => res,
                                     Err(_) => break,
                                 }
                             } else {
-                                break; // Yield back to executor
+                                break;
                             }
                         }
                         Err(_) => break,
@@ -161,16 +174,12 @@ impl ZtEndpoint {
                         let mut routed = false;
                         if let Some(tx) = local_routing_table.get(&dcid) {
                             let tx: &mpsc::Sender<ActorMessage> = tx;
-                            // Validate the cached sender is still alive before using it.
-                            // A closed channel means the actor dropped (possibly via
-                            // cleanup_guard rollback), so the local cache is stale.
                             if tx.is_closed() {
                                 local_routing_table.remove(&dcid);
                             } else if tx.try_send(ActorMessage::IncomingPacket { data: data.clone(), addr }).is_ok() {
                                 routed = true;
                             } else {
                                 tracing::debug!("Local routing cache try_send failed for dcid, removing from cache");
-                                // Channel full or closed, remove from local cache
                                 local_routing_table.remove(&dcid);
                             }
                         }
@@ -178,7 +187,6 @@ impl ZtEndpoint {
                         if !routed {
                             if let Some(tx) = endpoint.routing_table.get(&dcid) {
                                 if tx.is_closed() {
-                                    // Stale entry in global table — clean it up
                                     drop(tx);
                                     endpoint.routing_table.remove(&dcid);
                                 } else {
@@ -186,9 +194,8 @@ impl ZtEndpoint {
                                     let _ = tx.try_send(ActorMessage::IncomingPacket { data, addr });
                                 }
                             } else {
-                                // DoS Protection fast check: Only spawn handshakes for Initial packets of size >= 1200
                                 let is_initial = data.len() >= 1200
-                                    && (data[0] & 0x80) != 0; // Long header
+                                    && (data[0] & 0x80) != 0;
 
                                 if is_initial {
                                     if endpoint.routing_table.len() >= MAX_ACTIVE_CONNECTIONS {
@@ -253,6 +260,21 @@ impl ZtEndpoint {
         Err(ZtError::ActorFailed)
     }
 
+    /// Sends an unreliable datagram on a connection.
+    pub async fn send_datagram(&self, cid: &[u8], data: Bytes) -> Result<()> {
+        if let Some(tx) = self.routing_table.get(cid) {
+            let (resp_tx, resp_rx) = oneshot::channel();
+            tx.send(ActorMessage::SendDatagram {
+                data,
+                respond_to: resp_tx,
+            })
+            .await
+            .map_err(|e| ZtError::Io(std::io::Error::other(format!("Actor send failed: {}", e))))?;
+            return resp_rx.await.unwrap_or(Err(ZtError::ActorFailed));
+        }
+        Err(ZtError::ActorFailed)
+    }
+
     /// Closes a specific stream within a connection.
     pub async fn close_stream(&self, cid: &[u8], stream_id: u32) -> Result<()> {
         if let Some(tx) = self.routing_table.get(cid) {
@@ -285,10 +307,6 @@ impl ZtEndpoint {
     }
 
     /// Accepts an incoming connection.
-    ///
-    /// This method holds the `Mutex` lock for the lifetime of the `recv()`
-    /// call (i.e. until a connection arrives). Calling `accept()` from
-    /// multiple tasks is safe and sequential.
     pub async fn accept(&self) -> Option<ZtConnectionHandle> {
         let mut rx = self.incoming_rx.lock().await;
         rx.recv().await
@@ -299,18 +317,19 @@ impl ZtEndpoint {
         Ok(self.socket.local_addr()?)
     }
 
-    /// Initiates a connection to a remote peer.
+    /// Connect to a remote peer. Blocks until the handshake completes.
     pub async fn connect(self: &Arc<Self>, addr: SocketAddr) -> Result<ZtConnectionHandle> {
         let mut scid = vec![0u8; 8];
-        rand::thread_rng().fill(&mut scid[..]);
         let mut dcid = vec![0u8; 8];
+        rand::thread_rng().fill(&mut scid[..]);
         rand::thread_rng().fill(&mut dcid[..]);
 
-        let mut conn = ZtConnection::new(addr, scid.clone(), dcid);
+        let mut conn = ZtConnection::new_with_cc(addr, scid.clone(), dcid.clone(), self.cc_algo);
         conn.state = ConnectionState::Handshaking;
 
         let (actor_tx, actor_rx) = mpsc::channel(1024);
         let (stream_tx, stream_rx) = mpsc::channel(128);
+        let (datagram_tx, datagram_rx) = mpsc::channel(1024);
 
         let (wait_tx, wait_rx) = oneshot::channel();
 
@@ -334,6 +353,7 @@ impl ZtEndpoint {
             self.routing_table.clone(),
             scid.clone(),
             stream_tx.clone(),
+            datagram_tx,
             true,
             actor_tx.clone(),
         );
@@ -343,7 +363,7 @@ impl ZtEndpoint {
 
         match tokio::time::timeout(std::time::Duration::from_secs(5), wait_rx).await {
             Ok(Ok(_)) => {
-                Ok(ZtConnectionHandle::new(self.clone(), scid, stream_rx))
+                Ok(ZtConnectionHandle::new(self.clone(), scid, stream_rx, datagram_rx))
             }
             _ => {
                 self.routing_table.remove(&scid);

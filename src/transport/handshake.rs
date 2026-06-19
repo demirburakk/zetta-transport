@@ -136,8 +136,8 @@ pub(crate) async fn handle_handshake(
     }
 
     // Handshake replay protection: Check if cookie has been processed before
-    if let Some(ref c) = cookie_data {
-        if c.len() == 40 {
+    if let Some(ref c) = cookie_data
+        && c.len() == 40 {
             let cookie_hmac: [u8; 32] = c[8..40].try_into().unwrap();
             
             // Periodically clean up expired entries (probabilistically to avoid lock contention on every packet)
@@ -153,7 +153,6 @@ pub(crate) async fn handle_handshake(
             }
             endpoint.handshake_replay_filter.insert(cookie_hmac, current_time);
         }
-    }
 
     {
         // Verify Ed25519 signature
@@ -207,7 +206,7 @@ pub(crate) async fn handle_handshake(
             return Err(ZtError::ConnectionIdExhausted);
         }
 
-        let mut new_conn = ZtConnection::new(addr, scid.clone(), header.scid.clone());
+        let mut new_conn = ZtConnection::new_with_cc(addr, scid.clone(), header.scid.clone(), endpoint.cc_algo);
         new_conn.bytes_received = original_data.len();
 
         let (data_tx, _data_rx) = mpsc::channel(2048);
@@ -230,6 +229,7 @@ pub(crate) async fn handle_handshake(
 
         let (actor_tx, actor_rx) = mpsc::channel(1024);
         let (stream_tx, stream_rx) = mpsc::channel(128);
+        let (datagram_tx, datagram_rx) = mpsc::channel(1024);
 
         // Server-side actor does not need the ephemeral secret (already consumed).
         // It is passed as None to eliminate the need for a dummy keypair.
@@ -249,6 +249,7 @@ pub(crate) async fn handle_handshake(
             endpoint.routing_table.clone(),
             scid.clone(),
             stream_tx.clone(),
+            datagram_tx,
             false,
             actor_tx.clone(),
         );
@@ -275,7 +276,7 @@ pub(crate) async fn handle_handshake(
 
         tokio::spawn(actor.run());
 
-        let conn_handle = ZtConnectionHandle::new(endpoint.clone(), scid.clone(), stream_rx);
+        let conn_handle = ZtConnectionHandle::new(endpoint.clone(), scid.clone(), stream_rx, datagram_rx);
 
         if endpoint.incoming_tx.try_send(conn_handle).is_err() {
             tracing::warn!(

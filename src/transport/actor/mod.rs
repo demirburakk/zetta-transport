@@ -40,6 +40,10 @@ pub(crate) enum ActorMessage {
         stream_id: u32,
     },
     Close,
+    SendDatagram {
+        data: Bytes,
+        respond_to: oneshot::Sender<Result<()>>,
+    },
 }
 
 /// Per-connection actor that owns all mutable connection state and
@@ -62,10 +66,21 @@ pub(crate) struct ZtConnectionActor {
     pub(super) scid: Vec<u8>,
     pub(super) last_active_stream_id: u32,
     pub(super) incoming_streams_tx: mpsc::Sender<ZtStream>,
+    pub(super) datagram_tx: mpsc::Sender<Bytes>,
     pub(super) next_stream_id: u32,
     pub(super) is_client: bool,
     pub(super) actor_tx: mpsc::Sender<ActorMessage>,
     pub(super) socket_blocked: bool,
+
+    // Path validation state variables:
+    /// Target candidate address representing the new socket route under validation.
+    pub(super) pending_validation_addr: Option<SocketAddr>,
+    /// Secure 8-byte random token sent in the PathChallenge frame.
+    pub(super) path_validation_token: Option<[u8; 8]>,
+    /// Timestamp of when the last PathChallenge was sent (used to check RTT timeout).
+    pub(super) path_validation_sent_at: Option<std::time::Instant>,
+    /// Current count of PathChallenge retransmission retries (up to 3).
+    pub(super) path_validation_retries: u32,
 }
 
 impl ZtConnectionActor {
@@ -84,6 +99,7 @@ impl ZtConnectionActor {
         routing_table: Arc<DashMap<Vec<u8>, mpsc::Sender<ActorMessage>>>,
         scid: Vec<u8>,
         incoming_streams_tx: mpsc::Sender<ZtStream>,
+        datagram_tx: mpsc::Sender<Bytes>,
         is_client: bool,
         actor_tx: mpsc::Sender<ActorMessage>,
     ) -> Self {
@@ -106,10 +122,15 @@ impl ZtConnectionActor {
             scid,
             last_active_stream_id: 0,
             incoming_streams_tx,
+            datagram_tx,
             next_stream_id,
             is_client,
             actor_tx,
             socket_blocked: false,
+            pending_validation_addr: None,
+            path_validation_token: None,
+            path_validation_sent_at: None,
+            path_validation_retries: 0,
         }
     }
 

@@ -23,13 +23,19 @@ pub(crate) enum UnackedPayload {
         max_data: u64,
     },
     Close,
+    /// Unreliable datagram transmission payload.
+    Datagram {
+        /// The raw payload of the datagram.
+        data: Bytes,
+    },
 }
 
 impl UnackedPayload {
     pub(crate) fn len(&self) -> usize {
         match self {
             UnackedPayload::Initial { .. } => 0,
-            UnackedPayload::Stream { data, .. } => data.len(),
+            UnackedPayload::Stream { data, .. }
+            | UnackedPayload::Datagram { data, .. } => data.len(),
             UnackedPayload::MtuProbe { target_size } => *target_size,
             UnackedPayload::StreamClose { .. }
             | UnackedPayload::MaxStreamData { .. }

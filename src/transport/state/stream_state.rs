@@ -14,6 +14,10 @@ pub(crate) struct StreamState {
     pub(crate) window_opened: Arc<Notify>,
     pub(crate) app_tx: mpsc::Sender<Bytes>,
     pub(crate) last_sent_max_data: u64,
+    /// Timestamp of the last auto-tuning flow control window check/update.
+    pub(crate) last_window_update: std::time::Instant,
+    /// Total bytes consumed by the application from the stream within the current auto-tuning epoch.
+    pub(crate) bytes_read_in_epoch: usize,
 }
 
 impl StreamState {
@@ -29,6 +33,8 @@ impl StreamState {
             window_opened,
             app_tx,
             last_sent_max_data: window_size,
+            last_window_update: std::time::Instant::now(),
+            bytes_read_in_epoch: 0,
         }
     }
 }

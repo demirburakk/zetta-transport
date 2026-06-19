@@ -8,6 +8,7 @@ use ed25519_dalek::Signer;
 use sha2::Digest;
 use std::io::IoSlice;
 use std::time::{Duration, Instant as StdInstant};
+use std::net::SocketAddr;
 
 const KEY_UPDATE_PACKET_INTERVAL: u64 = 1 << 20;
 
@@ -36,6 +37,46 @@ impl ZtConnectionActor {
         {
             tracing::warn!("Amplification limit reached, dropping packet");
             return Ok(());
+        }
+
+        #[cfg(any(test, feature = "testing"))]
+        {
+            if self.state.state == ConnectionState::Active {
+                let loss_rate = crate::simulation::get_loss_rate();
+                if loss_rate > 0 {
+                    use rand::Rng;
+                    let roll = rand::thread_rng().gen_range(0..100);
+                    if roll < loss_rate {
+                        tracing::debug!("[SIM] Loss simulation: dropping packet of len {}", total_len);
+                        self.state.bytes_sent += total_len;
+                        return Ok(());
+                    }
+                }
+
+                let reorder_rate = crate::simulation::get_reorder_rate();
+                let reorder_delay = crate::simulation::get_reorder_delay();
+                if reorder_rate > 0 && reorder_delay > 0 {
+                    use rand::Rng;
+                    let roll = rand::thread_rng().gen_range(0..100);
+                    if roll < reorder_rate {
+                        tracing::debug!("[SIM] Reorder simulation: delaying packet of len {} by {}ms", total_len, reorder_delay);
+                        self.state.bytes_sent += total_len;
+                        let socket = self.socket.clone();
+                        let addr = self.state.addr;
+                        
+                        let mut buf = Vec::with_capacity(total_len);
+                        for slice in iov {
+                            buf.extend_from_slice(slice);
+                        }
+                        
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(reorder_delay as u64)).await;
+                            let _ = socket.send_to(&buf, addr).await;
+                        });
+                        return Ok(());
+                    }
+                }
+            }
         }
 
         let res = if iov.len() == 1 {
@@ -202,7 +243,7 @@ impl ZtConnectionActor {
         let to_send_len_usize = to_send_len as usize;
         let queued_bytes = self.state.queued_bytes;
         
-        if self.state.bytes_in_flight + to_send_len_usize + queued_bytes > self.state.cwnd {
+        if self.state.bytes_in_flight + to_send_len_usize + queued_bytes > self.state.cc.cwnd() {
             return Err(ZtError::CongestionWindowFull);
         }
 
@@ -231,7 +272,7 @@ impl ZtConnectionActor {
         }
         let now = StdInstant::now();
         // 1.25x pacing multiplier to ensure full window utilization under timer jitter
-        let rate = (self.state.cwnd as f64 * 1.25) / self.state.rtt.as_secs_f64().max(0.00001);
+        let rate = (self.state.cc.cwnd() as f64 * 1.25) / self.state.rtt.as_secs_f64().max(0.00001);
         if let Some(last) = self.state.last_pacing_update {
             let elapsed = now.duration_since(last).as_secs_f64();
             self.state.pacing_tokens += rate * elapsed;
@@ -295,7 +336,9 @@ impl ZtConnectionActor {
             let backoff_multiplier = 1_u32.checked_shl(up.retries).unwrap_or(64).min(64);
             let packet_rto = (rto * backoff_multiplier).min(Duration::from_secs(10));
             if now.duration_since(up.sent_at) > packet_rto {
-                if up.is_mtu_probe {
+                // MTU probes and unreliable datagram payloads are never retransmitted.
+                // Upon RTO expiration, they are discarded from the unacked tracking table.
+                if up.is_mtu_probe || matches!(up.payload, UnackedPayload::Datagram { .. }) {
                     to_drop.push(pn);
                 } else {
                     up.retries += 1;
@@ -334,7 +377,7 @@ impl ZtConnectionActor {
 
         if !payloads_to_resend.is_empty() {
             tracing::debug!("RTO Retransmitting {} packets", payloads_to_resend.len());
-            self.state.handle_loss();
+            self.state.cc.on_congestion_event(self.state.rtt, StdInstant::now());
             for (payload, retries) in payloads_to_resend {
                 if let Err(e) = self.retransmit_payload(payload, retries) {
                     tracing::warn!("Failed to retransmit: {}", e);
@@ -365,6 +408,15 @@ impl ZtConnectionActor {
             self.state.unpaced_queue.push_front((payload, 0));
         }
         Ok(())
+    }
+
+    /// Dispatches an unreliable datagram payload to the peer.
+    /// Wraps the payload in `UnackedPayload::Datagram` and routes it through the standard
+    /// congestion-controlled packet sending pipeline, registering it as unacknowledged
+    /// bytes without marking it for retransmission.
+    pub(super) fn send_datagram_payload(&mut self, data: Bytes) -> Result<()> {
+        let payload = UnackedPayload::Datagram { data };
+        self.send_payload(payload)
     }
 
     fn send_payload_with_retries(&mut self, payload: UnackedPayload, retries: u32) -> Result<()> {
@@ -420,6 +472,9 @@ impl ZtConnectionActor {
             }
             UnackedPayload::Close => {
                 Frame::ConnectionClose.encode(&mut packet);
+            }
+            UnackedPayload::Datagram { data } => {
+                Frame::Datagram { data: data.clone() }.encode(&mut packet);
             }
         }
 
@@ -494,7 +549,7 @@ impl ZtConnectionActor {
         let h_len = p.len();
 
         let mut hasher = sha2::Sha256::new();
-        sha2::Digest::update(&mut hasher, &1u32.to_be_bytes());
+        sha2::Digest::update(&mut hasher, 1u32.to_be_bytes());
         sha2::Digest::update(&mut hasher, &self.state.scid);
         sha2::Digest::update(&mut hasher, &self.state.dcid);
         sha2::Digest::update(&mut hasher, self.public_key.as_bytes());
@@ -551,5 +606,49 @@ impl ZtConnectionActor {
         self.note_packet_sent();
 
         Ok(())
+    }
+
+    pub(super) fn send_frame_immediate(&mut self, frame: Frame, to_addr: SocketAddr) -> Result<()> {
+        let pn = self.state.get_next_packet_number()?;
+        let kp = self.current_key_phase();
+        let lowest_unacked = self.state.unacked_packets.keys().next().unwrap_or(pn);
+        let (_, pn_len) =
+            crate::protocol::packet_number::truncate_pn(pn, lowest_unacked.saturating_sub(1));
+        let header = PacketHeader {
+            p_type: PacketType::Data,
+            is_long: false,
+            version: 0,
+            dcid: self.state.dcid.clone(),
+            scid: vec![],
+            packet_number: pn,
+            key_phase: kp,
+            pn_len,
+        };
+
+        let mut packet = BytesMut::with_capacity(256);
+        header.encode(&mut packet);
+        let h_len = packet.len();
+        frame.encode(&mut packet);
+
+        let p_len = packet.len() - h_len;
+        packet.put_bytes(0, 16);
+        let crypto = self.state.crypto.as_mut().ok_or(ZtError::Unauthorized)?;
+        {
+            let p = packet.as_mut();
+            let (aad, rest) = p.split_at_mut(h_len);
+            let (payload_space, tag_space) = rest.split_at_mut(p_len);
+            let tag = crypto.encrypt_in_place(pn, aad, payload_space)?;
+            tag_space.copy_from_slice(&tag);
+        }
+        if let Some(offset) = PacketHeader::get_pn_offset(packet.as_mut()) {
+            crypto.apply_header_protection(packet.as_mut(), offset)?;
+        }
+        let frozen = packet.freeze();
+        
+        let old_addr = self.state.addr;
+        self.state.addr = to_addr;
+        let res = self.sendmsg_vectored(&[std::io::IoSlice::new(&frozen)]);
+        self.state.addr = old_addr;
+        res
     }
 }

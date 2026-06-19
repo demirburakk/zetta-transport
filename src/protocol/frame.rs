@@ -81,6 +81,24 @@ pub enum Frame {
     MaxData {
         max_data: u64,
     },
+    /// Unreliable datagram transmission frame containing raw bytes.
+    /// Bypasses stream sequencing and packet retransmissions.
+    Datagram {
+        /// The raw datagram payload.
+        data: Bytes,
+    },
+    /// Path challenge frame used to validate a new network path (e.g. client IP migration).
+    /// Contains an 8-byte random token sent to check for address reachability.
+    PathChallenge {
+        /// 8-byte secure random challenge token.
+        data: [u8; 8],
+    },
+    /// Path response frame sent back on the same path where the PathChallenge was received.
+    /// echoes back the 8-byte token to prove the path is bidirectional and alive.
+    PathResponse {
+        /// 8-byte token copied from the challenge.
+        data: [u8; 8],
+    },
 }
 
 impl Frame {
@@ -146,6 +164,19 @@ impl Frame {
             Frame::MaxData { max_data } => {
                 dst.put_u8(0x08);
                 dst.put_u64(*max_data);
+            }
+            Frame::Datagram { data } => {
+                dst.put_u8(0x09);
+                put_varint(dst, data.len() as u64);
+                dst.put_slice(data);
+            }
+            Frame::PathChallenge { data } => {
+                dst.put_u8(0x0A);
+                dst.put_slice(data);
+            }
+            Frame::PathResponse { data } => {
+                dst.put_u8(0x0B);
+                dst.put_slice(data);
             }
         }
     }
@@ -267,6 +298,30 @@ impl Frame {
                 }
                 let max_data = src.get_u64();
                 Ok(Frame::MaxData { max_data })
+            }
+            0x09 => {
+                let len = get_varint(src)? as usize;
+                if src.remaining() < len {
+                    return Err(ZtError::InvalidPacket("Datagram frame truncated".into()));
+                }
+                let data = src.copy_to_bytes(len);
+                Ok(Frame::Datagram { data })
+            }
+            0x0A => {
+                if src.remaining() < 8 {
+                    return Err(ZtError::InvalidPacket("PathChallenge frame too short".into()));
+                }
+                let mut data = [0u8; 8];
+                src.copy_to_slice(&mut data);
+                Ok(Frame::PathChallenge { data })
+            }
+            0x0B => {
+                if src.remaining() < 8 {
+                    return Err(ZtError::InvalidPacket("PathResponse frame too short".into()));
+                }
+                let mut data = [0u8; 8];
+                src.copy_to_slice(&mut data);
+                Ok(Frame::PathResponse { data })
             }
             _ => Err(ZtError::InvalidPacket(format!(
                 "Unknown frame type: {}",

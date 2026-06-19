@@ -92,12 +92,11 @@ impl StreamReceiveBuffer {
         }
 
         // Also check if there's a range starting just after `end` that's adjacent.
-        if let Some((&rs, &re)) = self.received_ranges.range(end..).next() {
-            if rs <= merged_end {
+        if let Some((&rs, &re)) = self.received_ranges.range(end..).next()
+            && rs <= merged_end {
                 merged_end = merged_end.max(re);
                 to_remove.push(rs);
             }
-        }
 
         for key in to_remove {
             self.received_ranges.remove(&key);
@@ -143,16 +142,42 @@ impl StreamReceiveBuffer {
                 self.received_ranges.remove(&key);
             }
             // Trim the first remaining range if it starts before read_head.
-            if let Some((&rs, &re)) = self.received_ranges.iter().next() {
-                if rs < self.read_head && re > self.read_head {
+            if let Some((&rs, &re)) = self.received_ranges.iter().next()
+                && rs < self.read_head && re > self.read_head {
                     self.received_ranges.remove(&rs);
                     self.received_ranges.insert(self.read_head, re);
                 }
-            }
 
             return Some(out.freeze());
         }
         None
+    }
+
+    /// Resizes the receive buffer's capacity.
+    /// Safely handles indices wrap-around mapping from the old circular layout to the new one,
+    /// preserving all bytes between `read_head` and `write_head`.
+    pub(crate) fn resize(&mut self, new_capacity: usize) {
+        if new_capacity == self.capacity {
+            return;
+        }
+        if self.buffer.is_empty() {
+            self.capacity = new_capacity;
+            return;
+        }
+        let mut new_buf = vec![0u8; new_capacity];
+        let old_cap = self.capacity;
+        
+        // Copy unread data bytes from the old circular indices to the new circular indices.
+        let mut offset = self.read_head;
+        while offset < self.write_head {
+            let old_idx = (offset % old_cap as u64) as usize;
+            let new_idx = (offset % new_capacity as u64) as usize;
+            new_buf[new_idx] = self.buffer[old_idx];
+            offset += 1;
+        }
+        
+        self.buffer = new_buf;
+        self.capacity = new_capacity;
     }
 }
 
@@ -229,5 +254,20 @@ mod tests {
         assert_eq!(added3, 5);
         let chunk = buf.read_contiguous().unwrap();
         assert_eq!(chunk.len(), 10);
+    }
+
+    #[test]
+    fn test_resize() {
+        let mut buf = StreamReceiveBuffer::new(16);
+        buf.write(0, b"0123456789abcdef").unwrap();
+        let chunk1 = buf.read_contiguous().unwrap();
+        assert_eq!(&chunk1[..], b"0123456789abcdef");
+        
+        buf.write(16, b"1234").unwrap();
+        buf.resize(32);
+        
+        buf.write(20, b"5678").unwrap();
+        let chunk2 = buf.read_contiguous().unwrap();
+        assert_eq!(&chunk2[..], b"12345678");
     }
 }

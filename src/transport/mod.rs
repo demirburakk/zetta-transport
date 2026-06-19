@@ -5,3 +5,5 @@ pub(crate) mod cookie;
 pub mod endpoint;
 pub(crate) mod handshake;
 pub(crate) mod state;
+
+pub use congestion::CongestionControlAlgorithm;

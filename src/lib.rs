@@ -78,3 +78,7 @@ pub mod error;
 pub(crate) mod protocol;
 pub mod stream;
 pub mod transport;
+
+#[cfg(any(test, feature = "testing"))]
+pub mod simulation;
+

@@ -9,6 +9,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
+use rand::Rng;
 
 impl ZtConnectionActor {
     pub(super) fn process_incoming_packet(
@@ -31,11 +32,8 @@ impl ZtConnectionActor {
             && let Some(dcid) = crate::protocol::routing::extract_dcid_fast(&mutable_data)
         {
             let is_retry = ((mutable_data[0] >> 2) & 0x0F) == 0x0C;
-            let is_initial = ((mutable_data[0] >> 2) & 0x0F) == 0;
-            if !is_retry && !is_initial {
-                let crypto = crate::crypto::CryptoContext::initial(&dcid, true);
-                crypto.remove_header_protection(&mut mutable_data, offset)?;
-            } else if is_initial {
+            let _is_initial = ((mutable_data[0] >> 2) & 0x0F) == 0;
+            if !is_retry {
                 let crypto = crate::crypto::CryptoContext::initial(&dcid, true);
                 crypto.remove_header_protection(&mut mutable_data, offset)?;
             }
@@ -141,13 +139,26 @@ impl ZtConnectionActor {
                     self.state.state = ConnectionState::Active;
                 }
 
-                self.state.addr = addr;
+                if self.state.state == ConnectionState::Active && self.state.addr != addr {
+                    if self.pending_validation_addr != Some(addr) {
+                        let mut token = [0u8; 8];
+                        rand::thread_rng().fill(&mut token);
+                        self.pending_validation_addr = Some(addr);
+                        self.path_validation_token = Some(token);
+                        self.path_validation_sent_at = Some(std::time::Instant::now());
+                        self.path_validation_retries = 0;
+                        let challenge = Frame::PathChallenge { data: token };
+                        let _ = self.send_frame_immediate(challenge, addr);
+                    }
+                } else if self.state.state == ConnectionState::Handshaking {
+                    self.state.addr = addr;
+                }
                 self.state.mark_processed(header.packet_number);
 
                 let mut payload_bytes = payload_buf.freeze();
                 while payload_bytes.remaining() > 0 {
                     if let Ok(frame) = Frame::decode(&mut payload_bytes) {
-                        self.handle_frame(frame, header.packet_number)?;
+                        self.handle_frame(frame, header.packet_number, addr)?;
                     } else {
                         break;
                     }
@@ -158,7 +169,7 @@ impl ZtConnectionActor {
         }
     }
 
-    fn handle_frame(&mut self, frame: Frame, _pn: u64) -> Result<()> {
+    fn handle_frame(&mut self, frame: Frame, _pn: u64, addr: SocketAddr) -> Result<()> {
         match frame {
             Frame::Stream { id, offset, data } => {
                 if !self.state.streams.contains_key(&id) {
@@ -305,6 +316,25 @@ impl ZtConnectionActor {
                     }
                 }
             }
+            Frame::Datagram { data } => {
+                let _ = self.datagram_tx.try_send(data);
+            }
+            Frame::PathChallenge { data } => {
+                let response = Frame::PathResponse { data };
+                let _ = self.send_frame_immediate(response, addr);
+            }
+            Frame::PathResponse { data } => {
+                if Some(data) == self.path_validation_token
+                    && let Some(a) = self.pending_validation_addr
+                        && a == addr {
+                            tracing::info!("Path validation succeeded for address {:?}", addr);
+                            self.state.addr = addr;
+                            self.pending_validation_addr = None;
+                            self.path_validation_token = None;
+                            self.path_validation_sent_at = None;
+                            self.path_validation_retries = 0;
+                        }
+            }
             _ => {}
         }
         Ok(())
@@ -316,17 +346,43 @@ impl ZtConnectionActor {
         };
 
         let mut forwarded = false;
+        let mut bytes_forwarded = 0;
         while let Some(chunk) = stream.receive_buffer.read_contiguous() {
             stream.buffered_bytes =
                 stream.buffered_bytes.saturating_sub(chunk.len());
+            let chunk_len = chunk.len();
             if stream.app_tx.try_send(chunk).is_ok() {
                 forwarded = true;
+                bytes_forwarded += chunk_len;
             } else {
                 break;
             }
         }
         
         stream.expected_rx_offset = stream.receive_buffer.read_head;
+
+        // Auto-tuning flow control (BDP/RTT heuristics):
+        // If the application reads more than half of the stream window size within two
+        // Round-Trip Times (2 * RTT), the stream window size is likely the throughput bottleneck.
+        // In response, we double the window capacity (capped at a maximum of 16MB) and resize
+        // the circular receive buffer dynamically to accommodate the larger incoming flight of packets.
+        if bytes_forwarded > 0 {
+            stream.bytes_read_in_epoch += bytes_forwarded;
+            if stream.bytes_read_in_epoch >= (stream.window_size / 2) as usize {
+                let elapsed = stream.last_window_update.elapsed();
+                let rtt = self.state.rtt;
+                if elapsed < rtt * 2 {
+                    let new_window = (stream.window_size * 2).min(16 * 1024 * 1024);
+                    if new_window > stream.window_size {
+                        tracing::info!("Auto-tuning: Scaling up stream {} window size from {} to {}", stream_id, stream.window_size, new_window);
+                        stream.receive_buffer.resize(new_window as usize);
+                        stream.window_size = new_window;
+                    }
+                }
+                stream.bytes_read_in_epoch = 0;
+                stream.last_window_update = std::time::Instant::now();
+            }
+        }
 
         let max_data = stream.expected_rx_offset + stream.window_size;
         // Only update peer with MAX_STREAM_DATA when the window can be extended

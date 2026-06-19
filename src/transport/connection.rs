@@ -33,14 +33,7 @@ pub(crate) struct ZtConnection {
     pub(crate) local_window: u32,
     pub(crate) remote_window: u32,
 
-    pub(crate) cwnd: usize,
-    pub(crate) ssthresh: usize,
-    pub(crate) cubic_w_max: f64,
-    pub(crate) cubic_k: f64,
-    pub(crate) last_congestion_time: Option<std::time::Instant>,
-    pub(crate) last_cubic_update: Option<std::time::Instant>,
-    pub(crate) cubic_epoch_start: Option<std::time::Instant>,
-    pub(crate) target_cwnd: usize,
+    pub(crate) cc: Box<dyn crate::transport::congestion::CongestionController>,
     pub(crate) pacing_tokens: f64,
     pub(crate) last_pacing_update: Option<std::time::Instant>,
     pub(crate) bytes_in_flight: usize,
@@ -72,7 +65,28 @@ impl ZtConnection {
     // stream buffer memory to ~100MB max per connection.
     pub(crate) const MAX_CONCURRENT_STREAMS: usize = 100;
 
+    #[allow(dead_code)]
     pub(crate) fn new(addr: SocketAddr, scid: Vec<u8>, dcid: Vec<u8>) -> Self {
+        Self::new_with_cc(addr, scid, dcid, crate::transport::congestion::CongestionControlAlgorithm::Cubic)
+    }
+
+    pub(crate) fn new_with_cc(
+        addr: SocketAddr,
+        scid: Vec<u8>,
+        dcid: Vec<u8>,
+        cc_algo: crate::transport::congestion::CongestionControlAlgorithm,
+    ) -> Self {
+        let initial_cwnd = 10 * 1200;
+        let mtu = 1200;
+        let cc: Box<dyn crate::transport::congestion::CongestionController> = match cc_algo {
+            crate::transport::congestion::CongestionControlAlgorithm::Cubic => {
+                Box::new(crate::transport::congestion::CubicController::new(initial_cwnd, mtu))
+            }
+            crate::transport::congestion::CongestionControlAlgorithm::Reno => {
+                Box::new(crate::transport::congestion::RenoController::new(initial_cwnd, mtu))
+            }
+        };
+
         Self {
             addr,
             dcid,
@@ -92,19 +106,12 @@ impl ZtConnection {
             local_window: 1024 * 1024,
             remote_window: 1024 * 1024,
 
-            cwnd: 10 * 1200,
-            ssthresh: usize::MAX,
-            cubic_w_max: 0.0,
-            cubic_k: 0.0,
-            last_congestion_time: None,
-            last_cubic_update: None,
-            cubic_epoch_start: None,
-            target_cwnd: 10 * 1200,
+            cc,
             pacing_tokens: 12000.0, // Initial burst
             last_pacing_update: None,
             bytes_in_flight: 0,
-            mtu: 1200,
-            shared_mtu: Arc::new(std::sync::atomic::AtomicUsize::new(1200)),
+            mtu,
+            shared_mtu: Arc::new(std::sync::atomic::AtomicUsize::new(mtu)),
             mtu_min: 1200,
             mtu_max: 9000,
             bytes_received: 0,

@@ -2,6 +2,7 @@ use super::ActorMessage;
 use super::ZtConnectionActor;
 use crate::stream::ZtStream;
 use crate::transport::state::{ConnectionState, StreamState};
+use crate::protocol::frame::Frame;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
@@ -135,6 +136,23 @@ impl ZtConnectionActor {
                             idle_timer.as_mut().reset(idle_deadline);
                             unacked_changed = true;
                         }
+                        ActorMessage::SendDatagram { data, respond_to } => {
+                            let data_len = data.len();
+                            if self.state.bytes_in_flight + data_len > self.state.cc.cwnd() {
+                                let _ = respond_to.send(Err(crate::error::ZtError::CongestionWindowFull));
+                            } else {
+                                let result = self.send_datagram_payload(data);
+                                unacked_changed = true;
+                                if let Some(wait) = self.flush_pacing_queue() {
+                                    pacing_deadline = TokioInstant::now() + wait;
+                                    pacing_timer.as_mut().reset(pacing_deadline);
+                                } else {
+                                    pacing_deadline = TokioInstant::now() + SLEEP_FOREVER;
+                                    pacing_timer.as_mut().reset(pacing_deadline);
+                                }
+                                let _ = respond_to.send(result);
+                            }
+                        }
                     }
                 }
 
@@ -186,6 +204,35 @@ impl ZtConnectionActor {
 
                 _ = &mut idle_timer => { break; }
             }
+            // Periodic check for path validation challenge retransmissions
+            // Path Validation Timeout & Retransmission:
+            // Checks if a PathChallenge is outstanding. If the peer does not reply with a
+            // PathResponse within 2 * RTT (with a minimum of 50ms), we retransmit the challenge.
+            // We allow up to 3 retries. If validation fails after all retries, the new path
+            // is deemed invalid/unreachable, and we discard validation state, keeping the connection
+            // on its original verified path.
+            if let Some(sent_at) = self.path_validation_sent_at {
+                let rtt = self.state.rtt.max(Duration::from_millis(50));
+                if sent_at.elapsed() > rtt * 2 {
+                    if self.path_validation_retries < 3 {
+                        if let Some(addr) = self.pending_validation_addr
+                            && let Some(token) = self.path_validation_token {
+                                tracing::info!("Retransmitting PathChallenge to {:?} (retry {})", addr, self.path_validation_retries + 1);
+                                self.path_validation_retries += 1;
+                                self.path_validation_sent_at = Some(std::time::Instant::now());
+                                let challenge = Frame::PathChallenge { data: token };
+                                let _ = self.send_frame_immediate(challenge, addr);
+                            }
+                    } else {
+                        tracing::warn!("Path validation failed after 3 retries for address {:?}", self.pending_validation_addr);
+                        self.pending_validation_addr = None;
+                        self.path_validation_token = None;
+                        self.path_validation_sent_at = None;
+                        self.path_validation_retries = 0;
+                    }
+                }
+            }
+
             if unacked_changed {
                 self.update_rto_timer(rto_timer.as_mut());
             }
