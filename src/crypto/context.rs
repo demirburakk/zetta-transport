@@ -282,6 +282,54 @@ impl CryptoContext {
     }
 }
 
+impl super::CryptoEngine for CryptoContext {
+    fn encrypt_in_place(
+        &self,
+        packet_number: u64,
+        aad: &[u8],
+        payload: &mut [u8],
+    ) -> Result<[u8; 16]> {
+        self.encrypt_in_place(packet_number, aad, payload)
+    }
+
+    fn decrypt_in_place(
+        &self,
+        packet_number: u64,
+        aad: &[u8],
+        payload: &mut [u8],
+        tag: &[u8; 16],
+        use_prev_key: bool,
+    ) -> Result<()> {
+        self.decrypt_in_place(packet_number, aad, payload, tag, use_prev_key)
+    }
+
+    fn trial_decrypt_and_rotate(
+        &mut self,
+        packet_number: u64,
+        aad: &[u8],
+        payload: &mut [u8],
+        tag: &[u8; 16],
+    ) -> Result<()> {
+        self.trial_decrypt_and_rotate(packet_number, aad, payload, tag)
+    }
+
+    fn apply_header_protection(&self, packet: &mut [u8], pn_offset: usize) -> Result<()> {
+        self.apply_header_protection(packet, pn_offset)
+    }
+
+    fn remove_header_protection(&self, packet: &mut [u8], pn_offset: usize) -> Result<()> {
+        self.remove_header_protection(packet, pn_offset)
+    }
+
+    fn rotate_keys(&mut self) {
+        self.rotate_keys()
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,51 +426,5 @@ mod tests {
     }
 }
 
-impl super::CryptoEngine for CryptoContext {
-    fn encrypt_in_place(
-        &self,
-        packet_number: u64,
-        aad: &[u8],
-        payload: &mut [u8],
-    ) -> Result<[u8; 16]> {
-        self.encrypt_in_place(packet_number, aad, payload)
-    }
 
-    fn decrypt_in_place(
-        &self,
-        packet_number: u64,
-        aad: &[u8],
-        payload: &mut [u8],
-        tag: &[u8; 16],
-        use_prev_key: bool,
-    ) -> Result<()> {
-        self.decrypt_in_place(packet_number, aad, payload, tag, use_prev_key)
-    }
-
-    fn trial_decrypt_and_rotate(
-        &mut self,
-        packet_number: u64,
-        aad: &[u8],
-        payload: &mut [u8],
-        tag: &[u8; 16],
-    ) -> Result<()> {
-        self.trial_decrypt_and_rotate(packet_number, aad, payload, tag)
-    }
-
-    fn apply_header_protection(&self, packet: &mut [u8], pn_offset: usize) -> Result<()> {
-        self.apply_header_protection(packet, pn_offset)
-    }
-
-    fn remove_header_protection(&self, packet: &mut [u8], pn_offset: usize) -> Result<()> {
-        self.remove_header_protection(packet, pn_offset)
-    }
-
-    fn rotate_keys(&mut self) {
-        self.rotate_keys()
-    }
-
-    fn epoch(&self) -> u64 {
-        self.epoch
-    }
-}
 

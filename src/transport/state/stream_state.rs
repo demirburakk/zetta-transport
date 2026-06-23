@@ -25,6 +25,7 @@ pub(crate) struct StreamState {
     pub(crate) last_window_update: std::time::Instant,
     /// Total bytes consumed by the application from the stream within the current auto-tuning epoch.
     pub(crate) bytes_read_in_epoch: usize,
+    #[allow(dead_code)]
     pub(crate) stream_type: StreamType,
 }
 

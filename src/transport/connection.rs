@@ -21,8 +21,11 @@ pub(crate) struct ZtConnection {
     pub(crate) state: ConnectionState,
     pub(crate) next_packet_number: u64,
     pub(crate) crypto: Option<Box<dyn CryptoEngine>>,
+    #[allow(dead_code)]
     pub(crate) initial_space: PacketSpace,
+    #[allow(dead_code)]
     pub(crate) handshake_space: PacketSpace,
+    #[allow(dead_code)]
     pub(crate) app_space: PacketSpace,
 
     pub(crate) streams: HashMap<u32, StreamState>,
@@ -69,6 +72,7 @@ pub(crate) struct ZtConnection {
 impl ZtConnection {
     // Maximum concurrent streams allowed. With 1MB window_size, this limits total
     // stream buffer memory to ~100MB max per connection.
+    #[allow(dead_code)]
     pub(crate) const MAX_CONCURRENT_STREAMS: usize = 100;
 
     #[allow(dead_code)]

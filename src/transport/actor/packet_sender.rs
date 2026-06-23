@@ -288,11 +288,7 @@ impl ZtConnectionActor {
         }
         self.state.last_pacing_update = Some(now);
 
-        loop {
-            let (payload, retries) = match self.state.unpaced_queue.front() {
-                Some((p, r)) => (p.clone(), *r),
-                None => break,
-            };
+        while let Some((payload, retries)) = self.state.unpaced_queue.front().cloned() {
             
             let len = payload.len() as f64;
             let payload_len = payload.len();

@@ -86,17 +86,17 @@ async fn test_rtt_ack_delay_compensation() -> Result<(), Box<dyn std::error::Err
     let server_addr = server.local_addr()?;
 
     let server_handle = tokio::spawn(async move {
-        if let Some(mut conn) = server.accept().await {
-            if let Some(mut stream) = conn.accept_stream().await {
-                let mut buf = vec![0u8; 7];
-                let _ = stream.read_exact(&mut buf).await.unwrap();
-                
-                // Simulate a receiver processing delay (e.g. 150ms delay)
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                
-                stream.write_all(b"response").await.unwrap();
-                stream.flush().await.unwrap();
-            }
+        if let Some(mut conn) = server.accept().await
+            && let Some(mut stream) = conn.accept_stream().await
+        {
+            let mut buf = vec![0u8; 7];
+            let _ = stream.read_exact(&mut buf).await.unwrap();
+            
+            // Simulate a receiver processing delay (e.g. 150ms delay)
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            
+            stream.write_all(b"response").await.unwrap();
+            stream.flush().await.unwrap();
         }
     });
 

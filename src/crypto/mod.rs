@@ -34,5 +34,6 @@ pub(crate) trait CryptoEngine: Send + Sync {
     fn remove_header_protection(&self, packet: &mut [u8], pn_offset: usize) -> crate::error::Result<()>;
 
     fn rotate_keys(&mut self);
+    #[allow(dead_code)]
     fn epoch(&self) -> u64;
 }

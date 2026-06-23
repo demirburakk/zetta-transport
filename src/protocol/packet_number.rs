@@ -33,7 +33,7 @@ pub(crate) fn expand_pn(pn_truncated: u64, pn_len: usize, largest_pn: u64) -> u6
 
     if expected_pn >= pn_hwin && candidate_pn <= expected_pn - pn_hwin {
         candidate_pn.saturating_add(pn_win)
-    } else if expected_pn.checked_add(pn_hwin).map_or(false, |limit| candidate_pn > limit)
+    } else if expected_pn.checked_add(pn_hwin).is_some_and(|limit| candidate_pn > limit)
         && candidate_pn >= pn_win
     {
         candidate_pn.saturating_sub(pn_win)

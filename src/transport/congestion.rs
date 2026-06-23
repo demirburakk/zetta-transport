@@ -257,7 +257,7 @@ impl ZtConnection {
 
     /// Marks a packet number as processed in the replay bitmask and ACK tracker.
     pub(crate) fn mark_processed(&mut self, pn: u64) {
-        let is_new_highest = self.ack_tracker.highest_processed.map_or(true, |h| pn >= h);
+        let is_new_highest = self.ack_tracker.highest_processed.is_none_or(|h| pn >= h);
         if is_new_highest {
             self.largest_acked_received_at = Some(std::time::Instant::now());
         }
