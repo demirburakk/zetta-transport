@@ -6,6 +6,7 @@ mod packet_sender;
 use crate::error::Result;
 use crate::stream::ZtStream;
 use crate::transport::connection::ZtConnection;
+use crate::transport::state::StreamType;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -33,6 +34,7 @@ pub(crate) enum ActorMessage {
         stream_id: u32,
     },
     OpenStream {
+        stream_type: StreamType,
         respond_to: oneshot::Sender<Result<ZtStream>>,
     },
     SetHandshakePacket(Bytes),

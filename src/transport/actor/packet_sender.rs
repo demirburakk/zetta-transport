@@ -198,9 +198,12 @@ impl ZtConnectionActor {
         header.encode(&mut packet);
         let header_len = packet.len();
         let ack_ranges = self.state.get_ack_ranges();
+        let ack_delay = self.state.largest_acked_received_at
+            .map_or(0, |t| t.elapsed().as_micros() as u64);
         Frame::Ack {
             largest_acked: self.state.ack_tracker.highest_processed.unwrap_or(0),
             window_size: self.state.local_window,
+            ack_delay,
             ack_ranges,
         }
         .encode(&mut packet);
@@ -285,18 +288,37 @@ impl ZtConnectionActor {
         }
         self.state.last_pacing_update = Some(now);
 
-        while let Some((payload, retries)) = self.state.unpaced_queue.front() {
+        loop {
+            let (payload, retries) = match self.state.unpaced_queue.front() {
+                Some((p, r)) => (p.clone(), *r),
+                None => break,
+            };
+            
             let len = payload.len() as f64;
             let payload_len = payload.len();
-            let retries = *retries;
             
             if self.state.pacing_tokens >= len {
-                let (p, _) = self.state.unpaced_queue.front().unwrap().clone();
-                if let Err(e) = self.send_payload_with_retries(p, retries) {
+                if let Err(e) = self.send_payload_with_retries(payload, retries) {
                     if self.socket_blocked {
                         return None;
                     }
-                    tracing::warn!("Failed to send paced payload: {}. Retrying in 1ms.", e);
+                    if matches!(e, ZtError::Unauthorized | ZtError::Crypto(_) | ZtError::PacketNumberOverflow) {
+                        tracing::error!("Fatal error during paced send: {:?}. Closing connection.", e);
+                        self.state.state = ConnectionState::Closed;
+                        return None;
+                    }
+                    if let Some((_, r)) = self.state.unpaced_queue.front_mut() {
+                        *r += 1;
+                        let r_val = *r;
+                        if r_val > 10 {
+                            tracing::error!("Paced send failed after 10 retries. Closing connection.");
+                            self.state.state = ConnectionState::Closed;
+                            return None;
+                        }
+                        let backoff = std::time::Duration::from_millis(1 << r_val);
+                        tracing::warn!("Failed to send paced payload: {}. Retrying in {:?}.", e, backoff);
+                        return Some(backoff);
+                    }
                     return Some(std::time::Duration::from_millis(1));
                 }
                 self.state.unpaced_queue.pop_front();
@@ -307,12 +329,27 @@ impl ZtConnectionActor {
                 let wait_secs = deficit / rate;
                 // Sub-millisecond timer bypass
                 if wait_secs < 0.001 {
-                    let (p, _) = self.state.unpaced_queue.front().unwrap().clone();
-                    if let Err(e) = self.send_payload_with_retries(p, retries) {
+                    if let Err(e) = self.send_payload_with_retries(payload, retries) {
                         if self.socket_blocked {
                             return None;
                         }
-                        tracing::warn!("Failed to send paced payload: {}. Retrying in 1ms.", e);
+                        if matches!(e, ZtError::Unauthorized | ZtError::Crypto(_) | ZtError::PacketNumberOverflow) {
+                            tracing::error!("Fatal error during paced send: {:?}. Closing connection.", e);
+                            self.state.state = ConnectionState::Closed;
+                            return None;
+                        }
+                        if let Some((_, r)) = self.state.unpaced_queue.front_mut() {
+                            *r += 1;
+                            let r_val = *r;
+                            if r_val > 10 {
+                                tracing::error!("Paced send failed after 10 retries. Closing connection.");
+                                self.state.state = ConnectionState::Closed;
+                                return None;
+                            }
+                            let backoff = std::time::Duration::from_millis(1 << r_val);
+                            tracing::warn!("Failed to send paced payload: {}. Retrying in {:?}.", e, backoff);
+                            return Some(backoff);
+                        }
                         return Some(std::time::Duration::from_millis(1));
                     }
                     self.state.unpaced_queue.pop_front();
@@ -564,6 +601,7 @@ impl ZtConnectionActor {
             ed_public_key: *self.ed_public_key.as_bytes(),
             transcript_hash: transcript_hash.clone(),
             signature: self.ed_signing_key.as_ref().expect("Signing key missing").sign(&transcript_hash).to_bytes(),
+            alpn: self.endpoint.alpn.read().unwrap().clone(),
         }
         .encode(&mut p);
         if let Some(c) = cookie.clone() {

@@ -103,7 +103,24 @@ impl ZtConnectionActor {
                             }
                             unacked_changed = true;
                         }
-                        ActorMessage::OpenStream { respond_to } => {
+                        ActorMessage::OpenStream { stream_type, respond_to } => {
+                            let opened_count = if self.is_client {
+                                if self.next_stream_id >= 2 { (self.next_stream_id - 2) / 2 } else { 0 }
+                            } else {
+                                if self.next_stream_id >= 1 { (self.next_stream_id - 1) / 2 } else { 0 }
+                            } as u64;
+
+                            if opened_count >= self.state.peer_max_streams {
+                                let blocked_frame = Frame::StreamsBlocked { max_streams: self.state.peer_max_streams };
+                                if let Err(e) = self.send_frame_immediate(blocked_frame, self.state.addr) {
+                                    tracing::warn!("Failed to send StreamsBlocked frame: {:?}", e);
+                                }
+                                let _ = respond_to.send(Err(crate::error::ZtError::TooManyStreams {
+                                    limit: self.state.peer_max_streams as usize,
+                                }));
+                                continue;
+                            }
+
                             let stream_id = self.next_stream_id;
                             self.next_stream_id += 2;
 
@@ -111,7 +128,7 @@ impl ZtConnectionActor {
                             let window_opened = Arc::new(Notify::new());
                             self.state.streams.insert(
                                 stream_id,
-                                StreamState::new(data_tx, window_opened.clone()),
+                                StreamState::new(data_tx, window_opened.clone(), stream_type),
                             );
 
                             let stream = ZtStream::new(
@@ -121,6 +138,7 @@ impl ZtConnectionActor {
                                 self.state.closed.clone(),
                                 self.actor_tx.clone(),
                                 self.state.shared_mtu.clone(),
+                                stream_type,
                             );
                             let _ = respond_to.send(Ok(stream));
                         }

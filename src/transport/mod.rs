@@ -7,3 +7,4 @@ pub(crate) mod handshake;
 pub(crate) mod state;
 
 pub use congestion::CongestionControlAlgorithm;
+pub use state::StreamType;

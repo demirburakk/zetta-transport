@@ -1,5 +1,6 @@
 use super::connection::ZtConnection;
 use crate::transport::state::UnackedPayload;
+use std::time::Duration;
 
 /// Supported congestion control algorithms for ZettaTransport.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -256,6 +257,10 @@ impl ZtConnection {
 
     /// Marks a packet number as processed in the replay bitmask and ACK tracker.
     pub(crate) fn mark_processed(&mut self, pn: u64) {
+        let is_new_highest = self.ack_tracker.highest_processed.map_or(true, |h| pn >= h);
+        if is_new_highest {
+            self.largest_acked_received_at = Some(std::time::Instant::now());
+        }
         self.replay_window.mark_processed(pn);
         self.ack_tracker.mark_processed(pn);
     }
@@ -271,6 +276,7 @@ impl ZtConnection {
         &mut self,
         largest_acked_pn: u64,
         window_size: u32,
+        ack_delay_us: u64,
         sack_ranges: &[(u64, u64)],
         fast_retransmits: &mut Vec<(UnackedPayload, u32)>,
     ) {
@@ -285,7 +291,9 @@ impl ZtConnection {
             if lower <= upper {
                 for pn in lower..=upper {
                     if let Some(up) = self.unacked_packets.remove(pn) {
-                        bytes_acked += up.payload.len();
+                        if !up.is_mtu_probe {
+                            bytes_acked += up.payload.len();
+                        }
                         bytes_in_flight_acked += up.sent_bytes;
                         if sample_rtt.is_none() && up.retries == 0 {
                             sample_rtt = Some(up.sent_at.elapsed());
@@ -317,7 +325,9 @@ impl ZtConnection {
         }
         for pn in cumulative_acked {
             if let Some(up) = self.unacked_packets.remove(pn) {
-                bytes_acked += up.payload.len();
+                if !up.is_mtu_probe {
+                    bytes_acked += up.payload.len();
+                }
                 bytes_in_flight_acked += up.sent_bytes;
                 if sample_rtt.is_none() && up.retries == 0 {
                     sample_rtt = Some(up.sent_at.elapsed());
@@ -363,7 +373,11 @@ impl ZtConnection {
             .bytes_in_flight
             .saturating_sub(bytes_in_flight_acked);
 
-        if let Some(rtt) = sample_rtt {
+        if let Some(mut rtt) = sample_rtt {
+            let ack_delay = Duration::from_micros(ack_delay_us);
+            if rtt > ack_delay {
+                rtt -= ack_delay;
+            }
             if !self.rtt_initialized {
                 self.rtt = rtt;
                 self.rttvar = rtt / 2;

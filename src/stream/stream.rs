@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::transport::state::StreamType;
 use bytes::{Bytes, BytesMut, Buf};
 use std::sync::Arc;
 use std::future::Future;
@@ -14,8 +15,8 @@ enum WriteState {
     Sending {
         /// Receiver side of the confirmation channel from the actor.
         resp_rx: tokio::sync::oneshot::Receiver<crate::error::Result<()>>,
-        /// Length in bytes of the chunk currently in flight.
-        chunk_len: usize,
+        /// The chunk currently in flight.
+        chunk: Bytes,
     },
     /// The transmission was blocked because either the congestion window was full
     /// or the peer's flow control window was exhausted.
@@ -55,6 +56,7 @@ pub struct ZtStream {
     // Write buffering and state machine
     write_buffer: BytesMut,
     write_state: WriteState,
+    pub(crate) stream_type: StreamType,
 }
 
 impl ZtStream {
@@ -65,6 +67,7 @@ impl ZtStream {
         closed: Arc<std::sync::atomic::AtomicBool>,
         actor_tx: mpsc::Sender<crate::transport::actor::ActorMessage>,
         mtu: Arc<std::sync::atomic::AtomicUsize>,
+        stream_type: StreamType,
     ) -> Self {
         Self {
             stream_id,
@@ -76,6 +79,7 @@ impl ZtStream {
             current_read_chunk: None,
             write_buffer: BytesMut::new(),
             write_state: WriteState::Idle,
+            stream_type,
         }
     }
 
@@ -89,6 +93,12 @@ impl ZtStream {
     /// Returns `ActorFailed` if the connection is closed while waiting,
     /// preventing silent deadlocks.
     pub async fn send(&self, data: &[u8]) -> Result<()> {
+        if self.stream_type == StreamType::UnidirectionalIn {
+            return Err(crate::error::ZtError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Cannot write to a unidirectional incoming stream",
+            )));
+        }
         let mtu = self.mtu.load(std::sync::atomic::Ordering::Relaxed);
         let chunk_size = mtu.saturating_sub(64).max(512);
         for chunk in data.chunks(chunk_size) {
@@ -139,6 +149,12 @@ impl ZtStream {
 
     /// Sends a payload zero-copy by leveraging Bytes references.
     pub async fn send_bytes(&self, mut data: Bytes) -> Result<()> {
+        if self.stream_type == StreamType::UnidirectionalIn {
+            return Err(crate::error::ZtError::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Cannot write to a unidirectional incoming stream",
+            )));
+        }
         let mtu = self.mtu.load(std::sync::atomic::Ordering::Relaxed);
         let chunk_size = mtu.saturating_sub(64).max(512);
         
@@ -191,6 +207,9 @@ impl ZtStream {
     }
 
     pub async fn recv(&mut self) -> Option<Bytes> {
+        if self.stream_type == StreamType::UnidirectionalOut {
+            return None;
+        }
         if let Some(chunk) = self.current_read_chunk.take()
             && chunk.remaining() > 0 {
                 let _ = self.actor_tx.send(crate::transport::actor::ActorMessage::StreamDataRead {
@@ -224,10 +243,13 @@ impl Drop for ZtStream {
 
 impl tokio::io::AsyncRead for ZtStream {
     fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+        if self.stream_type == StreamType::UnidirectionalOut {
+            return std::task::Poll::Ready(Ok(()));
+        }
         loop {
             // 1. If we have a buffered read chunk from a previous socket read, consume from it.
             if let Some(ref mut chunk) = self.current_read_chunk {
@@ -267,6 +289,12 @@ impl tokio::io::AsyncWrite for ZtStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.stream_type == StreamType::UnidirectionalIn {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Cannot write to a unidirectional incoming stream",
+            )));
+        }
         // Guard: check if connection closed.
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return std::task::Poll::Ready(Err(std::io::Error::new(
@@ -277,33 +305,26 @@ impl tokio::io::AsyncWrite for ZtStream {
 
         let this = self.as_mut().get_mut();
         loop {
-            match &mut this.write_state {
-                // Idle means we can accept a new write payload from the user.
-                WriteState::Idle => break,
-                
-                // A packet was already dispatched to the actor; we wait on the oneshot confirmation.
-                WriteState::Sending { resp_rx, chunk_len } => {
-                    let chunk_len = *chunk_len;
-                    match std::pin::Pin::new(resp_rx).poll(cx) {
-                        // The packet was successfully transmitted and acked/pushed.
+            let state = std::mem::replace(&mut this.write_state, WriteState::Idle);
+            match state {
+                WriteState::Idle => {
+                    this.write_state = WriteState::Idle;
+                    break;
+                }
+                WriteState::Sending { mut resp_rx, chunk } => {
+                    match std::pin::Pin::new(&mut resp_rx).poll(cx) {
                         std::task::Poll::Ready(Ok(Ok(()))) => {
-                            this.write_state = WriteState::Idle;
+                            // Successfully sent chunk, state remains Idle
                         }
-                        // Flow/Congestion blocked: transition to Blocked and wait for the window to open.
                         std::task::Poll::Ready(Ok(Err(crate::error::ZtError::FlowControlBlocked)))
                         | std::task::Poll::Ready(Ok(Err(crate::error::ZtError::CongestionWindowFull))) => {
-                            let chunk = Bytes::copy_from_slice(&this.write_buffer[..chunk_len]);
-                            this.write_buffer.advance(chunk_len);
                             let notify = this.window_opened.clone();
                             this.write_state = WriteState::Blocked {
                                 notify_fut: Box::pin(async move { notify.notified().await }),
                                 chunk,
                             };
                         }
-                        // Pacing blocked: transition to Pacing and wait for the timer to elapse.
                         std::task::Poll::Ready(Ok(Err(crate::error::ZtError::PacingBlocked(dur)))) => {
-                            let chunk = Bytes::copy_from_slice(&this.write_buffer[..chunk_len]);
-                            this.write_buffer.advance(chunk_len);
                             this.write_state = WriteState::Pacing {
                                 sleep_fut: Box::pin(tokio::time::sleep(dur)),
                                 chunk,
@@ -312,7 +333,7 @@ impl tokio::io::AsyncWrite for ZtStream {
                         std::task::Poll::Ready(Ok(Err(e))) => {
                             return std::task::Poll::Ready(Err(std::io::Error::other(
                                 format!("Write failed: {:?}", e),
-                             )));
+                            )));
                         }
                         std::task::Poll::Ready(Err(_)) => {
                             return std::task::Poll::Ready(Err(std::io::Error::new(
@@ -321,16 +342,14 @@ impl tokio::io::AsyncWrite for ZtStream {
                             )));
                         }
                         std::task::Poll::Pending => {
+                            this.write_state = WriteState::Sending { resp_rx, chunk };
                             return std::task::Poll::Pending;
                         }
                     }
                 }
-                // We are flow-control or congestion blocked. Poll the window open waker.
-                WriteState::Blocked { notify_fut, chunk } => {
+                WriteState::Blocked { mut notify_fut, chunk } => {
                     match notify_fut.as_mut().poll(cx) {
                         std::task::Poll::Ready(()) => {
-                            // Window has opened; attempt to re-transmit the same chunk.
-                            let chunk = chunk.clone();
                             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                             if this.actor_tx.try_send(crate::transport::actor::ActorMessage::OutgoingData {
                                 stream_id: this.stream_id,
@@ -344,20 +363,18 @@ impl tokio::io::AsyncWrite for ZtStream {
                             }
                             this.write_state = WriteState::Sending {
                                 resp_rx,
-                                chunk_len: chunk.len(),
+                                chunk,
                             };
                         }
                         std::task::Poll::Pending => {
+                            this.write_state = WriteState::Blocked { notify_fut, chunk };
                             return std::task::Poll::Pending;
                         }
                     }
                 }
-                // We are pacing-blocked. Poll the pacing sleep future.
-                WriteState::Pacing { sleep_fut, chunk } => {
+                WriteState::Pacing { mut sleep_fut, chunk } => {
                     match sleep_fut.as_mut().poll(cx) {
                         std::task::Poll::Ready(()) => {
-                            // Pacing duration elapsed; attempt to re-transmit the same chunk.
-                            let chunk = chunk.clone();
                             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                             if this.actor_tx.try_send(crate::transport::actor::ActorMessage::OutgoingData {
                                 stream_id: this.stream_id,
@@ -371,10 +388,11 @@ impl tokio::io::AsyncWrite for ZtStream {
                             }
                             this.write_state = WriteState::Sending {
                                 resp_rx,
-                                chunk_len: chunk.len(),
+                                chunk,
                             };
                         }
                         std::task::Poll::Pending => {
+                            this.write_state = WriteState::Pacing { sleep_fut, chunk };
                             return std::task::Poll::Pending;
                         }
                     }
@@ -383,39 +401,34 @@ impl tokio::io::AsyncWrite for ZtStream {
         }
 
         // --- At this point, the state machine is Idle and ready to buffer new data ---
-        
+
         let mtu = this.mtu.load(std::sync::atomic::Ordering::Relaxed);
-        // Reserve 64 bytes for headers (e.g. packet number, connection ID, stream header, crypto tag).
         let chunk_size = mtu.saturating_sub(64).max(512);
 
-        // Append the user's data to our local write buffer.
         this.write_buffer.extend_from_slice(buf);
         let written = buf.len();
 
-        // If we accumulated enough bytes to form a full packet segment, dispatch it.
         if this.write_buffer.len() >= chunk_size {
-            let chunk_data = this.write_buffer.clone().split_to(chunk_size).freeze();
             match this.actor_tx.try_reserve() {
                 Ok(permit) => {
+                    let chunk_data = this.write_buffer.split_to(chunk_size).freeze();
                     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                     permit.send(crate::transport::actor::ActorMessage::OutgoingData {
                         stream_id: this.stream_id,
-                        data: chunk_data,
+                        data: chunk_data.clone(),
                         respond_to: resp_tx,
                     });
                     this.write_state = WriteState::Sending {
                         resp_rx,
-                        chunk_len: chunk_size,
+                        chunk: chunk_data,
                     };
                 }
                 Err(_) => {
-                    // Actor queue is full; yield and ask caller to retry later.
                     return std::task::Poll::Pending;
                 }
             }
         }
 
-        // Return progress to the caller, even if we just buffered the bytes.
         std::task::Poll::Ready(Ok(written))
     }
 
@@ -423,44 +436,48 @@ impl tokio::io::AsyncWrite for ZtStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        if self.stream_type == StreamType::UnidirectionalIn {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Cannot write/flush on a unidirectional incoming stream",
+            )));
+        }
         let this = self.as_mut().get_mut();
         loop {
-            match &mut this.write_state {
+            let state = std::mem::replace(&mut this.write_state, WriteState::Idle);
+            match state {
                 WriteState::Idle => {
                     if this.write_buffer.is_empty() {
+                        this.write_state = WriteState::Idle;
                         return std::task::Poll::Ready(Ok(()));
                     }
-                    let chunk_len = this.write_buffer.len();
-                    let chunk_data = this.write_buffer.clone().freeze();
                     match this.actor_tx.try_reserve() {
                         Ok(permit) => {
+                            let chunk_data = this.write_buffer.split().freeze();
                             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                             permit.send(crate::transport::actor::ActorMessage::OutgoingData {
                                 stream_id: this.stream_id,
-                                data: chunk_data,
+                                data: chunk_data.clone(),
                                 respond_to: resp_tx,
                             });
                             this.write_state = WriteState::Sending {
                                 resp_rx,
-                                chunk_len,
+                                chunk: chunk_data,
                             };
                         }
                         Err(_) => {
+                            this.write_state = WriteState::Idle;
                             return std::task::Poll::Pending;
                         }
                     }
                 }
-                WriteState::Sending { resp_rx, chunk_len } => {
-                    let chunk_len = *chunk_len;
-                    match std::pin::Pin::new(resp_rx).poll(cx) {
+                WriteState::Sending { mut resp_rx, chunk } => {
+                    match std::pin::Pin::new(&mut resp_rx).poll(cx) {
                         std::task::Poll::Ready(Ok(Ok(()))) => {
-                            this.write_buffer.advance(chunk_len);
-                            this.write_state = WriteState::Idle;
+                            // Successfully sent chunk, state remains Idle
                         }
                         std::task::Poll::Ready(Ok(Err(crate::error::ZtError::FlowControlBlocked)))
                         | std::task::Poll::Ready(Ok(Err(crate::error::ZtError::CongestionWindowFull))) => {
-                            let chunk = Bytes::copy_from_slice(&this.write_buffer[..chunk_len]);
-                            this.write_buffer.advance(chunk_len);
                             let notify = this.window_opened.clone();
                             this.write_state = WriteState::Blocked {
                                 notify_fut: Box::pin(async move { notify.notified().await }),
@@ -468,8 +485,6 @@ impl tokio::io::AsyncWrite for ZtStream {
                             };
                         }
                         std::task::Poll::Ready(Ok(Err(crate::error::ZtError::PacingBlocked(dur)))) => {
-                            let chunk = Bytes::copy_from_slice(&this.write_buffer[..chunk_len]);
-                            this.write_buffer.advance(chunk_len);
                             this.write_state = WriteState::Pacing {
                                 sleep_fut: Box::pin(tokio::time::sleep(dur)),
                                 chunk,
@@ -487,14 +502,14 @@ impl tokio::io::AsyncWrite for ZtStream {
                             )));
                         }
                         std::task::Poll::Pending => {
+                            this.write_state = WriteState::Sending { resp_rx, chunk };
                             return std::task::Poll::Pending;
                         }
                     }
                 }
-                WriteState::Blocked { notify_fut, chunk } => {
+                WriteState::Blocked { mut notify_fut, chunk } => {
                     match notify_fut.as_mut().poll(cx) {
                         std::task::Poll::Ready(()) => {
-                            let chunk = chunk.clone();
                             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                             if this.actor_tx.try_send(crate::transport::actor::ActorMessage::OutgoingData {
                                 stream_id: this.stream_id,
@@ -508,18 +523,18 @@ impl tokio::io::AsyncWrite for ZtStream {
                             }
                             this.write_state = WriteState::Sending {
                                 resp_rx,
-                                chunk_len: chunk.len(),
+                                chunk,
                             };
                         }
                         std::task::Poll::Pending => {
+                            this.write_state = WriteState::Blocked { notify_fut, chunk };
                             return std::task::Poll::Pending;
                         }
                     }
                 }
-                WriteState::Pacing { sleep_fut, chunk } => {
+                WriteState::Pacing { mut sleep_fut, chunk } => {
                     match sleep_fut.as_mut().poll(cx) {
                         std::task::Poll::Ready(()) => {
-                            let chunk = chunk.clone();
                             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                             if this.actor_tx.try_send(crate::transport::actor::ActorMessage::OutgoingData {
                                 stream_id: this.stream_id,
@@ -533,10 +548,11 @@ impl tokio::io::AsyncWrite for ZtStream {
                             }
                             this.write_state = WriteState::Sending {
                                 resp_rx,
-                                chunk_len: chunk.len(),
+                                chunk,
                             };
                         }
                         std::task::Poll::Pending => {
+                            this.write_state = WriteState::Pacing { sleep_fut, chunk };
                             return std::task::Poll::Pending;
                         }
                     }
@@ -549,6 +565,12 @@ impl tokio::io::AsyncWrite for ZtStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        if self.stream_type == StreamType::UnidirectionalIn {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Cannot shutdown/write on a unidirectional incoming stream",
+            )));
+        }
         if self.as_mut().poll_flush(cx)?.is_pending() {
             return std::task::Poll::Pending;
         }

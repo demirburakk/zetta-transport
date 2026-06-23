@@ -3,8 +3,7 @@ use crate::error::{Result, ZtError};
 use crate::protocol::frame::Frame;
 use crate::protocol::packet::{PacketHeader, PacketType};
 use crate::stream::ZtStream;
-use crate::transport::connection::ZtConnection;
-use crate::transport::state::{ConnectionState, StreamState, UnackedPayload};
+use crate::transport::state::{ConnectionState, StreamState, StreamType, UnackedPayload};
 use bytes::{Buf, Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -181,14 +180,14 @@ impl ZtConnectionActor {
                         ));
                     }
 
-                    if self.state.streams.len() >= ZtConnection::MAX_CONCURRENT_STREAMS {
+                    if (self.state.streams.len() as u64) >= self.state.local_max_streams {
                         tracing::warn!(
-                            "Peer exceeded MAX_CONCURRENT_STREAMS ({}), dropping stream {}",
-                            ZtConnection::MAX_CONCURRENT_STREAMS,
+                            "Peer exceeded local_max_streams ({}), dropping stream {}",
+                            self.state.local_max_streams,
                             id
                         );
                         return Err(ZtError::TooManyStreams {
-                            limit: ZtConnection::MAX_CONCURRENT_STREAMS,
+                            limit: self.state.local_max_streams as usize,
                         });
                     }
 
@@ -196,7 +195,7 @@ impl ZtConnectionActor {
                     let window_opened = Arc::new(Notify::new());
                     self.state
                         .streams
-                        .insert(id, StreamState::new(data_tx, window_opened.clone()));
+                        .insert(id, StreamState::new(data_tx, window_opened.clone(), StreamType::Bidirectional));
 
                     let stream = ZtStream::new(
                         id,
@@ -205,6 +204,7 @@ impl ZtConnectionActor {
                         self.state.closed.clone(),
                         self.actor_tx.clone(),
                         self.state.shared_mtu.clone(),
+                        StreamType::Bidirectional,
                     );
                     if let Err(e) = self.incoming_streams_tx.try_send(stream) {
                         tracing::error!("Failed to deliver incoming stream: {}. Closing connection.", e);
@@ -265,12 +265,14 @@ impl ZtConnectionActor {
             Frame::Ack {
                 largest_acked,
                 window_size,
+                ack_delay,
                 ack_ranges,
             } => {
                 let mut fast_retransmits: Vec<(UnackedPayload, u32)> = Vec::new();
                 self.state.handle_ack(
                     largest_acked,
                     window_size,
+                    ack_delay,
                     &ack_ranges,
                     &mut fast_retransmits,
                 );
@@ -299,8 +301,9 @@ impl ZtConnectionActor {
             Frame::MaxStreamData { id, max_data } => {
                 if let Some(stream) = self.state.streams.get_mut(&id) {
                     let new_window = max_data.saturating_sub(stream.next_tx_offset);
-                    if new_window > stream.tx_window {
-                        stream.tx_window = new_window;
+                    let old_window = stream.tx_window;
+                    stream.tx_window = new_window;
+                    if new_window > old_window {
                         stream.window_opened.notify_waiters();
                     }
                 }
@@ -309,8 +312,9 @@ impl ZtConnectionActor {
                 let new_window = max_data
                     .saturating_sub(self.state.conn_tx_offset)
                     .min(u32::MAX as u64) as u32;
-                if new_window > self.state.remote_window {
-                    self.state.remote_window = new_window;
+                let old_window = self.state.remote_window;
+                self.state.remote_window = new_window;
+                if new_window > old_window {
                     for stream in self.state.streams.values() {
                         stream.window_opened.notify_waiters();
                     }
@@ -318,6 +322,17 @@ impl ZtConnectionActor {
             }
             Frame::Datagram { data } => {
                 let _ = self.datagram_tx.try_send(data);
+            }
+            Frame::MaxStreams { max_streams } => {
+                if max_streams > self.state.peer_max_streams {
+                    self.state.peer_max_streams = max_streams;
+                    for stream in self.state.streams.values() {
+                        stream.window_opened.notify_waiters();
+                    }
+                }
+            }
+            Frame::StreamsBlocked { max_streams } => {
+                tracing::info!("Peer signaled streams blocked at limit {}", max_streams);
             }
             Frame::PathChallenge { data } => {
                 let response = Frame::PathResponse { data };
@@ -341,61 +356,210 @@ impl ZtConnectionActor {
     }
 
     pub(super) fn forward_stream_data(&mut self, stream_id: u32) -> Result<()> {
-        let Some(stream) = self.state.streams.get_mut(&stream_id) else {
-            return Ok(());
-        };
-
         let mut forwarded = false;
         let mut bytes_forwarded = 0;
-        while let Some(chunk) = stream.receive_buffer.read_contiguous() {
-            stream.buffered_bytes =
-                stream.buffered_bytes.saturating_sub(chunk.len());
-            let chunk_len = chunk.len();
-            if stream.app_tx.try_send(chunk).is_ok() {
-                forwarded = true;
-                bytes_forwarded += chunk_len;
-            } else {
-                break;
-            }
-        }
-        
-        stream.expected_rx_offset = stream.receive_buffer.read_head;
+        let mut scale_up = false;
+        let mut new_window = 0;
+        let current_window_size;
 
-        // Auto-tuning flow control (BDP/RTT heuristics):
-        // If the application reads more than half of the stream window size within two
-        // Round-Trip Times (2 * RTT), the stream window size is likely the throughput bottleneck.
-        // In response, we double the window capacity (capped at a maximum of 16MB) and resize
-        // the circular receive buffer dynamically to accommodate the larger incoming flight of packets.
-        if bytes_forwarded > 0 {
-            stream.bytes_read_in_epoch += bytes_forwarded;
-            if stream.bytes_read_in_epoch >= (stream.window_size / 2) as usize {
-                let elapsed = stream.last_window_update.elapsed();
-                let rtt = self.state.rtt;
-                if elapsed < rtt * 2 {
-                    let new_window = (stream.window_size * 2).min(16 * 1024 * 1024);
-                    if new_window > stream.window_size {
-                        tracing::info!("Auto-tuning: Scaling up stream {} window size from {} to {}", stream_id, stream.window_size, new_window);
-                        stream.receive_buffer.resize(new_window as usize);
-                        stream.window_size = new_window;
-                    }
-                }
-                stream.bytes_read_in_epoch = 0;
-                stream.last_window_update = std::time::Instant::now();
-            }
-        }
-
-        let max_data = stream.expected_rx_offset + stream.window_size;
-        // Only update peer with MAX_STREAM_DATA when the window can be extended
-        // by a significant fraction (at least 1/4th of the window size, i.e., 256KB)
-        // to avoid Silly Window Syndrome and massive packet volume.
-        if forwarded && max_data.saturating_sub(stream.last_sent_max_data) >= stream.window_size / 4 {
-            stream.last_sent_max_data = max_data;
-            let payload = UnackedPayload::MaxStreamData {
-                stream_id,
-                max_data,
+        {
+            let Some(stream) = self.state.streams.get_mut(&stream_id) else {
+                return Ok(());
             };
-            self.retransmit_payload(payload, 0)?;
+
+            while let Some(chunk) = stream.receive_buffer.read_contiguous() {
+                stream.buffered_bytes =
+                    stream.buffered_bytes.saturating_sub(chunk.len());
+                let chunk_len = chunk.len();
+                if stream.app_tx.try_send(chunk).is_ok() {
+                    forwarded = true;
+                    bytes_forwarded += chunk_len;
+                } else {
+                    break;
+                }
+            }
+            
+            stream.expected_rx_offset = stream.receive_buffer.read_head;
+            current_window_size = stream.window_size;
+
+            if bytes_forwarded > 0 {
+                stream.bytes_read_in_epoch += bytes_forwarded;
+                if stream.bytes_read_in_epoch >= (stream.window_size / 2) as usize {
+                    let elapsed = stream.last_window_update.elapsed();
+                    let rtt = self.state.rtt;
+                    if elapsed < rtt * 2 {
+                        new_window = (stream.window_size * 2).min(16 * 1024 * 1024);
+                        if new_window > stream.window_size {
+                            scale_up = true;
+                        }
+                    }
+                    stream.bytes_read_in_epoch = 0;
+                    stream.last_window_update = std::time::Instant::now();
+                }
+            }
+        }
+
+        if scale_up {
+            let current_total = self.state.total_allocated_buffer_size();
+            let added_size = (new_window - current_window_size) as usize;
+            if current_total + added_size <= crate::transport::connection::ZtConnection::MAX_CONNECTION_BUFFER_LIMIT {
+                if let Some(stream) = self.state.streams.get_mut(&stream_id) {
+                    tracing::info!("Auto-tuning: Scaling up stream {} window size from {} to {}", stream_id, stream.window_size, new_window);
+                    stream.receive_buffer.resize(new_window as usize);
+                    stream.window_size = new_window;
+                }
+            } else {
+                tracing::warn!("Auto-tuning: Scaling up stream {} blocked (connection limit reached)", stream_id);
+            }
+        }
+
+        if let Some(stream) = self.state.streams.get_mut(&stream_id) {
+            let max_data = stream.expected_rx_offset + stream.window_size;
+            // Only update peer with MAX_STREAM_DATA when the window can be extended
+            // by a significant fraction (at least 1/4th of the window size, i.e., 256KB)
+            // to avoid Silly Window Syndrome and massive packet volume.
+            if forwarded && max_data.saturating_sub(stream.last_sent_max_data) >= stream.window_size / 4 {
+                stream.last_sent_max_data = max_data;
+                let payload = UnackedPayload::MaxStreamData {
+                    stream_id,
+                    max_data,
+                };
+                self.retransmit_payload(payload, 0)?;
+            }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::endpoint::ZtEndpoint;
+    use crate::transport::connection::ZtConnection;
+    use crate::protocol::frame::Frame;
+    use crate::transport::state::ConnectionState;
+    use std::net::SocketAddr;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn test_incoming_handler_path_validation() {
+        let endpoint = ZtEndpoint::bind("127.0.0.1:0", None).await.unwrap();
+        let socket = endpoint.socket.clone();
+        
+        let scid = vec![1, 2, 3, 4];
+        let dcid = vec![5, 6, 7, 8];
+        let original_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let migrated_addr: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        
+        let mut conn = ZtConnection::new(original_addr, scid.clone(), dcid.clone());
+        conn.crypto = Some(Box::new(crate::crypto::CryptoContext::initial(&dcid, false)));
+        
+        let (_, rx) = mpsc::channel(1);
+        let (stream_tx, _) = mpsc::channel(1);
+        let (datagram_tx, _) = mpsc::channel(1);
+        let (actor_tx, _) = mpsc::channel(1);
+        
+        let mut csprng = rand::rngs::OsRng;
+        let (ephemeral_secret, ephemeral_public) = crate::crypto::keypair::generate_keypair();
+        let client_ed_signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let client_ed_public_key = client_ed_signing_key.verifying_key();
+        
+        let mut actor = ZtConnectionActor::new(
+            endpoint.clone(),
+            socket,
+            rx,
+            conn,
+            ephemeral_public,
+            Some(ephemeral_secret),
+            Some(client_ed_signing_key),
+            client_ed_public_key,
+            None,
+            None,
+            endpoint.routing_table.clone(),
+            scid,
+            stream_tx,
+            datagram_tx,
+            false,
+            actor_tx,
+        );
+        
+        actor.state.state = ConnectionState::Active;
+        
+        // 1. Send PathChallenge from migrated address.
+        let challenge_token = [0xAA; 8];
+        let frame_challenge = Frame::PathChallenge { data: challenge_token };
+        let res = actor.handle_frame(frame_challenge, 0, migrated_addr);
+        assert!(res.is_ok());
+        
+        // 2. Set the pending validation parameters manually.
+        actor.pending_validation_addr = Some(migrated_addr);
+        actor.path_validation_token = Some(challenge_token);
+        
+        // Now receive PathResponse matching the token and address
+        let frame_response = Frame::PathResponse { data: challenge_token };
+        let res = actor.handle_frame(frame_response, 0, migrated_addr);
+        assert!(res.is_ok());
+        
+        // Verify connection migrated!
+        assert_eq!(actor.state.addr, migrated_addr);
+        assert_eq!(actor.pending_validation_addr, None);
+        assert_eq!(actor.path_validation_token, None);
+    }
+
+    #[tokio::test]
+    async fn test_incoming_handler_max_streams_limit_update() {
+        let endpoint = ZtEndpoint::bind("127.0.0.1:0", None).await.unwrap();
+        let socket = endpoint.socket.clone();
+        
+        let scid = vec![1, 2, 3, 4];
+        let dcid = vec![5, 6, 7, 8];
+        let original_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        
+        let conn = ZtConnection::new(original_addr, scid.clone(), dcid.clone());
+        
+        let (_, rx) = mpsc::channel(1);
+        let (stream_tx, _) = mpsc::channel(1);
+        let (datagram_tx, _) = mpsc::channel(1);
+        let (actor_tx, _) = mpsc::channel(1);
+        
+        let mut csprng = rand::rngs::OsRng;
+        let (ephemeral_secret, ephemeral_public) = crate::crypto::keypair::generate_keypair();
+        let client_ed_signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
+        let client_ed_public_key = client_ed_signing_key.verifying_key();
+        
+        let mut actor = ZtConnectionActor::new(
+            endpoint.clone(),
+            socket,
+            rx,
+            conn,
+            ephemeral_public,
+            Some(ephemeral_secret),
+            Some(client_ed_signing_key),
+            client_ed_public_key,
+            None,
+            None,
+            endpoint.routing_table.clone(),
+            scid,
+            stream_tx,
+            datagram_tx,
+            false,
+            actor_tx,
+        );
+        
+        assert_eq!(actor.state.peer_max_streams, 100);
+        
+        // Handle MaxStreams frame increasing peer_max_streams
+        let frame = Frame::MaxStreams { max_streams: 150 };
+        let res = actor.handle_frame(frame, 0, original_addr);
+        assert!(res.is_ok());
+        
+        assert_eq!(actor.state.peer_max_streams, 150);
+        
+        // Handle MaxStreams frame trying to decrease peer_max_streams (should be ignored)
+        let frame_low = Frame::MaxStreams { max_streams: 80 };
+        let res = actor.handle_frame(frame_low, 0, original_addr);
+        assert!(res.is_ok());
+        
+        assert_eq!(actor.state.peer_max_streams, 150);
     }
 }

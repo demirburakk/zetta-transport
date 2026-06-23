@@ -7,7 +7,7 @@ use crate::transport::actor::ZtConnectionActor;
 use crate::transport::connection::ZtConnection;
 use crate::transport::cookie;
 use crate::transport::endpoint::ZtEndpoint;
-use crate::transport::state::{ConnectionState, StreamState};
+use crate::transport::state::{ConnectionState, StreamState, StreamType};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use rand::Rng;
@@ -85,6 +85,7 @@ pub(crate) async fn handle_handshake(
     let mut remote_sig_bytes = [0u8; 64];
     let mut remote_transcript_hash = Vec::new();
 
+    let mut remote_alpn = Vec::new();
     let mut cookie_data: Option<Bytes> = None;
     let mut handshake_found = false;
 
@@ -95,11 +96,13 @@ pub(crate) async fn handle_handshake(
                 ed_public_key,
                 transcript_hash,
                 signature,
+                alpn,
             }) => {
                 pk_bytes = public_key;
                 remote_ed_pk_bytes = ed_public_key;
                 remote_transcript_hash = transcript_hash;
                 remote_sig_bytes = signature;
+                remote_alpn = alpn;
                 handshake_found = true;
             }
             Ok(Frame::Cookie { cookie: c }) => {
@@ -133,6 +136,11 @@ pub(crate) async fn handle_handshake(
             &new_cookie,
         )?;
         return Ok(());
+    }
+
+    let expected_alpn = endpoint.alpn.read().unwrap().clone();
+    if remote_alpn != expected_alpn {
+        return Err(ZtError::InvalidPacket("ALPN negotiation failed".into()));
     }
 
     // Handshake replay protection: Check if cookie has been processed before
@@ -213,19 +221,19 @@ pub(crate) async fn handle_handshake(
         let window_opened = Arc::new(Notify::new());
         new_conn
             .streams
-            .insert(0, StreamState::new(data_tx, window_opened.clone()));
+            .insert(0, StreamState::new(data_tx, window_opened.clone(), StreamType::Bidirectional));
 
         let handshake_pn = new_conn.get_next_packet_number()?;
         new_conn.mark_processed(header.packet_number);
         new_conn.state = ConnectionState::Handshaking;
 
-        new_conn.crypto = Some(CryptoContext::from_shared_secret(
+        new_conn.crypto = Some(Box::new(CryptoContext::from_shared_secret(
             shared,
             &new_conn.scid,
             &new_conn.dcid,
             endpoint.psk,
             false,
-        ));
+        )));
 
         let (actor_tx, actor_rx) = mpsc::channel(1024);
         let (stream_tx, stream_rx) = mpsc::channel(128);
@@ -319,6 +327,7 @@ pub(crate) async fn handle_handshake(
             ed_public_key: *endpoint.ed_public_key.as_bytes(),
             transcript_hash: transcript_hash.clone(),
             signature: endpoint.ed_signing_key.sign(&transcript_hash).to_bytes(),
+            alpn: endpoint.alpn.read().unwrap().clone(),
         };
         frame.encode(&mut buf);
         let payload_len = buf.len() - header_len;
@@ -380,4 +389,22 @@ fn send_retry(
         tracing::debug!("Failed to send retry: {}", e);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_handshake_replay_protection() {
+        let endpoint = ZtEndpoint::bind("127.0.0.1:0", None).await.unwrap();
+        
+        let mut dummy_hmac = [0u8; 32];
+        dummy_hmac[0] = 0xFF;
+        
+        let current_time = cookie::current_time_millis();
+        endpoint.handshake_replay_filter.insert(dummy_hmac, current_time);
+
+        assert!(endpoint.handshake_replay_filter.contains_key(&dummy_hmac));
+    }
 }

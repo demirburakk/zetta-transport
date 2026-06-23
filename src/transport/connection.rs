@@ -1,4 +1,4 @@
-use crate::crypto::CryptoContext;
+use crate::crypto::CryptoEngine;
 use crate::error::{Result, ZtError};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use super::state::{
-    AckTracker, ConnectionState, ReplayWindow, StreamState, UnackedPayload, UnackedWindow,
+    AckTracker, ConnectionState, PacketSpace, ReplayWindow, StreamState, UnackedPayload, UnackedWindow,
 };
 
 /// Represents a single connection to a remote peer.
@@ -20,7 +20,10 @@ pub(crate) struct ZtConnection {
     pub(crate) scid: Vec<u8>,
     pub(crate) state: ConnectionState,
     pub(crate) next_packet_number: u64,
-    pub(crate) crypto: Option<CryptoContext>,
+    pub(crate) crypto: Option<Box<dyn CryptoEngine>>,
+    pub(crate) initial_space: PacketSpace,
+    pub(crate) handshake_space: PacketSpace,
+    pub(crate) app_space: PacketSpace,
 
     pub(crate) streams: HashMap<u32, StreamState>,
     pub(crate) mtu_probes: HashMap<u64, usize>,
@@ -58,6 +61,9 @@ pub(crate) struct ZtConnection {
     /// Shared closed flag for all streams. Set to true when the connection
     /// is closing/closed to unblock pending ZtStream::send() calls.
     pub(crate) closed: Arc<AtomicBool>,
+    pub(crate) largest_acked_received_at: Option<std::time::Instant>,
+    pub(crate) local_max_streams: u64,
+    pub(crate) peer_max_streams: u64,
 }
 
 impl ZtConnection {
@@ -94,6 +100,9 @@ impl ZtConnection {
             state: ConnectionState::Handshaking,
             next_packet_number: 0,
             crypto: None,
+            initial_space: PacketSpace::new(),
+            handshake_space: PacketSpace::new(),
+            app_space: PacketSpace::new(),
 
             streams: HashMap::new(),
             mtu_probes: HashMap::new(),
@@ -129,6 +138,9 @@ impl ZtConnection {
             cookie: None,
             handshake_packet: None,
             closed: Arc::new(AtomicBool::new(false)),
+            largest_acked_received_at: None,
+            local_max_streams: 100,
+            peer_max_streams: 100,
         }
     }
     
@@ -145,6 +157,15 @@ impl ZtConnection {
         self.streams
             .values()
             .map(|s| s.buffered_bytes)
+            .sum()
+    }
+
+    pub(crate) const MAX_CONNECTION_BUFFER_LIMIT: usize = 64 * 1024 * 1024; // 64 MB
+
+    pub(crate) fn total_allocated_buffer_size(&self) -> usize {
+        self.streams
+            .values()
+            .map(|s| s.window_size as usize)
             .sum()
     }
 }

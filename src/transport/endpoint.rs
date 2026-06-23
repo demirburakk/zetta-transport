@@ -34,6 +34,7 @@ pub struct ZtEndpoint {
     pub(crate) handshake_semaphore: Arc<Semaphore>,
     pub(crate) handshake_replay_filter: Arc<DashMap<[u8; 32], u64>>,
     pub(crate) cc_algo: crate::transport::congestion::CongestionControlAlgorithm,
+    pub(crate) alpn: std::sync::RwLock<Vec<u8>>,
 
     incoming_rx: Mutex<mpsc::Receiver<ZtConnectionHandle>>,
     pub(crate) incoming_tx: mpsc::Sender<ZtConnectionHandle>,
@@ -105,6 +106,7 @@ impl ZtEndpoint {
             incoming_rx: Mutex::new(rx),
             incoming_tx: tx,
             cc_algo,
+            alpn: std::sync::RwLock::new(b"zetta".to_vec()),
         });
 
         // Main socket routing
@@ -227,6 +229,13 @@ impl ZtEndpoint {
         });
     }
 
+    /// Sets the ALPN protocols supported by this endpoint.
+    pub fn set_alpn(&self, alpn: Vec<u8>) {
+        if let Ok(mut guard) = self.alpn.write() {
+            *guard = alpn;
+        }
+    }
+
     /// Returns the MTU for a given connection.
     pub async fn get_mtu(&self, cid: &[u8]) -> usize {
         if let Some(tx) = self.routing_table.get(cid) {
@@ -285,9 +294,15 @@ impl ZtEndpoint {
 
     /// Opens a new stream on an existing connection.
     pub async fn open_stream(&self, cid: &[u8]) -> Result<ZtStream> {
+        self.open_stream_with_type(cid, crate::transport::state::StreamType::Bidirectional).await
+    }
+
+    /// Opens a new stream of a specific type on an existing connection.
+    pub async fn open_stream_with_type(&self, cid: &[u8], stream_type: crate::transport::state::StreamType) -> Result<ZtStream> {
         if let Some(tx) = self.routing_table.get(cid) {
             let (resp_tx, resp_rx) = oneshot::channel();
             tx.send(ActorMessage::OpenStream {
+                stream_type,
                 respond_to: resp_tx,
             })
             .await

@@ -24,17 +24,19 @@ pub(crate) fn truncate_pn(pn: u64, largest_acked: u64) -> (u32, usize) {
 
 pub(crate) fn expand_pn(pn_truncated: u64, pn_len: usize, largest_pn: u64) -> u64 {
     let pn_nbits = pn_len * 8;
-    let expected_pn = largest_pn + 1;
+    let expected_pn = largest_pn.saturating_add(1);
     let pn_win = 1u64 << pn_nbits;
     let pn_hwin = pn_win / 2;
     let pn_mask = pn_win - 1;
 
     let candidate_pn = (expected_pn & !pn_mask) | pn_truncated;
 
-    if candidate_pn + pn_hwin <= expected_pn {
-        candidate_pn.wrapping_add(pn_win)
-    } else if candidate_pn > expected_pn + pn_hwin && candidate_pn >= pn_win {
-        candidate_pn - pn_win
+    if expected_pn >= pn_hwin && candidate_pn <= expected_pn - pn_hwin {
+        candidate_pn.saturating_add(pn_win)
+    } else if expected_pn.checked_add(pn_hwin).map_or(false, |limit| candidate_pn > limit)
+        && candidate_pn >= pn_win
+    {
+        candidate_pn.saturating_sub(pn_win)
     } else {
         candidate_pn
     }

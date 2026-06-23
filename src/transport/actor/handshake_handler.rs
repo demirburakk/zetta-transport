@@ -47,15 +47,21 @@ impl ZtConnectionActor {
                 ed_public_key,
                 transcript_hash,
                 signature,
+                alpn,
             }) = Frame::decode(&mut payload_bytes)
             {
-                handshake = Some((public_key, ed_public_key, transcript_hash, signature));
+                handshake = Some((public_key, ed_public_key, transcript_hash, signature, alpn));
             }
         }
-        let Some((pk_bytes, remote_ed_pk_bytes, transcript_hash, remote_sig_bytes)) = handshake
+        let Some((pk_bytes, remote_ed_pk_bytes, transcript_hash, remote_sig_bytes, remote_alpn)) = handshake
         else {
             return Err(ZtError::Crypto("No handshake".into()));
         };
+
+        let expected_alpn = self.endpoint.alpn.read().unwrap().clone();
+        if remote_alpn != expected_alpn {
+            return Err(ZtError::Crypto("ALPN negotiation failed".into()));
+        }
 
         let old_scid = self.state.dcid.clone();
         let new_dcid = header.scid.clone();
@@ -100,13 +106,13 @@ impl ZtConnectionActor {
             PublicKey::from(pk_bytes),
         );
         self.state.dcid = new_dcid.clone();
-        self.state.crypto = Some(crate::crypto::CryptoContext::from_shared_secret(
+        self.state.crypto = Some(Box::new(crate::crypto::CryptoContext::from_shared_secret(
             shared,
             &self.state.scid,
             &self.state.dcid,
             self.psk,
             true,
-        ));
+        )));
         self.state.addr = addr;
         self.state.state = ConnectionState::Active;
         self.state.mark_processed(header.packet_number);

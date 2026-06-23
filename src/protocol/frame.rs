@@ -59,6 +59,7 @@ pub enum Frame {
     Ack {
         largest_acked: u64,
         window_size: u32,
+        ack_delay: u64,
         ack_ranges: Vec<(u64, u64)>,
     },
     ConnectionClose,
@@ -67,6 +68,7 @@ pub enum Frame {
         ed_public_key: [u8; 32],
         transcript_hash: Vec<u8>,
         signature: [u8; 64],
+        alpn: Vec<u8>,
     },
     Cookie {
         cookie: Bytes,
@@ -99,6 +101,16 @@ pub enum Frame {
         /// 8-byte token copied from the challenge.
         data: [u8; 8],
     },
+    Crypto {
+        offset: u64,
+        data: Bytes,
+    },
+    MaxStreams {
+        max_streams: u64,
+    },
+    StreamsBlocked {
+        max_streams: u64,
+    },
 }
 
 impl Frame {
@@ -119,11 +131,13 @@ impl Frame {
             Frame::Ack {
                 largest_acked,
                 window_size,
+                ack_delay,
                 ack_ranges,
             } => {
                 dst.put_u8(0x02);
                 dst.put_u64(*largest_acked);
                 dst.put_u32(*window_size);
+                put_varint(dst, *ack_delay);
                 let range_len = ack_ranges.len().min(128);
                 dst.put_u8(range_len as u8);
                 for (start, end) in ack_ranges.iter().take(range_len) {
@@ -139,6 +153,7 @@ impl Frame {
                 ed_public_key,
                 transcript_hash,
                 signature,
+                alpn,
             } => {
                 dst.put_u8(0x04);
                 dst.put_slice(public_key);
@@ -146,6 +161,8 @@ impl Frame {
                 dst.put_u16(transcript_hash.len() as u16);
                 dst.put_slice(transcript_hash);
                 dst.put_slice(signature);
+                dst.put_u8(alpn.len() as u8);
+                dst.put_slice(alpn);
             }
             Frame::Cookie { cookie } => {
                 dst.put_u8(0x05);
@@ -177,6 +194,20 @@ impl Frame {
             Frame::PathResponse { data } => {
                 dst.put_u8(0x0B);
                 dst.put_slice(data);
+            }
+            Frame::Crypto { offset, data } => {
+                dst.put_u8(0x0C);
+                dst.put_u64(*offset);
+                put_varint(dst, data.len() as u64);
+                dst.put_slice(data);
+            }
+            Frame::MaxStreams { max_streams } => {
+                dst.put_u8(0x12);
+                dst.put_u64(*max_streams);
+            }
+            Frame::StreamsBlocked { max_streams } => {
+                dst.put_u8(0x13);
+                dst.put_u64(*max_streams);
             }
         }
     }
@@ -215,6 +246,10 @@ impl Frame {
                 }
                 let largest_acked = src.get_u64();
                 let window_size = src.get_u32();
+                let ack_delay = get_varint(src)?;
+                if src.remaining() < 1 {
+                    return Err(ZtError::InvalidPacket("Ack frame range count missing".into()));
+                }
                 let range_count = src.get_u8() as usize;
                 if range_count > 128 {
                     return Err(ZtError::InvalidPacket("Too many ACK ranges".into()));
@@ -237,6 +272,7 @@ impl Frame {
                 Ok(Frame::Ack {
                     largest_acked,
                     window_size,
+                    ack_delay,
                     ack_ranges,
                 })
             }
@@ -259,11 +295,20 @@ impl Frame {
                 let mut signature = [0u8; 64];
                 signature.copy_from_slice(&src.chunk()[..64]);
                 src.advance(64);
+                if src.remaining() < 1 {
+                    return Err(ZtError::InvalidPacket("Handshake frame ALPN length missing".into()));
+                }
+                let alpn_len = src.get_u8() as usize;
+                if src.remaining() < alpn_len {
+                    return Err(ZtError::InvalidPacket("Handshake frame ALPN truncated".into()));
+                }
+                let alpn = src.copy_to_bytes(alpn_len).to_vec();
                 Ok(Frame::Handshake {
                     public_key,
                     ed_public_key,
                     transcript_hash,
                     signature,
+                    alpn,
                 })
             }
             0x05 => {
@@ -323,6 +368,32 @@ impl Frame {
                 src.copy_to_slice(&mut data);
                 Ok(Frame::PathResponse { data })
             }
+            0x0C => {
+                if src.remaining() < 9 {
+                    return Err(ZtError::InvalidPacket("Crypto frame too short".into()));
+                }
+                let offset = src.get_u64();
+                let len = get_varint(src)? as usize;
+                if src.remaining() < len {
+                    return Err(ZtError::InvalidPacket("Crypto frame truncated".into()));
+                }
+                let data = src.copy_to_bytes(len);
+                Ok(Frame::Crypto { offset, data })
+            }
+            0x12 => {
+                if src.remaining() < 8 {
+                    return Err(ZtError::InvalidPacket("MaxStreams frame too short".into()));
+                }
+                let max_streams = src.get_u64();
+                Ok(Frame::MaxStreams { max_streams })
+            }
+            0x13 => {
+                if src.remaining() < 8 {
+                    return Err(ZtError::InvalidPacket("StreamsBlocked frame too short".into()));
+                }
+                let max_streams = src.get_u64();
+                Ok(Frame::StreamsBlocked { max_streams })
+            }
             _ => Err(ZtError::InvalidPacket(format!(
                 "Unknown frame type: {}",
                 frame_type
@@ -358,6 +429,7 @@ mod tests {
         let f = Frame::Ack {
             largest_acked: 500,
             window_size: 65536,
+            ack_delay: 250,
             ack_ranges: vec![(400, 450), (480, 499)],
         };
         assert_eq!(roundtrip(f.clone()), f);
@@ -369,6 +441,7 @@ mod tests {
         buf.put_u8(0x02);
         buf.put_u64(100u64);
         buf.put_u32(65536u32);
+        buf.put_u8(0); // ack_delay = 0 varint
         buf.put_u8(1u8);
         buf.put_u64(50u64);
         buf.put_u64(10u64);
@@ -391,6 +464,7 @@ mod tests {
         buf.put_u8(0x02);
         buf.put_u64(200u64);
         buf.put_u32(65536u32);
+        buf.put_u8(0); // ack_delay = 0 varint
         buf.put_u8(129u8);
         for i in 0..129u64 {
             buf.put_u64(i * 2);
@@ -398,5 +472,29 @@ mod tests {
         }
         let mut bytes = buf.freeze();
         assert!(Frame::decode(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn new_frames_roundtrip() {
+        let f1 = Frame::Crypto {
+            offset: 100,
+            data: Bytes::from_static(b"hello"),
+        };
+        assert_eq!(roundtrip(f1.clone()), f1);
+
+        let f2 = Frame::MaxStreams { max_streams: 10 };
+        assert_eq!(roundtrip(f2.clone()), f2);
+
+        let f3 = Frame::StreamsBlocked { max_streams: 5 };
+        assert_eq!(roundtrip(f3.clone()), f3);
+
+        let f4 = Frame::Handshake {
+            public_key: [1u8; 32],
+            ed_public_key: [2u8; 32],
+            transcript_hash: vec![3u8; 32],
+            signature: [4u8; 64],
+            alpn: b"zetta".to_vec(),
+        };
+        assert_eq!(roundtrip(f4.clone()), f4);
     }
 }

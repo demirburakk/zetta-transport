@@ -34,6 +34,11 @@ impl ZtConnectionHandle {
         self.endpoint.open_stream(&self.cid).await
     }
 
+    /// Opens a new stream of a specific type to the remote peer.
+    pub async fn open_stream_with_type(&self, stream_type: crate::transport::state::StreamType) -> Result<ZtStream> {
+        self.endpoint.open_stream_with_type(&self.cid, stream_type).await
+    }
+
     /// Accepts an incoming stream initiated by the remote peer.
     pub async fn accept_stream(&mut self) -> Option<ZtStream> {
         self.incoming_streams.recv().await
