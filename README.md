@@ -23,6 +23,9 @@ ZettaTransport is a custom, multiplexed, encrypted transport protocol implemente
 - **Auto-Tuning Flow Control**: Tracks stream consumption relative to Round-Trip Time (RTT) and dynamically doubles the flow control window (up to 16MB) to sustain high-throughput networks.
 - **Secure Path Migration**: Automatically detects IP/port changes, triggering a cryptographically secure 3-way `PathChallenge` / `PathResponse` handshake to prevent reflection and amplification DDoS attacks.
 - **Cryptographic Security**: Every packet is encrypted with ChaCha20-Poly1305 AEAD, authenticated via Ed25519 signatures over X25519 Diffie-Hellman handshakes, protected via AES-128 header obfuscation, and protected against replays with a sliding bitmask.
+- **Configuration System (`ZtConfig`)**: Centralized, type-safe configuration with sensible defaults for all protocol parameters — timeouts, flow control, MTU bounds, and congestion control algorithm.
+- **Connection Statistics API**: Real-time telemetry via `conn.stats()` providing RTT, congestion window, bytes in flight, key epoch, and more.
+- **Extended Frame Support**: Implements `Ping`, `ResetStream`, `StopSending`, `DataBlocked`, `StreamDataBlocked`, and `ConnectionCloseV2` frames for comprehensive signaling.
 
 ---
 
@@ -128,6 +131,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+### Configuration
+
+```rust
+use zetta_transport::config::ZtConfig;
+use zetta_transport::transport::CongestionControlAlgorithm;
+
+let config = ZtConfig {
+    cc_algorithm: CongestionControlAlgorithm::Reno,
+    max_concurrent_streams: 200,
+    idle_timeout: std::time::Duration::from_secs(120),
+    ..ZtConfig::default()
+};
+```
+
+### Connection Statistics
+
+```rust
+// After establishing a connection:
+let stats = conn.stats().await?;
+println!("RTT: {:?}, CWND: {}, MTU: {}", stats.rtt, stats.cwnd, stats.mtu);
+```
 ```
 
 ---

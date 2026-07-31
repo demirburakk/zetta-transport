@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::stats::ConnectionStats;
 use crate::stream::ZtStream;
 use crate::transport::endpoint::ZtEndpoint;
 use std::sync::Arc;
@@ -64,5 +65,12 @@ impl ZtConnectionHandle {
     /// Returns `None` if the connection has been terminated.
     pub async fn recv_datagram(&mut self) -> Option<Bytes> {
         self.incoming_datagrams.recv().await
+    }
+
+    /// Returns a snapshot of the connection's current transport-level statistics.
+    ///
+    /// Includes RTT estimates, congestion window, bytes in flight, and other metrics.
+    pub async fn stats(&self) -> crate::error::Result<ConnectionStats> {
+        self.endpoint.get_stats(&self.cid).await
     }
 }

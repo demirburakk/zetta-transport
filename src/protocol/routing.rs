@@ -3,7 +3,7 @@
 ///
 /// This is a fast-path helper used by the router to dispatch incoming
 /// datagrams to the correct per-connection actor.
-pub(crate) fn extract_dcid_fast(data: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn extract_dcid_fast(data: &[u8]) -> Option<&[u8]> {
     if data.is_empty() {
         return None;
     }
@@ -17,7 +17,7 @@ pub(crate) fn extract_dcid_fast(data: &[u8]) -> Option<Vec<u8>> {
         if data.len() < 6 + dcid_len {
             return None;
         }
-        Some(data[6..6 + dcid_len].to_vec())
+        Some(&data[6..6 + dcid_len])
     } else {
         if data.len() < 2 {
             return None;
@@ -26,7 +26,7 @@ pub(crate) fn extract_dcid_fast(data: &[u8]) -> Option<Vec<u8>> {
         if data.len() < 2 + dcid_len {
             return None;
         }
-        Some(data[2..2 + dcid_len].to_vec())
+        Some(&data[2..2 + dcid_len])
     }
 }
 
@@ -38,14 +38,14 @@ mod tests {
     fn extract_dcid_short_header() {
         let data = [0x02u8, 3, 1, 2, 3, 0xAA, 0xBB];
         let dcid = extract_dcid_fast(&data).expect("dcid missing");
-        assert_eq!(dcid, vec![1, 2, 3]);
+        assert_eq!(dcid, &[1, 2, 3]);
     }
 
     #[test]
     fn extract_dcid_long_header() {
         let data = vec![0x80u8, 0, 0, 0, 1, 4, 9, 8, 7, 6, 2, 1, 2];
         let dcid = extract_dcid_fast(&data).expect("dcid missing");
-        assert_eq!(dcid, vec![9, 8, 7, 6]);
+        assert_eq!(dcid, &[9, 8, 7, 6]);
     }
 
     #[test]

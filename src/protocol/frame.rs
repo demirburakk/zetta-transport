@@ -111,6 +111,44 @@ pub enum Frame {
     StreamsBlocked {
         max_streams: u64,
     },
+    /// Ping frame used for keep-alive and to elicit an ACK from the peer.
+    Ping,
+    /// Signals that a stream was abruptly terminated by the sender.
+    ResetStream {
+        /// The stream ID being reset.
+        stream_id: u32,
+        /// Application-level error code explaining the reset reason.
+        error_code: u64,
+        /// The final size of data sent on the stream before reset.
+        final_size: u64,
+    },
+    /// Requests that the peer stop sending data on a specific stream.
+    StopSending {
+        /// The stream ID to stop sending on.
+        stream_id: u32,
+        /// Application-level error code explaining why.
+        error_code: u64,
+    },
+    /// Signals that the sender is blocked by connection-level flow control.
+    DataBlocked {
+        /// The connection-level offset at which the sender is blocked.
+        max_data: u64,
+    },
+    /// Signals that the sender is blocked by stream-level flow control.
+    StreamDataBlocked {
+        /// The stream ID that is blocked.
+        stream_id: u32,
+        /// The stream-level offset at which the sender is blocked.
+        max_data: u64,
+    },
+    /// Enhanced connection close with error code and diagnostic reason.
+    /// Uses frame type 0x14 to maintain backward compatibility with basic ConnectionClose (0x03).
+    ConnectionCloseV2 {
+        /// Transport-level error code.
+        error_code: u64,
+        /// Human-readable diagnostic reason (UTF-8).
+        reason: Vec<u8>,
+    },
 }
 
 impl Frame {
@@ -208,6 +246,35 @@ impl Frame {
             Frame::StreamsBlocked { max_streams } => {
                 dst.put_u8(0x13);
                 dst.put_u64(*max_streams);
+            }
+            Frame::Ping => {
+                dst.put_u8(0x0D);
+            }
+            Frame::ResetStream { stream_id, error_code, final_size } => {
+                dst.put_u8(0x0E);
+                dst.put_u32(*stream_id);
+                put_varint(dst, *error_code);
+                put_varint(dst, *final_size);
+            }
+            Frame::StopSending { stream_id, error_code } => {
+                dst.put_u8(0x0F);
+                dst.put_u32(*stream_id);
+                put_varint(dst, *error_code);
+            }
+            Frame::DataBlocked { max_data } => {
+                dst.put_u8(0x10);
+                put_varint(dst, *max_data);
+            }
+            Frame::StreamDataBlocked { stream_id, max_data } => {
+                dst.put_u8(0x11);
+                dst.put_u32(*stream_id);
+                put_varint(dst, *max_data);
+            }
+            Frame::ConnectionCloseV2 { error_code, reason } => {
+                dst.put_u8(0x14);
+                put_varint(dst, *error_code);
+                put_varint(dst, reason.len() as u64);
+                dst.put_slice(reason);
             }
         }
     }
@@ -394,6 +461,45 @@ impl Frame {
                 let max_streams = src.get_u64();
                 Ok(Frame::StreamsBlocked { max_streams })
             }
+            0x0D => Ok(Frame::Ping),
+            0x0E => {
+                if src.remaining() < 4 {
+                    return Err(ZtError::InvalidPacket("ResetStream frame too short".into()));
+                }
+                let stream_id = src.get_u32();
+                let error_code = get_varint(src)?;
+                let final_size = get_varint(src)?;
+                Ok(Frame::ResetStream { stream_id, error_code, final_size })
+            }
+            0x0F => {
+                if src.remaining() < 4 {
+                    return Err(ZtError::InvalidPacket("StopSending frame too short".into()));
+                }
+                let stream_id = src.get_u32();
+                let error_code = get_varint(src)?;
+                Ok(Frame::StopSending { stream_id, error_code })
+            }
+            0x10 => {
+                let max_data = get_varint(src)?;
+                Ok(Frame::DataBlocked { max_data })
+            }
+            0x11 => {
+                if src.remaining() < 4 {
+                    return Err(ZtError::InvalidPacket("StreamDataBlocked frame too short".into()));
+                }
+                let stream_id = src.get_u32();
+                let max_data = get_varint(src)?;
+                Ok(Frame::StreamDataBlocked { stream_id, max_data })
+            }
+            0x14 => {
+                let error_code = get_varint(src)?;
+                let reason_len = get_varint(src)? as usize;
+                if src.remaining() < reason_len {
+                    return Err(ZtError::InvalidPacket("ConnectionCloseV2 reason truncated".into()));
+                }
+                let reason = src.copy_to_bytes(reason_len).to_vec();
+                Ok(Frame::ConnectionCloseV2 { error_code, reason })
+            }
             _ => Err(ZtError::InvalidPacket(format!(
                 "Unknown frame type: {}",
                 frame_type
@@ -496,5 +602,62 @@ mod tests {
             alpn: b"zetta".to_vec(),
         };
         assert_eq!(roundtrip(f4.clone()), f4);
+    }
+
+    #[test]
+    fn ping_frame_roundtrip() {
+        assert_eq!(roundtrip(Frame::Ping), Frame::Ping);
+    }
+
+    #[test]
+    fn reset_stream_frame_roundtrip() {
+        let f = Frame::ResetStream {
+            stream_id: 42,
+            error_code: 0x100,
+            final_size: 65536,
+        };
+        assert_eq!(roundtrip(f.clone()), f);
+    }
+
+    #[test]
+    fn stop_sending_frame_roundtrip() {
+        let f = Frame::StopSending {
+            stream_id: 7,
+            error_code: 0x0A,
+        };
+        assert_eq!(roundtrip(f.clone()), f);
+    }
+
+    #[test]
+    fn data_blocked_frame_roundtrip() {
+        let f = Frame::DataBlocked { max_data: 1_048_576 };
+        assert_eq!(roundtrip(f.clone()), f);
+    }
+
+    #[test]
+    fn stream_data_blocked_frame_roundtrip() {
+        let f = Frame::StreamDataBlocked {
+            stream_id: 3,
+            max_data: 65536,
+        };
+        assert_eq!(roundtrip(f.clone()), f);
+    }
+
+    #[test]
+    fn connection_close_v2_roundtrip() {
+        let f = Frame::ConnectionCloseV2 {
+            error_code: 0x01,
+            reason: b"idle timeout".to_vec(),
+        };
+        assert_eq!(roundtrip(f.clone()), f);
+    }
+
+    #[test]
+    fn connection_close_v2_empty_reason_roundtrip() {
+        let f = Frame::ConnectionCloseV2 {
+            error_code: 0,
+            reason: vec![],
+        };
+        assert_eq!(roundtrip(f.clone()), f);
     }
 }

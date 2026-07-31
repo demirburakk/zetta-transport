@@ -40,7 +40,7 @@ pub(crate) async fn handle_handshake(
     if let Some(offset) = PacketHeader::get_pn_offset(&mutable_packet) {
         let dcid_opt = crate::protocol::routing::extract_dcid_fast(&mutable_packet);
         if let Some(dcid) = dcid_opt {
-            let crypto = CryptoContext::initial(&dcid, false);
+            let crypto = CryptoContext::initial(dcid, false);
             crypto.remove_header_protection(&mut mutable_packet, offset)?;
         }
     }

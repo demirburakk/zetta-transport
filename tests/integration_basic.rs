@@ -58,6 +58,9 @@ async fn test_large_payload_transfer() -> Result<(), Box<dyn std::error::Error>>
         }
     }
 
+    assert_eq!(original_data.len(), received_data.len(), "Echoed payload size mismatch");
+    assert_eq!(original_data, received_data, "Echoed payload content mismatch");
+
     println!("[CLIENT] Closing stream...");
     stream.close().await?;
 
@@ -92,7 +95,7 @@ async fn test_multi_stream_concurrency() -> Result<(), Box<dyn std::error::Error
                 }
             }
             for t in tasks {
-                let _ = t.await;
+                t.await.expect("Server stream task panicked");
             }
         }
     });

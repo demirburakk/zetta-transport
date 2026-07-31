@@ -52,6 +52,18 @@ pub enum ZtError {
     /// The connection has reached its maximum number of concurrent streams.
     #[error("Too many concurrent streams (limit: {limit})")]
     TooManyStreams { limit: usize },
+
+    /// The remote peer reset a stream with an error code.
+    #[error("Stream {stream_id} reset by peer (error code: {error_code})")]
+    StreamReset { stream_id: u32, error_code: u64 },
+
+    /// The connection was closed by the peer with an error code and optional reason.
+    #[error("Connection closed by peer (error code: {error_code}, reason: {reason})")]
+    ConnectionClosedByPeer { error_code: u64, reason: String },
+
+    /// The connection was closed due to idle timeout.
+    #[error("Connection closed due to idle timeout")]
+    IdleTimeout,
 }
 
 /// A specialized Result type for ZettaTransport operations.

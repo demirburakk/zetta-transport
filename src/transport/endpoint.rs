@@ -172,7 +172,8 @@ impl ZtEndpoint {
                         buf.resize(2048, 0);
                     }
 
-                    if let Some(dcid) = crate::protocol::routing::extract_dcid_fast(&data) {
+                    if let Some(dcid_slice) = crate::protocol::routing::extract_dcid_fast(&data) {
+                        let dcid = dcid_slice.to_vec();
                         let mut routed = false;
                         if let Some(tx) = local_routing_table.get(&dcid) {
                             let tx: &mpsc::Sender<ActorMessage> = tx;
@@ -265,6 +266,18 @@ impl ZtEndpoint {
             .await
             .map_err(|e| ZtError::Io(std::io::Error::other(format!("Actor send failed: {}", e))))?;
             return resp_rx.await.unwrap_or(Err(ZtError::ActorFailed));
+        }
+        Err(ZtError::ActorFailed)
+    }
+
+    /// Returns transport-level statistics for a given connection.
+    pub async fn get_stats(&self, cid: &[u8]) -> Result<crate::stats::ConnectionStats> {
+        if let Some(tx) = self.routing_table.get(cid) {
+            let (resp_tx, resp_rx) = oneshot::channel();
+            tx.send(ActorMessage::GetStats { respond_to: resp_tx })
+                .await
+                .map_err(|_| ZtError::ActorFailed)?;
+            return resp_rx.await.map_err(|_| ZtError::ActorFailed);
         }
         Err(ZtError::ActorFailed)
     }

@@ -528,9 +528,9 @@ impl ZtConnectionActor {
         let packet_len = frozen.len();
 
         let is_client_str = if self.is_client { "CLIENT" } else { "SERVER" };
-        println!("[{}] sendmsg_vectored: pn={}, len={}", is_client_str, pn, packet_len);
+        tracing::debug!("[{}] sendmsg_vectored: pn={}, len={}", is_client_str, pn, packet_len);
         let res = self.sendmsg_vectored(&[IoSlice::new(&frozen)]);
-        println!("[{}] sendmsg_vectored res: pn={}, {:?}", is_client_str, pn, res);
+        tracing::debug!("[{}] sendmsg_vectored res: pn={}, {:?}", is_client_str, pn, res);
         res?;
         let is_mtu_probe = matches!(payload, UnackedPayload::MtuProbe { .. });
         self.state.unacked_packets.insert(

@@ -4,6 +4,7 @@ mod incoming_handler;
 mod packet_sender;
 
 use crate::error::Result;
+use crate::stats::ConnectionStats;
 use crate::stream::ZtStream;
 use crate::transport::connection::ZtConnection;
 use crate::transport::state::StreamType;
@@ -45,6 +46,9 @@ pub(crate) enum ActorMessage {
     SendDatagram {
         data: Bytes,
         respond_to: oneshot::Sender<Result<()>>,
+    },
+    GetStats {
+        respond_to: oneshot::Sender<ConnectionStats>,
     },
 }
 

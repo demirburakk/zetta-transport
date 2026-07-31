@@ -33,7 +33,7 @@ impl ZtConnectionActor {
             let is_retry = ((mutable_data[0] >> 2) & 0x0F) == 0x0C;
             let _is_initial = ((mutable_data[0] >> 2) & 0x0F) == 0;
             if !is_retry {
-                let crypto = crate::crypto::CryptoContext::initial(&dcid, true);
+                let crypto = crate::crypto::CryptoContext::initial(dcid, true);
                 crypto.remove_header_protection(&mut mutable_data, offset)?;
             }
         }
@@ -349,6 +349,46 @@ impl ZtConnectionActor {
                             self.path_validation_sent_at = None;
                             self.path_validation_retries = 0;
                         }
+            }
+            Frame::Ping => {
+                // Ping frames elicit an immediate ACK.
+                self.pending_acks += 1;
+                if self.pending_acks >= 10 {
+                    let _ = self.flush_acks();
+                }
+            }
+            Frame::ResetStream { stream_id, error_code, final_size: _ } => {
+                // Peer has abruptly terminated a stream. Remove stream state and
+                // notify the application layer by closing the data channel.
+                tracing::info!("Stream {} reset by peer with error code {}", stream_id, error_code);
+                self.state.streams.remove(&stream_id);
+            }
+            Frame::StopSending { stream_id, error_code } => {
+                // Peer requests us to stop sending on a specific stream.
+                // We acknowledge by removing our send state for this stream.
+                tracing::info!("Peer requested StopSending on stream {} (error code: {})", stream_id, error_code);
+                self.state.streams.remove(&stream_id);
+            }
+            Frame::DataBlocked { max_data } => {
+                // Peer is blocked by our connection-level flow control limit.
+                // Log the signal for debugging; flow control updates are sent separately.
+                tracing::debug!("Peer signaled DataBlocked at connection offset {}", max_data);
+            }
+            Frame::StreamDataBlocked { stream_id, max_data } => {
+                // Peer is blocked by our stream-level flow control limit.
+                tracing::debug!("Peer signaled StreamDataBlocked on stream {} at offset {}", stream_id, max_data);
+            }
+            Frame::ConnectionCloseV2 { error_code, reason } => {
+                // Enhanced connection close with error code and diagnostic reason.
+                let reason_str = String::from_utf8_lossy(&reason);
+                tracing::info!("Connection closed by peer: error_code={}, reason='{}'", error_code, reason_str);
+                self.state.state = ConnectionState::Closed;
+                self.state
+                    .closed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                for stream in self.state.streams.values() {
+                    stream.window_opened.notify_waiters();
+                }
             }
             _ => {}
         }

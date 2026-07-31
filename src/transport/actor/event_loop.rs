@@ -1,4 +1,5 @@
 use super::ActorMessage;
+use crate::stats::ConnectionStats;
 use super::ZtConnectionActor;
 use crate::stream::ZtStream;
 use crate::transport::state::{ConnectionState, StreamState};
@@ -29,6 +30,20 @@ impl ZtConnectionActor {
         tokio::pin!(delayed_ack_timer);
         tokio::pin!(mtu_probe_timer);
         tokio::pin!(pacing_timer);
+
+        // Helper macro to reset the pacing timer after flushing the pacing queue.
+        // Avoids duplicating the same if/else block across all select! branches.
+        macro_rules! reset_pacing {
+            () => {
+                if let Some(wait) = self.flush_pacing_queue() {
+                    pacing_deadline = TokioInstant::now() + wait;
+                    pacing_timer.as_mut().reset(pacing_deadline);
+                } else {
+                    pacing_deadline = TokioInstant::now() + SLEEP_FOREVER;
+                    pacing_timer.as_mut().reset(pacing_deadline);
+                }
+            };
+        }
 
         if self.is_client
             && self.state.state == ConnectionState::Handshaking
@@ -66,25 +81,13 @@ impl ZtConnectionActor {
                                     delayed_ack_timer.as_mut().reset(ack_deadline);
                                 }
                             }
-                            if let Some(wait) = self.flush_pacing_queue() {
-                                pacing_deadline = TokioInstant::now() + wait;
-                                pacing_timer.as_mut().reset(pacing_deadline);
-                            } else {
-                                pacing_deadline = TokioInstant::now() + SLEEP_FOREVER;
-                                pacing_timer.as_mut().reset(pacing_deadline);
-                            }
+                            reset_pacing!();
                         }
                         ActorMessage::OutgoingData { stream_id, data, respond_to } => {
                             self.last_active_stream_id = stream_id;
                             let result = self.process_outgoing_data(stream_id, data);
                             unacked_changed = true;
-                            if let Some(wait) = self.flush_pacing_queue() {
-                                pacing_deadline = TokioInstant::now() + wait;
-                                pacing_timer.as_mut().reset(pacing_deadline);
-                            } else {
-                                pacing_deadline = TokioInstant::now() + SLEEP_FOREVER;
-                                pacing_timer.as_mut().reset(pacing_deadline);
-                            }
+                            reset_pacing!();
                             let _ = respond_to.send(result);
                         }
                         ActorMessage::GetMtu { respond_to } => {
@@ -148,6 +151,21 @@ impl ZtConnectionActor {
                         ActorMessage::StreamDataRead { stream_id } => {
                             let _ = self.forward_stream_data(stream_id);
                         }
+                        ActorMessage::GetStats { respond_to } => {
+                            let stats = ConnectionStats {
+                                rtt: self.state.rtt,
+                                rttvar: self.state.rttvar,
+                                cwnd: self.state.cc.cwnd(),
+                                bytes_in_flight: self.state.bytes_in_flight,
+                                bytes_sent: self.state.bytes_sent,
+                                bytes_received: self.state.bytes_received,
+                                active_streams: self.state.streams.len(),
+                                key_epoch: self.state.current_key_epoch,
+                                mtu: self.state.mtu,
+                                cc_algorithm: format!("{:?}", self.endpoint.cc_algo),
+                            };
+                            let _ = respond_to.send(stats);
+                        }
                         ActorMessage::Close => {
                             let _ = self.initiate_close();
                             idle_deadline = TokioInstant::now() + Duration::from_secs(5);
@@ -161,13 +179,7 @@ impl ZtConnectionActor {
                             } else {
                                 let result = self.send_datagram_payload(data);
                                 unacked_changed = true;
-                                if let Some(wait) = self.flush_pacing_queue() {
-                                    pacing_deadline = TokioInstant::now() + wait;
-                                    pacing_timer.as_mut().reset(pacing_deadline);
-                                } else {
-                                    pacing_deadline = TokioInstant::now() + SLEEP_FOREVER;
-                                    pacing_timer.as_mut().reset(pacing_deadline);
-                                }
+                                reset_pacing!();
                                 let _ = respond_to.send(result);
                             }
                         }
@@ -198,25 +210,13 @@ impl ZtConnectionActor {
                 }
 
                 _ = &mut pacing_timer => {
-                    if let Some(wait) = self.flush_pacing_queue() {
-                        pacing_deadline = TokioInstant::now() + wait;
-                        pacing_timer.as_mut().reset(pacing_deadline);
-                    } else {
-                        pacing_deadline = TokioInstant::now() + SLEEP_FOREVER;
-                        pacing_timer.as_mut().reset(pacing_deadline);
-                    }
+                    reset_pacing!();
                     unacked_changed = true;
                 }
 
                 _ = self.socket.writable(), if self.socket_blocked => {
                     self.socket_blocked = false;
-                    if let Some(wait) = self.flush_pacing_queue() {
-                        pacing_deadline = TokioInstant::now() + wait;
-                        pacing_timer.as_mut().reset(pacing_deadline);
-                    } else {
-                        pacing_deadline = TokioInstant::now() + SLEEP_FOREVER;
-                        pacing_timer.as_mut().reset(pacing_deadline);
-                    }
+                    reset_pacing!();
                     unacked_changed = true;
                 }
 
