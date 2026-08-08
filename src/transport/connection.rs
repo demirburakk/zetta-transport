@@ -36,8 +36,8 @@ pub(crate) struct ZtConnection {
     pub(crate) rtt: Duration,
     pub(crate) rttvar: Duration,
     pub(crate) rtt_initialized: bool,
-    pub(crate) local_window: u32,
-    pub(crate) remote_window: u32,
+    pub(crate) local_window: u64,
+    pub(crate) remote_window: u64,
 
     pub(crate) cc: Box<dyn crate::transport::congestion::CongestionController>,
     pub(crate) pacing_tokens: f64,
@@ -70,10 +70,6 @@ pub(crate) struct ZtConnection {
 }
 
 impl ZtConnection {
-    // Maximum concurrent streams allowed. With 1MB window_size, this limits total
-    // stream buffer memory to ~100MB max per connection.
-    #[allow(dead_code)]
-    pub(crate) const MAX_CONCURRENT_STREAMS: usize = 100;
 
     #[allow(dead_code)]
     pub(crate) fn new(addr: SocketAddr, scid: Vec<u8>, dcid: Vec<u8>) -> Self {

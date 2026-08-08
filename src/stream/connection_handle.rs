@@ -52,24 +52,34 @@ impl ZtConnectionHandle {
 
     /// Sends an unreliable datagram to the remote peer.
     ///
-    /// Unlike streams, datagrams bypass stream sequencing, packet sorting, and
-    /// retransmissions. They are ideal for loss-tolerant, low-latency applications.
-    /// However, they are still subject to congestion control limits and pacing
-    /// to avoid network congestion.
+    /// **Why use Datagrams?**
+    /// Unlike multiplexed streams, datagrams bypass stream sequencing, packet sorting, and
+    /// retransmissions. This makes them ideal for loss-tolerant, low-latency applications where
+    /// stale data is useless (e.g., VoIP voice frames, multiplayer game state synchronizations).
+    /// 
+    /// **Note on Congestion Control:**
+    /// While datagrams bypass stream reliability, they are still subject to the connection's
+    /// active congestion control algorithm (e.g., CUBIC or Reno) and packet pacing to prevent
+    /// network flooding and bufferbloat.
     pub async fn send_datagram(&self, data: Bytes) -> Result<()> {
         self.endpoint.send_datagram(&self.cid, data).await
     }
 
     /// Receives an unreliable datagram sent by the remote peer.
     ///
-    /// Returns `None` if the connection has been terminated.
+    /// This method will yield the next available datagram payload without waiting for previous
+    /// lost packets. If the connection is gracefully closed or abruptly terminated, it returns `None`.
     pub async fn recv_datagram(&mut self) -> Option<Bytes> {
         self.incoming_datagrams.recv().await
     }
 
-    /// Returns a snapshot of the connection's current transport-level statistics.
+    /// Returns a snapshot of the connection's current transport-level telemetry and statistics.
     ///
-    /// Includes RTT estimates, congestion window, bytes in flight, and other metrics.
+    /// The `ConnectionStats` struct includes:
+    /// - `rtt` / `rttvar`: Smoothed round-trip time and jitter variance.
+    /// - `cwnd`: The current congestion window size in bytes.
+    /// - `bytes_in_flight`: Volume of data currently sent but unacknowledged.
+    /// - `mtu`: Current Path MTU discovered via PMTUD.
     pub async fn stats(&self) -> crate::error::Result<ConnectionStats> {
         self.endpoint.get_stats(&self.cid).await
     }

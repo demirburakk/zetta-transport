@@ -310,8 +310,7 @@ impl ZtConnectionActor {
             }
             Frame::MaxData { max_data } => {
                 let new_window = max_data
-                    .saturating_sub(self.state.conn_tx_offset)
-                    .min(u32::MAX as u64) as u32;
+                    .saturating_sub(self.state.conn_tx_offset);
                 let old_window = self.state.remote_window;
                 self.state.remote_window = new_window;
                 if new_window > old_window {

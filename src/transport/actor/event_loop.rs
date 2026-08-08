@@ -105,6 +105,7 @@ impl ZtConnectionActor {
                                 idle_timer.as_mut().reset(idle_deadline);
                             }
                             unacked_changed = true;
+                            reset_pacing!();
                         }
                         ActorMessage::OpenStream { stream_type, respond_to } => {
                             let opened_count = if self.is_client {
@@ -150,6 +151,7 @@ impl ZtConnectionActor {
                         }
                         ActorMessage::StreamDataRead { stream_id } => {
                             let _ = self.forward_stream_data(stream_id);
+                            reset_pacing!();
                         }
                         ActorMessage::GetStats { respond_to } => {
                             let stats = ConnectionStats {
@@ -162,7 +164,7 @@ impl ZtConnectionActor {
                                 active_streams: self.state.streams.len(),
                                 key_epoch: self.state.current_key_epoch,
                                 mtu: self.state.mtu,
-                                cc_algorithm: format!("{:?}", self.endpoint.cc_algo),
+                                cc_algorithm: self.endpoint.cc_algo,
                             };
                             let _ = respond_to.send(stats);
                         }
@@ -171,6 +173,7 @@ impl ZtConnectionActor {
                             idle_deadline = TokioInstant::now() + Duration::from_secs(5);
                             idle_timer.as_mut().reset(idle_deadline);
                             unacked_changed = true;
+                            reset_pacing!();
                         }
                         ActorMessage::SendDatagram { data, respond_to } => {
                             let data_len = data.len();
@@ -198,6 +201,7 @@ impl ZtConnectionActor {
                 _ = &mut rto_timer => {
                     if self.handle_retransmits().is_err() { break; }
                     unacked_changed = true;
+                    reset_pacing!();
                 }
 
                 _ = &mut mtu_probe_timer => {

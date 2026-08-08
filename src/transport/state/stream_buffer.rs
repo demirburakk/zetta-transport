@@ -167,13 +167,33 @@ impl StreamReceiveBuffer {
         let mut new_buf = vec![0u8; new_capacity];
         let old_cap = self.capacity;
         
-        // Copy unread data bytes from the old circular indices to the new circular indices.
-        let mut offset = self.read_head;
-        while offset < self.write_head {
-            let old_idx = (offset % old_cap as u64) as usize;
-            let new_idx = (offset % new_capacity as u64) as usize;
-            new_buf[new_idx] = self.buffer[old_idx];
-            offset += 1;
+        // Copy unread data from old circular buffer to new circular buffer
+        // using chunk-based copies (memcpy) instead of byte-by-byte iteration.
+        let data_len = (self.write_head - self.read_head) as usize;
+        let old_start = (self.read_head % old_cap as u64) as usize;
+        
+        if data_len > 0 {
+            // Extract contiguous data from old buffer (may wrap around)
+            let first_chunk_len = data_len.min(old_cap - old_start);
+            let new_start = (self.read_head % new_capacity as u64) as usize;
+            
+            // Write first chunk into new buffer (may also wrap)
+            let new_first_chunk_len = data_len.min(new_capacity - new_start);
+            
+            // Build a temporary linear copy of old data to simplify wrap handling
+            let mut linear = Vec::with_capacity(data_len);
+            linear.extend_from_slice(&self.buffer[old_start..old_start + first_chunk_len]);
+            if first_chunk_len < data_len {
+                linear.extend_from_slice(&self.buffer[..data_len - first_chunk_len]);
+            }
+            
+            // Write linear data into new circular buffer
+            new_buf[new_start..new_start + new_first_chunk_len]
+                .copy_from_slice(&linear[..new_first_chunk_len]);
+            if new_first_chunk_len < data_len {
+                new_buf[..data_len - new_first_chunk_len]
+                    .copy_from_slice(&linear[new_first_chunk_len..]);
+            }
         }
         
         self.buffer = new_buf;

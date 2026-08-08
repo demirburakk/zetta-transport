@@ -36,7 +36,20 @@ enum WriteState {
 }
 
 /// Represents a reliable, encrypted, and multiplexed data stream over a UDP connection.
-/// Behaves similarly to a TCP stream but operates within the ZettaTransport protocol.
+/// 
+/// `ZtStream` operates very similarly to a `TcpStream` but with the distinct advantage of being
+/// multiplexed. You can open hundreds of independent `ZtStream` instances on a single 
+/// `ZtConnectionHandle` without suffering from Head-of-Line (HoL) blocking.
+///
+/// **Async I/O Integration:**
+/// `ZtStream` natively implements `tokio::io::AsyncRead` and `tokio::io::AsyncWrite`. This allows
+/// you to use it seamlessly with standard Tokio utilities like `tokio::io::copy`, `read_to_end`,
+/// or `write_all`.
+///
+/// **Zero-Copy Transmissions:**
+/// For maximum throughput, use the custom `send_bytes` method. By passing a `bytes::Bytes` buffer,
+/// the stream will chunk and transmit the data directly at the MTU boundary without allocating
+/// intermediate buffers or copying the payload memory.
 pub struct ZtStream {
     pub(crate) stream_id: u32,
     receiver: mpsc::Receiver<Bytes>,

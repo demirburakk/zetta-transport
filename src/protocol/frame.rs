@@ -45,9 +45,7 @@ pub(crate) fn get_varint(src: &mut Bytes) -> Result<u64> {
 
 /// Frame types for ZettaTransport payloads.
 ///
-/// Frame type discriminants occupy bytes 0x00–0x08. PacketType discriminants
-/// use the 0x0A+ range, so there is no byte-level collision between the two
-/// namespaces.
+/// Frame type discriminants occupy bytes 0x00–0x14.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
     Padding(usize),

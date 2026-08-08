@@ -42,6 +42,7 @@ pub(super) fn derive_master_secret(
     let mut secret = [0u8; 32];
     hk.expand(b"master_secret", &mut secret)
         .expect("HKDF expand failed");
+    ikm.zeroize();
     secret
 }
 
@@ -98,29 +99,28 @@ pub(super) fn derive_epoch_keys(secret: &[u8; 32], epoch: u64, is_client: bool) 
         (mk_label("server_iv"), mk_label("client_iv"))
     };
 
-    let mut keys = EpochKeys {
-        tx_key: [0u8; 32],
-        rx_key: [0u8; 32],
-        tx_iv: [0u8; 12],
-        rx_iv: [0u8; 12],
-        tx_cipher: ChaCha20Poly1305::new([0u8; 32].as_slice().into()),
-        rx_cipher: ChaCha20Poly1305::new([0u8; 32].as_slice().into()),
-    };
+    let mut tx_key = [0u8; 32];
+    let mut rx_key = [0u8; 32];
+    let mut tx_iv = [0u8; 12];
+    let mut rx_iv = [0u8; 12];
 
-    hk.expand(&tx_label, &mut keys.tx_key)
+    hk.expand(&tx_label, &mut tx_key)
         .expect("HKDF expand tx_key failed");
-    keys.tx_cipher = ChaCha20Poly1305::new(keys.tx_key.as_slice().into());
-
-    hk.expand(&rx_label, &mut keys.rx_key)
+    hk.expand(&rx_label, &mut rx_key)
         .expect("HKDF expand rx_key failed");
-    keys.rx_cipher = ChaCha20Poly1305::new(keys.rx_key.as_slice().into());
-
-    hk.expand(&tx_iv_label, &mut keys.tx_iv)
+    hk.expand(&tx_iv_label, &mut tx_iv)
         .expect("HKDF expand tx_iv failed");
-    hk.expand(&rx_iv_label, &mut keys.rx_iv)
+    hk.expand(&rx_iv_label, &mut rx_iv)
         .expect("HKDF expand rx_iv failed");
 
-    keys
+    EpochKeys {
+        tx_key,
+        rx_key,
+        tx_iv,
+        rx_iv,
+        tx_cipher: ChaCha20Poly1305::new(tx_key.as_slice().into()),
+        rx_cipher: ChaCha20Poly1305::new(rx_key.as_slice().into()),
+    }
 }
 
 /// Derives static HP keys from the master secret without epoch suffixes.

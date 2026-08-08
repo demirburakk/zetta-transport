@@ -1,10 +1,11 @@
+use crate::transport::congestion::CongestionControlAlgorithm;
 use std::time::Duration;
 
 /// Connection-level statistics and telemetry.
 ///
 /// Provides a snapshot of the current connection state including RTT estimates,
 /// congestion window, bytes in flight, and other transport-level metrics.
-/// Obtain via [`ZtConnectionHandle::stats()`].
+/// Obtain via [`crate::stream::ZtConnectionHandle::stats()`].
 #[derive(Debug, Clone)]
 pub struct ConnectionStats {
     /// Smoothed Round-Trip Time estimate.
@@ -25,6 +26,6 @@ pub struct ConnectionStats {
     pub key_epoch: u64,
     /// Current path MTU in bytes.
     pub mtu: usize,
-    /// Current congestion control algorithm name.
-    pub cc_algorithm: String,
+    /// Current congestion control algorithm.
+    pub cc_algorithm: CongestionControlAlgorithm,
 }

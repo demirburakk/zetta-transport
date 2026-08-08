@@ -73,7 +73,11 @@ src/
     │   ├── stream_state.rs       # StreamState (tracks flow-control variables)
     │   ├── stream_buffer.rs      # StreamReceiveBuffer (dynamic circular buffer)
     │   ├── unacked.rs            # UnackedPacket, UnackedPayload
-    │   └── window.rs             # UnackedWindow, ReplayWindow (bitmask)
+    │   ├── unacked_window.rs     # UnackedWindow (sliding window ring buffer)
+    │   ├── replay_window.rs      # ReplayWindow (2048-bit bitmask)
+    │   ├── ack_tracker.rs        # AckTracker (SACK range generation)
+    │   ├── connection_state.rs   # ConnectionState enum
+    │   └── space.rs              # PacketSpace (per-encryption-level state)
     └── actor/
         ├── mod.rs                # ZtConnectionActor, ActorMessage
         ├── event_loop.rs         # Main event loop (RTO, challenge timers)
@@ -193,7 +197,7 @@ println!("RTT: {:?}, CWND: {}, In-flight: {}", stats.rtt, stats.cwnd, stats.byte
 | `active_streams` | `usize` | Number of active streams |
 | `key_epoch` | `u64` | Current key rotation epoch |
 | `mtu` | `usize` | Current path MTU |
-| `cc_algorithm` | `String` | Active CC algorithm name |
+| `cc_algorithm` | `CongestionControlAlgorithm` | Active CC algorithm |
 
 ---
 
@@ -309,7 +313,7 @@ Inside decrypted packet payloads, data is structured into sequential frames. Zet
 | `0x01` | `Stream` | `id: u32, offset: u64, data: Bytes` | Transmits stream-multiplexed data. |
 | `0x02` | `Ack` | `largest_acked: u64, window: u32, ranges: Vec` | Signals packet reception and peer window size. |
 | `0x03` | `ConnectionClose`| None | Terminates the connection immediately. |
-| `0x04` | `Handshake` | `dh_pub: [u8;32], ed_pub: [u8;32], sig: [u8;64]` | Handshake credentials exchange. |
+| `0x04` | `Handshake` | `pub_key: [u8;32], ed_pub: [u8;32], hash: Vec, sig: [u8;64], alpn: Vec` | Handshake credentials exchange. |
 | `0x05` | `Cookie` | `cookie: Bytes` | Anti-DoS proof verification. |
 | `0x06` | `StreamClose` | `id: u32` | Notifies peer that a stream has ended. |
 | `0x07` | `MaxStreamData` | `id: u32, max_data: u64` | Expands flow control limit for a specific stream. |
@@ -317,12 +321,14 @@ Inside decrypted packet payloads, data is structured into sequential frames. Zet
 | `0x09` | `Datagram` | `data: Bytes` | Transmits an unreliable datagram chunk. |
 | `0x0A` | `PathChallenge` | `data: [u8; 8]` | Asks candidate path to echo a secure random token. |
 | `0x0B` | `PathResponse` | `data: [u8; 8]` | Echoes token back to validate path bidirectionality. |
-| `0x0C` | `MaxStreams` | `max_streams: u64` | Updates peer's maximum concurrent stream limit. |
+| `0x0C` | `Crypto` | `offset: u64, data: Bytes` | Transmits TLS-like handshake and key data. |
 | `0x0D` | `Ping` | None | Keep-alive signal; elicits an ACK from the peer. |
 | `0x0E` | `ResetStream` | `stream_id: u32, error_code: u64, final_size: u64` | Abruptly terminates a stream with an error code. |
 | `0x0F` | `StopSending` | `stream_id: u32, error_code: u64` | Requests peer to stop sending on a stream. |
 | `0x10` | `DataBlocked` | `max_data: u64` | Signals sender is blocked by connection-level flow control. |
 | `0x11` | `StreamDataBlocked` | `stream_id: u32, max_data: u64` | Signals sender is blocked by stream-level flow control. |
+| `0x12` | `MaxStreams` | `max_streams: u64` | Updates peer's maximum concurrent stream limit. |
+| `0x13` | `StreamsBlocked` | `max_streams: u64` | Signals sender is blocked by connection-level stream limits. |
 | `0x14` | `ConnectionCloseV2` | `error_code: u64, reason: Vec<u8>` | Enhanced connection close with error code and diagnostic reason. |
 
 ---

@@ -35,7 +35,7 @@ pub struct ZtConfig {
     /// Maximum stream receive window after auto-tuning in bytes. Default: 16 MB.
     pub max_stream_window: u64,
     /// Initial connection-level flow control window in bytes. Default: 1 MB.
-    pub initial_max_data: u32,
+    pub initial_max_data: u64,
     /// Maximum total stream buffer memory per connection. Default: 64 MB.
     pub max_connection_buffer: usize,
 

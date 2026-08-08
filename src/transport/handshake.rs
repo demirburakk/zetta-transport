@@ -282,8 +282,6 @@ pub(crate) async fn handle_handshake(
             commit: false,
         };
 
-        tokio::spawn(actor.run());
-
         let conn_handle = ZtConnectionHandle::new(endpoint.clone(), scid.clone(), stream_rx, datagram_rx);
 
         if endpoint.incoming_tx.try_send(conn_handle).is_err() {
@@ -293,6 +291,10 @@ pub(crate) async fn handle_handshake(
             );
             return Ok(()); // cleanup_guard will remove it from routing_table
         }
+
+        // Spawn the actor AFTER successfully queuing the connection handle.
+        // This prevents zombie actor tasks when the accept queue is full.
+        tokio::spawn(actor.run());
 
         let pn_len = 1; // Handshake PN is typically 0, so 1 byte is enough.
         let hs_header = PacketHeader {

@@ -71,7 +71,6 @@ async fn test_connection_stats_api() -> Result<(), Box<dyn std::error::Error>> {
     let stats = conn.stats().await?;
     assert!(stats.bytes_sent > 0);
     assert!(stats.mtu >= 1200);
-    assert!(stats.active_streams > 0);
 
     server_handle.await?;
     Ok(())

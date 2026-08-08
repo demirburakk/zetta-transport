@@ -3,6 +3,9 @@ use crate::transport::state::UnackedPayload;
 use std::time::Duration;
 
 /// Supported congestion control algorithms for ZettaTransport.
+///
+/// **CUBIC** is the default algorithm, providing superior performance on modern, 
+/// high-bandwidth networks with high latency.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CongestionControlAlgorithm {
     /// CUBIC congestion control (RFC 8312). Scales the congestion window as a cubic
@@ -136,7 +139,7 @@ impl CongestionController for CubicController {
 
             if target_cwnd > self.cwnd {
                 let cubic_inc = target_cwnd - self.cwnd;
-                self.cwnd += cubic_inc.min(bytes_acked); // Bound the increase by acked amount
+                self.cwnd += cubic_inc.min(bytes_acked).min(self.mtu); // Bound the increase by acked amount
             } else {
                 // Reno fallback (additive increase)
                 self.cwnd += reno_inc;
@@ -170,7 +173,7 @@ impl CongestionController for CubicController {
         self.ssthresh = ((self.cwnd as f64 * beta) as usize).max(self.mtu * 2);
         self.cwnd = self.ssthresh;
 
-        self.cubic_k = ((self.cubic_w_max * (1.0 - beta)) / c).powf(1.0 / 3.0);
+        self.cubic_k = ((self.cubic_w_max * (1.0 - beta)) / c).cbrt();
         self.cubic_epoch_start = None;
         self.last_cubic_update = None;
     }
@@ -394,9 +397,9 @@ impl ZtConnection {
         }
 
         let old_remote_window = self.remote_window;
-        self.remote_window = window_size;
+        self.remote_window = window_size as u64;
 
-        if window_size > old_remote_window || bytes_acked > 0 {
+        if (window_size as u64) > old_remote_window || bytes_acked > 0 {
             for stream in self.streams.values() {
                 stream.window_opened.notify_waiters();
             }

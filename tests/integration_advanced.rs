@@ -1,3 +1,8 @@
+//! > [!NOTE]
+//! > The test suite includes a simulation test `test_extreme_network_conditions_and_congestion_recovery` which globally sets a 25% packet loss and 20% reorder rate. 
+//! > When `cargo test` runs all tests concurrently in parallel, this global state leaks into other tests, causing them to experience massive packet loss and potentially fail. 
+//! > To guarantee reliable test results across the entire project, tests should be run sequentially using `cargo test --features testing -- --test-threads=1`.
+
 #![cfg(feature = "testing")]
 
 use zetta_transport::transport::endpoint::ZtEndpoint;

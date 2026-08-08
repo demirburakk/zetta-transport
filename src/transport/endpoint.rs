@@ -43,6 +43,9 @@ pub struct ZtEndpoint {
 impl ZtEndpoint {
     /// Binds an endpoint to the given local address, defaulting to the `Cubic`
     /// congestion control algorithm.
+    ///
+    /// The `Cubic` algorithm is optimized for high-bandwidth, high-latency (BDP) networks
+    /// and is the recommended default for most applications over the classic `Reno` algorithm.
     pub async fn bind(addr: &str, psk: Option<[u8; 32]>) -> Result<Arc<Self>> {
         Self::bind_with_config(addr, psk, crate::transport::congestion::CongestionControlAlgorithm::Cubic).await
     }
@@ -50,8 +53,10 @@ impl ZtEndpoint {
     /// Binds an endpoint with the specified configuration, including a custom
     /// pre-shared key (PSK) and selection of the pluggable congestion control algorithm.
     ///
-    /// The specified `cc_algo` (e.g. `Cubic` or `Reno`) will govern the transmission rate
-    /// and backpressure management of all connections accepted or initiated by this endpoint.
+    /// The specified `cc_algo` (e.g., `Cubic` or `Reno`) will govern the transmission rate,
+    /// pacing, and backpressure management of all connections accepted or initiated by this endpoint.
+    /// This also implicitly configures the ALPN protocol to `b"zetta"` by default, which can be
+    /// overridden via `set_alpn`.
     pub async fn bind_with_config(
         addr: &str,
         psk: Option<[u8; 32]>,
@@ -71,7 +76,10 @@ impl ZtEndpoint {
             SocketAddr::V6(_) => socket2::Domain::IPV6,
         };
         let std_socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-        std_socket.set_reuse_port(true)?;
+        #[cfg(unix)]
+        if let Err(e) = std_socket.set_reuse_port(true) {
+            tracing::debug!("set_reuse_port failed on main socket: {:?}", e);
+        }
         
         let buf_size = 2 * 1024 * 1024;
         if let Err(e) = std_socket.set_recv_buffer_size(buf_size) {
@@ -143,9 +151,13 @@ impl ZtEndpoint {
     /// Starts the packet router task that dispatches incoming datagrams
     /// to the correct per-connection actor or initiates new handshakes.
     fn start_router(endpoint: Arc<Self>, socket: Arc<UdpSocket>) {
+        // Buffer size must accommodate the largest possible PMTUD probe (mtu_max=9000)
+        // plus header/tag overhead. 9200 bytes safely covers jumbo frames.
+        const RECV_BUF_SIZE: usize = 9200;
+
         tokio::spawn(async move {
             let mut local_routing_table = std::collections::HashMap::new();
-            let mut buf = bytes::BytesMut::zeroed(2048);
+            let mut buf = bytes::BytesMut::zeroed(RECV_BUF_SIZE);
             loop {
                 let mut processed = 0;
                 while processed < 64 {
@@ -156,20 +168,32 @@ impl ZtEndpoint {
                             if processed == 0 {
                                 match socket.recv_from(&mut buf).await {
                                     Ok(res) => res,
-                                    Err(_) => break,
+                                    Err(e) => {
+                                        tracing::error!("Terminal socket recv error: {}", e);
+                                        return; // Exit the router task entirely
+                                    }
                                 }
                             } else {
                                 break;
                             }
                         }
-                        Err(_) => break,
+                        // Transient ICMP errors (e.g., port unreachable) are harmless; skip.
+                        Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
+                        Err(e) => {
+                            tracing::error!("Terminal socket error in router: {}", e);
+                            return; // Exit the router task to prevent CPU spin
+                        }
                     };
 
                     let data = buf.split_to(len);
-                    if buf.capacity() < 2048 {
-                        buf = bytes::BytesMut::zeroed(2048);
+                    if buf.capacity() < RECV_BUF_SIZE {
+                        buf = bytes::BytesMut::zeroed(RECV_BUF_SIZE);
                     } else {
-                        buf.resize(2048, 0);
+                        // Reset length without re-zeroing the buffer contents.
+                        // The recv_from call will overwrite exactly what it reads,
+                        // and `split_to(len)` already gave us only the valid bytes.
+                        buf.clear();
+                        buf.resize(RECV_BUF_SIZE, 0);
                     }
 
                     if let Some(dcid_slice) = crate::protocol::routing::extract_dcid_fast(&data) {

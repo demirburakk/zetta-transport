@@ -131,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+```
 
 ### Configuration
 
@@ -152,7 +153,6 @@ let config = ZtConfig {
 // After establishing a connection:
 let stats = conn.stats().await?;
 println!("RTT: {:?}, CWND: {}, MTU: {}", stats.rtt, stats.cwnd, stats.mtu);
-```
 ```
 
 ---

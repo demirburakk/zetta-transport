@@ -120,7 +120,7 @@ impl ZtConnectionActor {
         let pn = self.state.get_next_packet_number()?;
         let key_phase = self.current_key_phase();
         let total_buffered = self.state.get_total_buffered_bytes();
-        self.state.local_window = (1024u32 * 1024u32).saturating_sub(total_buffered as u32);
+        self.state.local_window = (1024u64 * 1024u64).saturating_sub(total_buffered as u64);
         let lowest_unacked = self.state.unacked_packets.keys().next().unwrap_or(pn);
         let (_, pn_len) =
             crate::protocol::packet_number::truncate_pn(pn, lowest_unacked.saturating_sub(1));
@@ -180,7 +180,7 @@ impl ZtConnectionActor {
         let pn = self.state.get_next_packet_number()?;
         let kp = self.current_key_phase();
         self.state.local_window =
-            (1024u32 * 1024u32).saturating_sub(self.state.get_total_buffered_bytes() as u32);
+            (1024u64 * 1024u64).saturating_sub(self.state.get_total_buffered_bytes() as u64);
         let lowest_unacked = self.state.unacked_packets.keys().next().unwrap_or(pn);
         let (_, pn_len) =
             crate::protocol::packet_number::truncate_pn(pn, lowest_unacked.saturating_sub(1));
@@ -202,12 +202,18 @@ impl ZtConnectionActor {
             .map_or(0, |t| t.elapsed().as_micros() as u64);
         Frame::Ack {
             largest_acked: self.state.ack_tracker.highest_processed.unwrap_or(0),
-            window_size: self.state.local_window,
+            window_size: self.state.local_window as u32,
             ack_delay,
             ack_ranges,
         }
         .encode(&mut packet);
-        let payload_len = packet.len() - header_len;
+        let mut payload_len = packet.len() - header_len;
+        let min_payload = 4usize.saturating_sub(pn_len);
+        if payload_len < min_payload {
+            let pad = min_payload - payload_len;
+            Frame::Padding(pad).encode(&mut packet);
+            payload_len = packet.len() - header_len;
+        }
         packet.put_bytes(0, 16);
         let crypto = self.state.crypto.as_mut().ok_or(ZtError::Unauthorized)?;
         {
@@ -230,7 +236,7 @@ impl ZtConnectionActor {
     }
 
     pub(super) fn process_outgoing_data(&mut self, stream_id: u32, data: Bytes) -> Result<()> {
-        let to_send_len = data.len() as u32;
+        let to_send_len = data.len() as u64;
 
         // Check global flow control
         if self.state.remote_window < to_send_len {
@@ -239,7 +245,7 @@ impl ZtConnectionActor {
 
         // Check stream flow control
         let stream = self.state.streams.get_mut(&stream_id).ok_or(ZtError::ActorFailed)?;
-        if stream.tx_window < to_send_len as u64 {
+        if stream.tx_window < to_send_len {
             return Err(ZtError::FlowControlBlocked);
         }
 
@@ -251,10 +257,10 @@ impl ZtConnectionActor {
         }
 
         let start = stream.next_tx_offset;
-        stream.next_tx_offset += to_send_len as u64;
-        stream.tx_window -= to_send_len as u64;
+        stream.next_tx_offset += to_send_len;
+        stream.tx_window -= to_send_len;
         self.state.conn_tx_offset =
-            self.state.conn_tx_offset.saturating_add(to_send_len as u64);
+            self.state.conn_tx_offset.saturating_add(to_send_len);
         
         self.state.remote_window -= to_send_len;
         
@@ -511,7 +517,13 @@ impl ZtConnectionActor {
             }
         }
 
-        let p_len = packet.len() - h_len;
+        let mut p_len = packet.len() - h_len;
+        let min_payload = 4usize.saturating_sub(pn_len);
+        if p_len < min_payload {
+            let pad = min_payload - p_len;
+            Frame::Padding(pad).encode(&mut packet);
+            p_len = packet.len() - h_len;
+        }
         packet.put_bytes(0, 16);
         let crypto = self.state.crypto.as_mut().ok_or(ZtError::Unauthorized)?;
         {
@@ -664,7 +676,13 @@ impl ZtConnectionActor {
         let h_len = packet.len();
         frame.encode(&mut packet);
 
-        let p_len = packet.len() - h_len;
+        let mut p_len = packet.len() - h_len;
+        let min_payload = 4usize.saturating_sub(pn_len);
+        if p_len < min_payload {
+            let pad = min_payload - p_len;
+            Frame::Padding(pad).encode(&mut packet);
+            p_len = packet.len() - h_len;
+        }
         packet.put_bytes(0, 16);
         let crypto = self.state.crypto.as_mut().ok_or(ZtError::Unauthorized)?;
         {
