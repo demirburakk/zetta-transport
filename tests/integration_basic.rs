@@ -1,5 +1,5 @@
-use zetta_transport::transport::endpoint::ZtEndpoint;
 use rand::RngCore;
+use zetta_transport::transport::endpoint::ZtEndpoint;
 
 const LARGE_PAYLOAD_SIZE: usize = 500 * 1024;
 const MULTI_PAYLOAD_SIZE: usize = 50 * 1024;
@@ -23,13 +23,21 @@ async fn test_large_payload_transfer() -> Result<(), Box<dyn std::error::Error>>
                 while received.len() < LARGE_PAYLOAD_SIZE {
                     if let Some(chunk) = stream.recv().await {
                         received.extend_from_slice(&chunk);
-                        println!("[SERVER] Received chunk of {} bytes, total {}/{}", chunk.len(), received.len(), LARGE_PAYLOAD_SIZE);
+                        println!(
+                            "[SERVER] Received chunk of {} bytes, total {}/{}",
+                            chunk.len(),
+                            received.len(),
+                            LARGE_PAYLOAD_SIZE
+                        );
                     } else {
                         println!("[SERVER] Stream EOF");
                         break;
                     }
                 }
-                println!("[SERVER] Read loop finished. Echoing back {} bytes...", received.len());
+                println!(
+                    "[SERVER] Read loop finished. Echoing back {} bytes...",
+                    received.len()
+                );
                 let send_res = stream.send(&received).await;
                 println!("[SERVER] Echo send result: {:?}", send_res);
             }
@@ -51,15 +59,27 @@ async fn test_large_payload_transfer() -> Result<(), Box<dyn std::error::Error>>
     while received_data.len() < LARGE_PAYLOAD_SIZE {
         if let Some(chunk) = stream.recv().await {
             received_data.extend_from_slice(&chunk);
-            println!("[CLIENT] Received echo chunk of {} bytes, total {}/{}", chunk.len(), received_data.len(), LARGE_PAYLOAD_SIZE);
+            println!(
+                "[CLIENT] Received echo chunk of {} bytes, total {}/{}",
+                chunk.len(),
+                received_data.len(),
+                LARGE_PAYLOAD_SIZE
+            );
         } else {
             println!("[CLIENT] Client Stream EOF");
             break;
         }
     }
 
-    assert_eq!(original_data.len(), received_data.len(), "Echoed payload size mismatch");
-    assert_eq!(original_data, received_data, "Echoed payload content mismatch");
+    assert_eq!(
+        original_data.len(),
+        received_data.len(),
+        "Echoed payload size mismatch"
+    );
+    assert_eq!(
+        original_data, received_data,
+        "Echoed payload content mismatch"
+    );
 
     println!("[CLIENT] Closing stream...");
     stream.close().await?;
@@ -115,7 +135,7 @@ async fn test_multi_stream_concurrency() -> Result<(), Box<dyn std::error::Error
         let t = tokio::spawn(async move {
             let mut data = vec![i as u8; MULTI_PAYLOAD_SIZE];
             rand::thread_rng().fill_bytes(&mut data);
-            
+
             stream.send(&data).await.unwrap();
 
             let mut received = Vec::new();

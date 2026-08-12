@@ -2,11 +2,11 @@
 ///
 /// This window tracks the highest packet number processed and uses a 2048-bit
 /// sliding window (represented as `[u64; 32]`) to track out-of-order packets.
-/// 
+///
 /// - If a packet is received that is older than `highest_processed - 2048`, it is
 ///   considered too old and automatically rejected as a potential replay attack.
-/// - The 2048-packet size is chosen to be large enough to accommodate significant 
-///   packet reordering on high bandwidth-delay product networks without falsely 
+/// - The 2048-packet size is chosen to be large enough to accommodate significant
+///   packet reordering on high bandwidth-delay product networks without falsely
 ///   rejecting valid but delayed packets, while bounding memory usage securely.
 pub(crate) struct ReplayWindow {
     pub highest_processed: Option<u64>,

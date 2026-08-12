@@ -3,12 +3,12 @@ use crate::error::{Result, ZtError};
 use crate::protocol::frame::Frame;
 use crate::protocol::packet::{PacketHeader, PacketType};
 use crate::stream::ZtStream;
-use crate::transport::state::{ConnectionState, StreamState, StreamType, UnackedPayload};
+use crate::transport::state::{ConnectionState, StreamState, UnackedPayload};
 use bytes::{Buf, Bytes, BytesMut};
+use rand::Rng;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
-use rand::Rng;
 
 impl ZtConnectionActor {
     pub(super) fn process_incoming_packet(
@@ -96,14 +96,11 @@ impl ZtConnectionActor {
                 }
                 let tag_idx = payload_buf.len() - 16;
                 let tag_bytes = payload_buf.split_off(tag_idx);
-                let tag: [u8; 16] = tag_bytes
-                    .as_ref()
-                    .try_into()
-                    .map_err(|_| {
-                        // Return unauthorized, we can't recover crypto context here without a workaround,
-                        // but invalid tag size means protocol violation anyway.
-                        ZtError::InvalidPacket("Invalid tag size".into())
-                    })?;
+                let tag: [u8; 16] = tag_bytes.as_ref().try_into().map_err(|_| {
+                    // Return unauthorized, we can't recover crypto context here without a workaround,
+                    // but invalid tag size means protocol violation anyway.
+                    ZtError::InvalidPacket("Invalid tag size".into())
+                })?;
 
                 if trial_rotate {
                     if let Err(e) = crypto.trial_decrypt_and_rotate(
@@ -112,7 +109,10 @@ impl ZtConnectionActor {
                         &mut payload_buf,
                         &tag,
                     ) {
-                        tracing::debug!("Key rotation trial decryption failed for pn={}", header.packet_number);
+                        tracing::debug!(
+                            "Key rotation trial decryption failed for pn={}",
+                            header.packet_number
+                        );
                         self.state.crypto = Some(crypto);
                         return Err(e);
                     }
@@ -130,7 +130,7 @@ impl ZtConnectionActor {
                         return Err(e);
                     }
                 }
-                
+
                 self.state.crypto = Some(crypto);
 
                 // Transition server to Active upon successful decryption of 1-RTT packet.
@@ -170,17 +170,30 @@ impl ZtConnectionActor {
 
     fn handle_frame(&mut self, frame: Frame, _pn: u64, addr: SocketAddr) -> Result<()> {
         match frame {
-            Frame::Stream { id, offset, data } => {
+            Frame::Stream {
+                id,
+                stream_type,
+                offset,
+                data,
+            } => {
+                let local_stream_type = stream_type.for_peer().ok_or_else(|| {
+                    ZtError::InvalidPacket("peer sent a receive-only stream type".into())
+                })?;
                 if !self.state.streams.contains_key(&id) {
                     let expected_parity = if self.is_client { 1 } else { 0 };
                     if (id % 2) as u8 != expected_parity {
                         let _ = self.initiate_close();
-                        return Err(ZtError::InvalidPacket(
-                            "Invalid stream id parity".into(),
-                        ));
+                        return Err(ZtError::InvalidPacket("Invalid stream id parity".into()));
                     }
 
-                    if (self.state.streams.len() as u64) >= self.state.local_max_streams {
+                    let peer_parity = expected_parity as u32;
+                    let peer_opened_streams = self
+                        .state
+                        .streams
+                        .keys()
+                        .filter(|stream_id| **stream_id % 2 == peer_parity)
+                        .count() as u64;
+                    if peer_opened_streams >= self.state.local_max_streams {
                         tracing::warn!(
                             "Peer exceeded local_max_streams ({}), dropping stream {}",
                             self.state.local_max_streams,
@@ -193,9 +206,18 @@ impl ZtConnectionActor {
 
                     let (data_tx, data_rx) = mpsc::channel(2048);
                     let window_opened = Arc::new(Notify::new());
-                    self.state
-                        .streams
-                        .insert(id, StreamState::new(data_tx, window_opened.clone(), StreamType::Bidirectional));
+                    let termination = Arc::new(crate::stream::termination::Termination::default());
+                    self.state.streams.insert(
+                        id,
+                        StreamState::new(
+                            data_tx,
+                            window_opened.clone(),
+                            local_stream_type,
+                            self.endpoint.config.initial_stream_window,
+                            self.state.peer_initial_stream_window,
+                            termination.clone(),
+                        ),
+                    );
 
                     let stream = ZtStream::new(
                         id,
@@ -204,29 +226,80 @@ impl ZtConnectionActor {
                         self.state.closed.clone(),
                         self.actor_tx.clone(),
                         self.state.shared_mtu.clone(),
-                        StreamType::Bidirectional,
+                        local_stream_type,
+                        self.state.idle_timeout,
+                        termination,
                     );
                     if let Err(e) = self.incoming_streams_tx.try_send(stream) {
-                        tracing::error!("Failed to deliver incoming stream: {}. Closing connection.", e);
+                        tracing::error!(
+                            "Failed to deliver incoming stream: {}. Closing connection.",
+                            e
+                        );
                         self.state.streams.remove(&id);
                         let _ = self.initiate_close();
-                        return Err(ZtError::Io(std::io::Error::other("Application dropped connection handle")));
+                        return Err(ZtError::Io(std::io::Error::other(
+                            "Application dropped connection handle",
+                        )));
                     }
                 }
 
+                if self
+                    .state
+                    .streams
+                    .get(&id)
+                    .is_some_and(|stream| stream.stream_type != local_stream_type)
+                {
+                    let _ = self.initiate_close();
+                    return Err(ZtError::InvalidPacket(
+                        "stream type changed during transmission".into(),
+                    ));
+                }
+
+                let total_allocated = self.state.total_allocated_buffer_size();
                 let Some(stream) = self.state.streams.get_mut(&id) else {
                     return Ok(());
                 };
 
+                if stream.receive_buffer.allocated_size() == 0
+                    && total_allocated.saturating_add(stream.window_size as usize)
+                        > self.endpoint.config.max_connection_buffer
+                {
+                    let _ = self.initiate_close();
+                    return Err(ZtError::InvalidPacket(
+                        "Connection receive-buffer limit exceeded".into(),
+                    ));
+                }
+
                 // If the entire data payload is older than read_head, ignore.
-                // Note: we can still receive overlapping packets. 
-                // We'll let `StreamReceiveBuffer::write` handle writing. 
+                // Note: we can still receive overlapping packets.
+                // We'll let `StreamReceiveBuffer::write` handle writing.
                 // Wait, if offset + len <= read_head, it's fully duplicate.
-                if offset + (data.len() as u64) <= stream.receive_buffer.read_head {
+                let end_offset = offset
+                    .checked_add(data.len() as u64)
+                    .ok_or_else(|| ZtError::InvalidPacket("Stream offset overflow".into()))?;
+                if stream
+                    .final_rx_offset
+                    .is_some_and(|final_size| end_offset > final_size)
+                {
+                    let _ = self.initiate_close();
+                    return Err(ZtError::InvalidPacket(
+                        "stream data exceeds declared final size".into(),
+                    ));
+                }
+                stream.highest_rx_offset = stream.highest_rx_offset.max(end_offset);
+                if end_offset <= stream.receive_buffer.read_head {
                     self.pending_acks += 1;
                     return Ok(());
                 }
-                
+
+                let receive_limit = stream.expected_rx_offset.saturating_add(stream.window_size);
+                if end_offset > receive_limit {
+                    let _ = self.initiate_close();
+                    return Err(ZtError::InvalidPacket(
+                        "Stream flow-control limit exceeded".into(),
+                    ));
+                }
+
                 // Truncate overlapping prefix if needed, to avoid writing before read_head
                 let (write_offset, write_data) = if offset < stream.receive_buffer.read_head {
                     let diff = (stream.receive_buffer.read_head - offset) as usize;
@@ -238,24 +311,23 @@ impl ZtConnectionActor {
                 if !write_data.is_empty() {
                     match stream.receive_buffer.write(write_offset, write_data) {
                         Some(added) => {
-                            stream.buffered_bytes =
-                                stream.buffered_bytes.saturating_add(added);
+                            stream.buffered_bytes = stream.buffered_bytes.saturating_add(added);
                         }
                         None => {
-                        tracing::warn!(
-                            "Stream {} buffered data exceeds window ({} bytes), dropping",
-                            id,
-                            stream.window_size
-                        );
-                        let _ = self.initiate_close();
-                        return Err(ZtError::InvalidPacket(
-                            "Stream receive window exceeded".into(),
-                        ));
+                            tracing::warn!(
+                                "Stream {} buffered data exceeds window ({} bytes), dropping",
+                                id,
+                                stream.window_size
+                            );
+                            let _ = self.initiate_close();
+                            return Err(ZtError::InvalidPacket(
+                                "Stream receive window exceeded".into(),
+                            ));
                         }
                     }
                 }
 
-                self.forward_stream_data(id)?;
+                self.forward_stream_data(id, 0)?;
 
                 self.pending_acks += 1;
                 if self.pending_acks >= 10 {
@@ -268,6 +340,17 @@ impl ZtConnectionActor {
                 ack_delay,
                 ack_ranges,
             } => {
+                let highest_sent = self.state.next_packet_number.checked_sub(1);
+                if highest_sent.is_none_or(|highest| largest_acked > highest)
+                    || ack_ranges
+                        .iter()
+                        .any(|(start, end)| start > end || *end > largest_acked)
+                {
+                    let _ = self.initiate_close();
+                    return Err(ZtError::InvalidPacket(
+                        "ACK acknowledges an unsent packet number".into(),
+                    ));
+                }
                 let mut fast_retransmits: Vec<(UnackedPayload, u32)> = Vec::new();
                 self.state.handle_ack(
                     largest_acked,
@@ -285,6 +368,14 @@ impl ZtConnectionActor {
                 }
             }
             Frame::ConnectionClose => {
+                let reason = crate::stream::termination::TerminationReason::ConnectionClosed {
+                    error_code: 0,
+                    reason: "peer closed connection".into(),
+                };
+                self.state.termination.set(reason.clone());
+                for stream in self.state.streams.values() {
+                    stream.termination.set(reason.clone());
+                }
                 self.state.state = ConnectionState::Closed;
                 // Signal all streams that the connection is closing so their
                 // send() loops don't hang forever waiting for window_opened.
@@ -292,11 +383,25 @@ impl ZtConnectionActor {
                     .closed
                     .store(true, std::sync::atomic::Ordering::Release);
                 for stream in self.state.streams.values() {
-                    stream.window_opened.notify_waiters();
+                    stream.signal_window_opened();
                 }
             }
-            Frame::StreamClose { id } => {
-                self.state.streams.remove(&id);
+            Frame::StreamClose { id, final_size } => {
+                let Some(stream) = self.state.streams.get_mut(&id) else {
+                    return Ok(());
+                };
+                if final_size < stream.highest_rx_offset
+                    || stream
+                        .final_rx_offset
+                        .is_some_and(|existing| existing != final_size)
+                {
+                    let _ = self.initiate_close();
+                    return Err(ZtError::InvalidPacket(
+                        "inconsistent stream final size".into(),
+                    ));
+                }
+                stream.final_rx_offset = Some(final_size);
+                self.forward_stream_data(id, 0)?;
             }
             Frame::MaxStreamData { id, max_data } => {
                 if let Some(stream) = self.state.streams.get_mut(&id) {
@@ -304,18 +409,17 @@ impl ZtConnectionActor {
                     let old_window = stream.tx_window;
                     stream.tx_window = new_window;
                     if new_window > old_window {
-                        stream.window_opened.notify_waiters();
+                        stream.signal_window_opened();
                     }
                 }
             }
             Frame::MaxData { max_data } => {
-                let new_window = max_data
-                    .saturating_sub(self.state.conn_tx_offset);
+                let new_window = max_data.saturating_sub(self.state.conn_tx_offset);
                 let old_window = self.state.remote_window;
                 self.state.remote_window = new_window;
                 if new_window > old_window {
                     for stream in self.state.streams.values() {
-                        stream.window_opened.notify_waiters();
+                        stream.signal_window_opened();
                     }
                 }
             }
@@ -326,7 +430,7 @@ impl ZtConnectionActor {
                 if max_streams > self.state.peer_max_streams {
                     self.state.peer_max_streams = max_streams;
                     for stream in self.state.streams.values() {
-                        stream.window_opened.notify_waiters();
+                        stream.signal_window_opened();
                     }
                 }
             }
@@ -340,14 +444,15 @@ impl ZtConnectionActor {
             Frame::PathResponse { data } => {
                 if Some(data) == self.path_validation_token
                     && let Some(a) = self.pending_validation_addr
-                        && a == addr {
-                            tracing::info!("Path validation succeeded for address {:?}", addr);
-                            self.state.addr = addr;
-                            self.pending_validation_addr = None;
-                            self.path_validation_token = None;
-                            self.path_validation_sent_at = None;
-                            self.path_validation_retries = 0;
-                        }
+                    && a == addr
+                {
+                    tracing::info!("Path validation succeeded for address {:?}", addr);
+                    self.state.addr = addr;
+                    self.pending_validation_addr = None;
+                    self.path_validation_token = None;
+                    self.path_validation_sent_at = None;
+                    self.path_validation_retries = 0;
+                }
             }
             Frame::Ping => {
                 // Ping frames elicit an immediate ACK.
@@ -356,37 +461,94 @@ impl ZtConnectionActor {
                     let _ = self.flush_acks();
                 }
             }
-            Frame::ResetStream { stream_id, error_code, final_size: _ } => {
+            Frame::ResetStream {
+                stream_id,
+                error_code,
+                final_size,
+            } => {
                 // Peer has abruptly terminated a stream. Remove stream state and
                 // notify the application layer by closing the data channel.
-                tracing::info!("Stream {} reset by peer with error code {}", stream_id, error_code);
+                tracing::info!(
+                    "Stream {} reset by peer with error code {}",
+                    stream_id,
+                    error_code
+                );
+                if let Some(stream) = self.state.streams.get(&stream_id) {
+                    if final_size < stream.highest_rx_offset {
+                        let _ = self.initiate_close();
+                        return Err(ZtError::InvalidPacket(
+                            "reset final size is smaller than received data".into(),
+                        ));
+                    }
+                    stream.termination.set(
+                        crate::stream::termination::TerminationReason::StreamReset {
+                            stream_id,
+                            error_code,
+                        },
+                    );
+                    stream.signal_window_opened();
+                }
                 self.state.streams.remove(&stream_id);
             }
-            Frame::StopSending { stream_id, error_code } => {
-                // Peer requests us to stop sending on a specific stream.
-                // We acknowledge by removing our send state for this stream.
-                tracing::info!("Peer requested StopSending on stream {} (error code: {})", stream_id, error_code);
-                self.state.streams.remove(&stream_id);
+            Frame::StopSending {
+                stream_id,
+                error_code,
+            } => {
+                // Stop only the transmit half. A bidirectional stream may still
+                // carry peer data, so removing the whole stream would lose it.
+                tracing::info!(
+                    "Peer requested StopSending on stream {} (error code: {})",
+                    stream_id,
+                    error_code
+                );
+                if let Some(stream) = self.state.streams.get_mut(&stream_id) {
+                    stream.send_stopped_error = Some(error_code);
+                    stream.signal_window_opened();
+                }
+                self.reset_stream(stream_id, error_code)?;
             }
             Frame::DataBlocked { max_data } => {
                 // Peer is blocked by our connection-level flow control limit.
                 // Log the signal for debugging; flow control updates are sent separately.
-                tracing::debug!("Peer signaled DataBlocked at connection offset {}", max_data);
+                tracing::debug!(
+                    "Peer signaled DataBlocked at connection offset {}",
+                    max_data
+                );
             }
-            Frame::StreamDataBlocked { stream_id, max_data } => {
+            Frame::StreamDataBlocked {
+                stream_id,
+                max_data,
+            } => {
                 // Peer is blocked by our stream-level flow control limit.
-                tracing::debug!("Peer signaled StreamDataBlocked on stream {} at offset {}", stream_id, max_data);
+                tracing::debug!(
+                    "Peer signaled StreamDataBlocked on stream {} at offset {}",
+                    stream_id,
+                    max_data
+                );
             }
             Frame::ConnectionCloseV2 { error_code, reason } => {
                 // Enhanced connection close with error code and diagnostic reason.
                 let reason_str = String::from_utf8_lossy(&reason);
-                tracing::info!("Connection closed by peer: error_code={}, reason='{}'", error_code, reason_str);
+                tracing::info!(
+                    "Connection closed by peer: error_code={}, reason='{}'",
+                    error_code,
+                    reason_str
+                );
+                let termination_reason =
+                    crate::stream::termination::TerminationReason::ConnectionClosed {
+                        error_code,
+                        reason: reason_str.into_owned(),
+                    };
+                self.state.termination.set(termination_reason.clone());
+                for stream in self.state.streams.values() {
+                    stream.termination.set(termination_reason.clone());
+                }
                 self.state.state = ConnectionState::Closed;
                 self.state
                     .closed
                     .store(true, std::sync::atomic::Ordering::Release);
                 for stream in self.state.streams.values() {
-                    stream.window_opened.notify_waiters();
+                    stream.signal_window_opened();
                 }
             }
             _ => {}
@@ -394,40 +556,46 @@ impl ZtConnectionActor {
         Ok(())
     }
 
-    pub(super) fn forward_stream_data(&mut self, stream_id: u32) -> Result<()> {
-        let mut forwarded = false;
-        let mut bytes_forwarded = 0;
+    pub(super) fn forward_stream_data(&mut self, stream_id: u32, bytes_read: usize) -> Result<()> {
         let mut scale_up = false;
         let mut new_window = 0;
         let current_window_size;
+        let consumed;
 
         {
             let Some(stream) = self.state.streams.get_mut(&stream_id) else {
                 return Ok(());
             };
 
-            while let Some(chunk) = stream.receive_buffer.read_contiguous() {
-                stream.buffered_bytes =
-                    stream.buffered_bytes.saturating_sub(chunk.len());
-                let chunk_len = chunk.len();
-                if stream.app_tx.try_send(chunk).is_ok() {
-                    forwarded = true;
-                    bytes_forwarded += chunk_len;
-                } else {
+            consumed = bytes_read.min(stream.buffered_bytes);
+            stream.buffered_bytes = stream.buffered_bytes.saturating_sub(consumed);
+            stream.expected_rx_offset = stream.expected_rx_offset.saturating_add(consumed as u64);
+
+            while let Some(app_tx) = stream.app_tx.as_ref() {
+                let Ok(permit) = app_tx.try_reserve() else {
                     break;
-                }
+                };
+                let Some(chunk) = stream.receive_buffer.read_contiguous() else {
+                    break;
+                };
+                permit.send(chunk);
             }
-            
-            stream.expected_rx_offset = stream.receive_buffer.read_head;
+            if stream
+                .final_rx_offset
+                .is_some_and(|final_size| stream.receive_buffer.read_head >= final_size)
+            {
+                stream.app_tx.take();
+            }
             current_window_size = stream.window_size;
 
-            if bytes_forwarded > 0 {
-                stream.bytes_read_in_epoch += bytes_forwarded;
+            if consumed > 0 {
+                stream.bytes_read_in_epoch = stream.bytes_read_in_epoch.saturating_add(consumed);
                 if stream.bytes_read_in_epoch >= (stream.window_size / 2) as usize {
                     let elapsed = stream.last_window_update.elapsed();
                     let rtt = self.state.rtt;
                     if elapsed < rtt * 2 {
-                        new_window = (stream.window_size * 2).min(16 * 1024 * 1024);
+                        new_window =
+                            (stream.window_size * 2).min(self.endpoint.config.max_stream_window);
                         if new_window > stream.window_size {
                             scale_up = true;
                         }
@@ -441,14 +609,24 @@ impl ZtConnectionActor {
         if scale_up {
             let current_total = self.state.total_allocated_buffer_size();
             let added_size = (new_window - current_window_size) as usize;
-            if current_total + added_size <= crate::transport::connection::ZtConnection::MAX_CONNECTION_BUFFER_LIMIT {
+            if current_total.saturating_add(added_size)
+                <= self.endpoint.config.max_connection_buffer
+            {
                 if let Some(stream) = self.state.streams.get_mut(&stream_id) {
-                    tracing::info!("Auto-tuning: Scaling up stream {} window size from {} to {}", stream_id, stream.window_size, new_window);
+                    tracing::info!(
+                        "Auto-tuning: Scaling up stream {} window size from {} to {}",
+                        stream_id,
+                        stream.window_size,
+                        new_window
+                    );
                     stream.receive_buffer.resize(new_window as usize);
                     stream.window_size = new_window;
                 }
             } else {
-                tracing::warn!("Auto-tuning: Scaling up stream {} blocked (connection limit reached)", stream_id);
+                tracing::warn!(
+                    "Auto-tuning: Scaling up stream {} blocked (connection limit reached)",
+                    stream_id
+                );
             }
         }
 
@@ -457,7 +635,9 @@ impl ZtConnectionActor {
             // Only update peer with MAX_STREAM_DATA when the window can be extended
             // by a significant fraction (at least 1/4th of the window size, i.e., 256KB)
             // to avoid Silly Window Syndrome and massive packet volume.
-            if forwarded && max_data.saturating_sub(stream.last_sent_max_data) >= stream.window_size / 4 {
+            if consumed > 0
+                && max_data.saturating_sub(stream.last_sent_max_data) >= stream.window_size / 4
+            {
                 stream.last_sent_max_data = max_data;
                 let payload = UnackedPayload::MaxStreamData {
                     stream_id,
@@ -473,9 +653,9 @@ impl ZtConnectionActor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::endpoint::ZtEndpoint;
-    use crate::transport::connection::ZtConnection;
     use crate::protocol::frame::Frame;
+    use crate::transport::connection::ZtConnection;
+    use crate::transport::endpoint::ZtEndpoint;
     use crate::transport::state::ConnectionState;
     use std::net::SocketAddr;
     use tokio::sync::mpsc;
@@ -484,25 +664,27 @@ mod tests {
     async fn test_incoming_handler_path_validation() {
         let endpoint = ZtEndpoint::bind("127.0.0.1:0", None).await.unwrap();
         let socket = endpoint.socket.clone();
-        
+
         let scid = vec![1, 2, 3, 4];
         let dcid = vec![5, 6, 7, 8];
         let original_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let migrated_addr: SocketAddr = "127.0.0.1:54321".parse().unwrap();
-        
+
         let mut conn = ZtConnection::new(original_addr, scid.clone(), dcid.clone());
-        conn.crypto = Some(Box::new(crate::crypto::CryptoContext::initial(&dcid, false)));
-        
+        conn.crypto = Some(Box::new(crate::crypto::CryptoContext::initial(
+            &dcid, false,
+        )));
+
         let (_, rx) = mpsc::channel(1);
         let (stream_tx, _) = mpsc::channel(1);
         let (datagram_tx, _) = mpsc::channel(1);
         let (actor_tx, _) = mpsc::channel(1);
-        
+
         let mut csprng = rand::rngs::OsRng;
         let (ephemeral_secret, ephemeral_public) = crate::crypto::keypair::generate_keypair();
         let client_ed_signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
         let client_ed_public_key = client_ed_signing_key.verifying_key();
-        
+
         let mut actor = ZtConnectionActor::new(
             endpoint.clone(),
             socket,
@@ -521,24 +703,28 @@ mod tests {
             false,
             actor_tx,
         );
-        
+
         actor.state.state = ConnectionState::Active;
-        
+
         // 1. Send PathChallenge from migrated address.
         let challenge_token = [0xAA; 8];
-        let frame_challenge = Frame::PathChallenge { data: challenge_token };
+        let frame_challenge = Frame::PathChallenge {
+            data: challenge_token,
+        };
         let res = actor.handle_frame(frame_challenge, 0, migrated_addr);
         assert!(res.is_ok());
-        
+
         // 2. Set the pending validation parameters manually.
         actor.pending_validation_addr = Some(migrated_addr);
         actor.path_validation_token = Some(challenge_token);
-        
+
         // Now receive PathResponse matching the token and address
-        let frame_response = Frame::PathResponse { data: challenge_token };
+        let frame_response = Frame::PathResponse {
+            data: challenge_token,
+        };
         let res = actor.handle_frame(frame_response, 0, migrated_addr);
         assert!(res.is_ok());
-        
+
         // Verify connection migrated!
         assert_eq!(actor.state.addr, migrated_addr);
         assert_eq!(actor.pending_validation_addr, None);
@@ -549,23 +735,23 @@ mod tests {
     async fn test_incoming_handler_max_streams_limit_update() {
         let endpoint = ZtEndpoint::bind("127.0.0.1:0", None).await.unwrap();
         let socket = endpoint.socket.clone();
-        
+
         let scid = vec![1, 2, 3, 4];
         let dcid = vec![5, 6, 7, 8];
         let original_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        
+
         let conn = ZtConnection::new(original_addr, scid.clone(), dcid.clone());
-        
+
         let (_, rx) = mpsc::channel(1);
         let (stream_tx, _) = mpsc::channel(1);
         let (datagram_tx, _) = mpsc::channel(1);
         let (actor_tx, _) = mpsc::channel(1);
-        
+
         let mut csprng = rand::rngs::OsRng;
         let (ephemeral_secret, ephemeral_public) = crate::crypto::keypair::generate_keypair();
         let client_ed_signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
         let client_ed_public_key = client_ed_signing_key.verifying_key();
-        
+
         let mut actor = ZtConnectionActor::new(
             endpoint.clone(),
             socket,
@@ -584,21 +770,21 @@ mod tests {
             false,
             actor_tx,
         );
-        
+
         assert_eq!(actor.state.peer_max_streams, 100);
-        
+
         // Handle MaxStreams frame increasing peer_max_streams
         let frame = Frame::MaxStreams { max_streams: 150 };
         let res = actor.handle_frame(frame, 0, original_addr);
         assert!(res.is_ok());
-        
+
         assert_eq!(actor.state.peer_max_streams, 150);
-        
+
         // Handle MaxStreams frame trying to decrease peer_max_streams (should be ignored)
         let frame_low = Frame::MaxStreams { max_streams: 80 };
         let res = actor.handle_frame(frame_low, 0, original_addr);
         assert!(res.is_ok());
-        
+
         assert_eq!(actor.state.peer_max_streams, 150);
     }
 }

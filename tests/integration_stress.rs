@@ -1,6 +1,6 @@
-use zetta_transport::transport::endpoint::ZtEndpoint;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use zetta_transport::transport::endpoint::ZtEndpoint;
 
 #[tokio::test]
 async fn test_stream_concurrency_stress() -> Result<(), Box<dyn std::error::Error>> {
@@ -91,10 +91,10 @@ async fn test_rtt_ack_delay_compensation() -> Result<(), Box<dyn std::error::Err
         {
             let mut buf = vec![0u8; 7];
             let _ = stream.read_exact(&mut buf).await.unwrap();
-            
+
             // Simulate a receiver processing delay (e.g. 150ms delay)
             tokio::time::sleep(Duration::from_millis(150)).await;
-            
+
             stream.write_all(b"response").await.unwrap();
             stream.flush().await.unwrap();
         }

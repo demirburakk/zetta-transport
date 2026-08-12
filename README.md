@@ -1,96 +1,68 @@
-# ZettaTransport (ZT)
+# ZettaTransport
+
+[![crates.io](https://img.shields.io/crates/v/zetta-transport.svg)](https://crates.io/crates/zetta-transport)
+[![docs.rs](https://docs.rs/zetta-transport/badge.svg)](https://docs.rs/zetta-transport)
+[![license](https://img.shields.io/crates/l/zetta-transport.svg)](#license)
+
+ZettaTransport is an experimental encrypted and multiplexed transport protocol over UDP, written
+in Rust. One connection carries independent reliable byte streams and unreliable messages while
+sharing congestion control, pacing, flow control, path validation, and path-MTU discovery.
 
 > [!WARNING]
-> **Experimental / Hobby & Learning Project**
->
-> ZettaTransport is an educational research project built to explore the internals of modern transport protocols. It has **not** been audited for security, is **not** production-ready, and should **not** be deployed in real-world applications. If you need a production-grade UDP-based multiplexed transport, please use standard [QUIC](https://datatracker.ietf.org/doc/html/rfc9000) implementations such as [Quinn](https://github.com/quinn-rs/quinn) or [s2n-quic](https://github.com/aws/s2n-quic).
+> ZettaTransport is a research and learning project. It is a custom protocol—not QUIC—has not
+> received an independent security audit, and is not production-ready. Use a standards-based QUIC
+> implementation when interoperability or production assurance matters.
 
----
+## What the crate provides
 
-ZettaTransport is a custom, multiplexed, encrypted transport protocol implemented over UDP in Rust. It provides reliable, stream-oriented delivery alongside low-latency unreliable datagram channels, pluggable congestion control, and secure path migration.
+- Bidirectional and unidirectional reliable ordered streams
+- Tokio `AsyncRead` and `AsyncWrite` integration
+- Unordered, unretransmitted application datagrams
+- ChaCha20-Poly1305 packet protection and ChaCha20 header protection
+- Ephemeral X25519 key agreement and Ed25519 handshake signatures
+- Optional 32-byte pre-shared key and application-defined public-key verification
+- Signed transport-parameter negotiation and ALPN equality checking
+- CUBIC or Reno congestion control with packet pacing
+- Stream and connection flow control with receive-window auto-tuning
+- Retry cookies, replay filtering, key updates, path validation, and PMTUD
+- Typed peer-close and stream-reset errors plus connection telemetry
 
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue.svg)](#license)
-
----
-
-## Key Features
-
-- **Multiplexed Streams**: Open multiple independent streams over a single connection to eliminate head-of-line blocking.
-- **Idiomatic Async I/O**: `ZtStream` fully implements Tokio's `AsyncRead` and `AsyncWrite` traits, allowing seamless integration with standard tools like `tokio::io::copy`.
-- **Zero-Copy Transmissions**: Leverage `send_bytes` to transmit `bytes::Bytes` payloads without copying overhead.
-- **Pluggable Congestion Control**: Supports switching algorithms on a per-endpoint basis, including implementations for **CUBIC** (RFC 8312) and classic **TCP Reno** (AIMD).
-- **Unreliable Datagrams**: Exposes non-reliable, congestion-controlled datagram channels (`send_datagram` / `recv_datagram`) that bypass stream sequencing and packet retransmissions.
-- **Auto-Tuning Flow Control**: Tracks stream consumption relative to Round-Trip Time (RTT) and dynamically doubles the flow control window (up to 16MB) to sustain high-throughput networks.
-- **Secure Path Migration**: Automatically detects IP/port changes, triggering a cryptographically secure 3-way `PathChallenge` / `PathResponse` handshake to prevent reflection and amplification DDoS attacks.
-- **Cryptographic Security**: Every packet is encrypted with ChaCha20-Poly1305 AEAD, authenticated via Ed25519 signatures over X25519 Diffie-Hellman handshakes, protected via AES-128 header obfuscation, and protected against replays with a sliding bitmask.
-- **Configuration System (`ZtConfig`)**: Centralized, type-safe configuration with sensible defaults for all protocol parameters — timeouts, flow control, MTU bounds, and congestion control algorithm.
-- **Connection Statistics API**: Real-time telemetry via `conn.stats()` providing RTT, congestion window, bytes in flight, key epoch, and more.
-- **Extended Frame Support**: Implements `Ping`, `ResetStream`, `StopSending`, `DataBlocked`, `StreamDataBlocked`, and `ConnectionCloseV2` frames for comprehensive signaling.
-
----
-
-## Protocol Architecture
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                   Application Layer                      │
-│        ZtStream (Async I/O)  ·  ZtConnectionHandle       │
-├──────────────────────────────────────────────────────────┤
-│                    Transport Layer                       │
-│  ZtEndpoint  →  Packet Router  →  ZtConnectionActor      │
-│                                   (per-connection loop)  │
-├──────────────────────────────────────────────────────────┤
-│                    Protocol Layer                        │
-│         PacketHeader  ·  Frame  ·  PacketNumber          │
-├──────────────────────────────────────────────────────────┤
-│                    Crypto Layer                          │
-│  X25519 DH  ·  HKDF/SHA-256  ·  ChaCha20-Poly1305        │
-│  AES-128 Header Protection  ·  Ed25519 Auth              │
-└──────────────────────────────────────────────────────────┘
-                         UDP / OS
-```
-
-Each connection is driven by an async actor task (`ZtConnectionActor`) implementing a single-threaded async event loop. The `ZtEndpoint` demultiplexes incoming UDP datagrams to the correct actor using Connection IDs (CIDs).
-
----
-
-## Quick Start
-
-Add ZettaTransport to your `Cargo.toml`:
+## Install
 
 ```toml
 [dependencies]
-zetta-transport = { path = "." }
+zetta-transport = "0.1.26"
 tokio = { version = "1", features = ["full"] }
 bytes = "1"
 ```
 
-### Echo Server (Async Read/Write)
+The public API documentation is on [docs.rs](https://docs.rs/zetta-transport). Protocol version 2
+is described in [DOCUMENTATION.md](DOCUMENTATION.md).
 
-```rust
-use zetta_transport::transport::endpoint::ZtEndpoint;
-use zetta_transport::transport::CongestionControlAlgorithm;
+## Echo server
+
+```rust,no_run
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use zetta_transport::transport::endpoint::ZtEndpoint;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Bind the server with Reno Congestion Control (or CongestionControlAlgorithm::Cubic)
-    let server = ZtEndpoint::bind_with_config(
-        "127.0.0.1:8080", 
-        None, 
-        CongestionControlAlgorithm::Reno
-    ).await?;
-    println!("Server listening on {}", server.local_addr()?);
+    let endpoint = ZtEndpoint::bind("0.0.0.0:4433", None).await?;
+    println!("listening on {}", endpoint.local_addr()?);
 
-    while let Some(mut conn) = server.accept().await {
+    while let Some(mut connection) = endpoint.accept().await {
         tokio::spawn(async move {
-            while let Some(mut stream) = conn.accept_stream().await {
+            while let Some(mut stream) = connection.accept_stream().await {
                 tokio::spawn(async move {
-                    let mut buf = vec![0u8; 1024];
-                    while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 { break; } // EOF
-                        let _ = stream.write_all(&buf[..n]).await;
-                        let _ = stream.flush().await;
+                    let mut buffer = [0_u8; 16 * 1024];
+                    loop {
+                        let read = match stream.read(&mut buffer).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => read,
+                        };
+                        if stream.write_all(&buffer[..read]).await.is_err() {
+                            break;
+                        }
                     }
                 });
             }
@@ -100,89 +72,183 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Client (Async Read/Write & Datagrams)
+## Client
 
-```rust
-use zetta_transport::transport::endpoint::ZtEndpoint;
-use bytes::Bytes;
+```rust,no_run
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use zetta_transport::transport::endpoint::ZtEndpoint;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = ZtEndpoint::bind("127.0.0.1:0", None).await?;
-    let mut conn = client.connect("127.0.0.1:8080".parse()?).await?;
+    let endpoint = ZtEndpoint::bind("0.0.0.0:0", None).await?;
+    let connection = endpoint.connect("127.0.0.1:4433".parse()?).await?;
+    let mut stream = connection.open_stream().await?;
 
-    // 1. Send an unreliable datagram
-    conn.send_datagram(Bytes::from_static(b"unreliable alert")).await?;
-    if let Some(datagram) = conn.recv_datagram().await {
-        println!("Received datagram: {:?}", datagram);
-    }
-
-    // 2. Open an async stream
-    let mut stream = conn.open_stream().await?;
-    
-    // Zero-copy transmission
-    stream.send_bytes(Bytes::from_static(b"Hello ZettaTransport")).await?;
+    stream.write_all(b"hello").await?;
     stream.flush().await?;
 
-    let mut reply = vec![0u8; 1024];
-    let n = stream.read(&mut reply).await?;
-    println!("Got stream reply: {}", String::from_utf8_lossy(&reply[..n]));
-
+    let mut reply = [0_u8; 5];
+    stream.read_exact(&mut reply).await?;
+    assert_eq!(&reply, b"hello");
     Ok(())
 }
 ```
 
-### Configuration
+`ZtStream` also offers `send`, `send_bytes`, and `recv_result`. The custom receive method is useful
+when message chunks are more convenient than Tokio's byte-oriented traits; `recv_result` preserves
+the peer's reset or close cause.
 
-```rust
+## Stream direction
+
+`open_stream()` creates a bidirectional stream. To create a send-only stream:
+
+```rust,no_run
+# use zetta_transport::error::Result;
+# use zetta_transport::stream::ZtConnectionHandle;
+use zetta_transport::transport::StreamType;
+
+# async fn example(connection: &ZtConnectionHandle) -> Result<()> {
+let stream = connection
+    .open_stream_with_type(StreamType::UnidirectionalOut)
+    .await?;
+stream.send(b"one-way payload").await?;
+stream.close().await?;
+# Ok(())
+# }
+```
+
+The peer accepts the same stream as `UnidirectionalIn`. A local application cannot directly open
+an incoming-only stream. Attempts to write to an incoming-only stream fail.
+
+## Unreliable datagrams
+
+Datagrams are encrypted, congestion-controlled, and paced, but they are not ordered or
+retransmitted. Use them only when losing a complete message is acceptable.
+
+```rust,no_run
+# use zetta_transport::error::Result;
+# use zetta_transport::stream::ZtConnectionHandle;
+use bytes::Bytes;
+
+# async fn example(mut connection: ZtConnectionHandle) -> Result<()> {
+connection
+    .send_datagram(Bytes::from_static(b"current position"))
+    .await?;
+
+if let Some(message) = connection.recv_datagram_result().await? {
+    println!("{} bytes", message.len());
+}
+# Ok(())
+# }
+```
+
+Payloads larger than the peer's negotiated datagram limit are rejected; ZettaTransport does not
+fragment application datagrams.
+
+## Configuration
+
+Create `ZtConfig` with struct-update syntax. Endpoint binding validates all wire-format, timeout,
+MTU, and resource-limit relationships before opening the socket.
+
+```rust,no_run
+use std::time::Duration;
 use zetta_transport::config::ZtConfig;
-use zetta_transport::transport::CongestionControlAlgorithm;
+use zetta_transport::transport::{CongestionControlAlgorithm, endpoint::ZtEndpoint};
 
+# async fn example() -> zetta_transport::error::Result<()> {
 let config = ZtConfig {
-    cc_algorithm: CongestionControlAlgorithm::Reno,
-    max_concurrent_streams: 200,
-    idle_timeout: std::time::Duration::from_secs(120),
+    alpn: b"my-application/1".to_vec(),
+    idle_timeout: Duration::from_secs(30),
+    max_concurrent_streams: 256,
+    initial_stream_window: 2 * 1024 * 1024,
+    initial_max_data: 8 * 1024 * 1024,
+    cc_algorithm: CongestionControlAlgorithm::Cubic,
     ..ZtConfig::default()
 };
+
+let endpoint = ZtEndpoint::bind_with_zt_config("0.0.0.0:0", config).await?;
+# drop(endpoint);
+# Ok(())
+# }
 ```
 
-### Connection Statistics
+Important defaults are a 5-second connect timeout, 60-second idle timeout, 100 concurrent streams,
+a 1 MiB initial stream window, a 1 MiB connection window, a 1200-byte initial MTU, and CUBIC.
+See [`ZtConfig`](https://docs.rs/zetta-transport/latest/zetta_transport/config/struct.ZtConfig.html)
+for every field and validation rule.
 
-```rust
-// After establishing a connection:
-let stats = conn.stats().await?;
-println!("RTT: {:?}, CWND: {}, MTU: {}", stats.rtt, stats.cwnd, stats.mtu);
+## Peer authentication
+
+Each bound endpoint creates an Ed25519 identity. Signatures protect handshake integrity, but the
+default policy accepts every valid identity: it does not associate a key with a hostname or user.
+Install a verifier when the application already knows the expected 32-byte public key:
+
+```rust,no_run
+use std::sync::Arc;
+use zetta_transport::transport::endpoint::{PeerKeyVerifier, ZtEndpoint};
+
+# async fn example(expected_key: [u8; 32]) -> zetta_transport::error::Result<()> {
+let endpoint = ZtEndpoint::bind("0.0.0.0:0", None).await?;
+let verifier: PeerKeyVerifier = Arc::new(move |presented| presented == &expected_key);
+endpoint.set_peer_key_verifier(Some(verifier));
+# Ok(())
+# }
 ```
 
----
+The generated identity is currently ephemeral. Applications are responsible for distributing and
+pinning keys. A matching PSK can be supplied to both peers through `ZtConfig::psk` (or the compact
+`bind` constructor), but it is not a replacement for a complete identity lifecycle.
 
-## Running Tests & Simulations
+## Shutdown and error handling
 
-To run unit, integration, and network loss recovery simulation tests:
+- `ZtStream::close()` sends the final stream offset and permits the peer to consume reordered tail
+  data before EOF.
+- `ZtStream::reset(code)` aborts a stream and exposes `ZtError::StreamReset` to the peer.
+- `ZtConnectionHandle::close()` performs a reasonless close.
+- `close_with_error(code, reason)` exposes `ZtError::ConnectionClosedByPeer` to the peer.
+- `recv_result`, `accept_stream_result`, and `recv_datagram_result` preserve termination causes.
+  Their `Option` convenience counterparts intentionally collapse termination into `None`.
+
+## Telemetry
+
+```rust,no_run
+# use zetta_transport::error::Result;
+# use zetta_transport::stream::ZtConnectionHandle;
+# async fn example(connection: &ZtConnectionHandle) -> Result<()> {
+let stats = connection.stats().await?;
+println!(
+    "rtt={:?} cwnd={} in_flight={} mtu={} lost={}",
+    stats.rtt, stats.cwnd, stats.bytes_in_flight, stats.mtu, stats.packets_lost
+);
+# Ok(())
+# }
+```
+
+Snapshots also expose byte counters, RTT variance, active streams, key epoch, retransmissions,
+PMTUD outcomes, and black-hole recovery events.
+
+## Compatibility
+
+Crate version 0.1.26 uses ZettaTransport wire protocol version 2. It is intentionally incompatible
+with protocol version 1 because version 2 authenticates transport parameters, carries stream
+direction on every stream frame, and includes the final byte offset in graceful stream closure.
+No compatibility with QUIC, TCP, DTLS, or any other transport is implied. The wire format may
+change again before a stable release.
+
+## Development
 
 ```bash
-cargo test --features testing
+cargo test --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
+cargo audit
 ```
 
-To run clippy or check that everything builds with zero warnings:
-
-```bash
-cargo clippy --all-targets --all-features
-```
-
-For verbose protocol tracing during tests:
-
-```bash
-RUST_LOG=debug cargo test --features testing -- --nocapture
-```
-
----
+The `testing` feature exposes deterministic endpoint-scoped loss, reordering, burst-loss, and MTU
+black-hole injection. It is intended only for protocol tests. The repository also contains a
+libFuzzer frame-decoder target under `fuzz/`.
 
 ## License
 
-Licensed under either of:
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+Licensed under either the [Apache License 2.0](LICENSE-APACHE) or the [MIT License](LICENSE-MIT), at
+your option.

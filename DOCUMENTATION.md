@@ -1,466 +1,356 @@
-# ZettaTransport — Technical Documentation
+# ZettaTransport protocol version 2
+
+This document is the implementation guide for the wire protocol spoken by `zetta-transport`
+0.1.26. It complements the generated [Rust API documentation](https://docs.rs/zetta-transport):
+docs.rs explains how to use the crate, while this file explains how another implementation can
+encode, authenticate, and process packets.
 
 > [!WARNING]
-> This document details the internal design and technical implementation details of ZettaTransport. ZettaTransport is an educational hobby and learning project. It is **not** production-ready and has **not** been audited for security. For a quick start and basic example code, see [README.md](README.md).
+> This is an experimental, non-standard protocol. It is not QUIC, has not received an independent
+> security audit, and is not production-ready. The implementation is the ultimate authority if
+> this document and the source ever disagree.
 
----
+All multi-byte fixed-width integers use network byte order (big endian). `varint` below means a
+1-, 2-, 4-, or 8-byte unsigned integer whose two most significant bits select the width (`00`,
+`01`, `10`, or `11`); the remaining 6, 14, 30, or 62 bits carry the value.
 
-## Table of Contents
+## 1. Design and architecture
 
-1. [Module Design](#module-design)
-2. [Public API & Component Reference](#public-api--component-reference)
-   - [ZtEndpoint](#ztendpoint)
-   - [ZtConnectionHandle](#ztconnectionhandle)
-   - [ZtStream](#ztstream)
-   - [CongestionControlAlgorithm](#congestioncontrolalgorithm)
-   - [ZtError](#zterror)
-3. [Protocol & Packet Format](#protocol--packet-format)
-   - [Long Header Packets](#long-header-packets)
-   - [Short Header Packets](#short-header-packets)
-4. [Frame Reference](#frame-reference)
-5. [Cryptographic Design](#cryptographic-design)
-   - [Handshake Cryptography](#handshake-cryptography)
-   - [In-Place Encryption](#in-place-encryption)
-   - [Header Protection](#header-protection)
-   - [Replay Protection](#replay-protection)
-6. [Connection Lifecycle & Path Validation](#connection-lifecycle--path-validation)
-   - [Handshake Sequence](#handshake-sequence)
-   - [Path Validation and IP Migration](#path-validation-and-ip-migration)
-7. [Stream Multiplexing & Flow Control](#stream-multiplexing--flow-control)
-   - [Multiplexing Mechanics](#multiplexing-mechanics)
-   - [Auto-Tuning Flow Control](#auto-tuning-flow-control)
-8. [Congestion Control & Pacing](#congestion-control--pacing)
-   - [Pluggable Congestion Controller](#pluggable-congestion-controller)
-   - [Unreliable Datagram Lifecycle](#unreliable-datagram-lifecycle)
-9. [Actor Loop Architecture](#actor-loop-architecture)
+ZettaTransport runs over UDP. A `ZtEndpoint` owns one socket, routes packets by destination
+connection ID (DCID), and creates one asynchronous actor per connection. The actor is the sole
+writer of connection state and handles application commands, packets, pacing, retransmission,
+idle timeout, PMTUD, and path validation.
 
----
+The public layering is:
 
-## Module Design
-
-The codebase layout is separated into modular components:
-
-```
-src/
-├── lib.rs                        # Crate root; re-exports public API
-├── error.rs                      # ZtError, Result<T>
-├── config.rs                     # ZtConfig — endpoint configuration
-├── stats.rs                      # ConnectionStats — runtime telemetry
-├── crypto/
-│   ├── mod.rs                    # Re-exports CryptoContext
-│   ├── keypair.rs                # X25519 keypair generation + DH
-│   ├── key_derivation.rs         # HKDF helpers, epoch key derivation, ratchet
-│   ├── header_protection.rs      # AES-128 apply/remove header protection
-│   └── context.rs                # CryptoContext (per-connection crypto state)
-├── protocol/
-│   ├── mod.rs
-│   ├── frame.rs                  # Frame enum + encode/decode
-│   ├── packet.rs                 # PacketHeader encode/decode, PacketType
-│   ├── packet_number.rs          # PN truncation and expansion
-│   └── routing.rs                # Fast DCID extraction
-├── stream/
-│   ├── mod.rs                    # Re-exports ZtStream, ZtConnectionHandle
-│   ├── stream.rs                 # AsyncRead/AsyncWrite state machines, send_bytes
-│   └── connection_handle.rs      # Public connection handle, Datagram API
-└── transport/
-    ├── mod.rs
-    ├── endpoint.rs               # ZtEndpoint — public entry point
-    ├── connection.rs             # ZtConnection — per-connection state struct
-    ├── handshake.rs              # Server-side handshake handler
-    ├── congestion.rs             # Pluggable CC, CubicController, RenoController
-    ├── cookie.rs                 # HMAC Retry cookie generation/verification
-    ├── state/
-    │   ├── stream_state.rs       # StreamState (tracks flow-control variables)
-    │   ├── stream_buffer.rs      # StreamReceiveBuffer (dynamic circular buffer)
-    │   ├── unacked.rs            # UnackedPacket, UnackedPayload
-    │   ├── unacked_window.rs     # UnackedWindow (sliding window ring buffer)
-    │   ├── replay_window.rs      # ReplayWindow (2048-bit bitmask)
-    │   ├── ack_tracker.rs        # AckTracker (SACK range generation)
-    │   ├── connection_state.rs   # ConnectionState enum
-    │   └── space.rs              # PacketSpace (per-encryption-level state)
-    └── actor/
-        ├── mod.rs                # ZtConnectionActor, ActorMessage
-        ├── event_loop.rs         # Main event loop (RTO, challenge timers)
-        ├── incoming_handler.rs   # Decryption, validation & frame dispatch
-        ├── handshake_handler.rs  # Client-side handshake + retry
-        └── packet_sender.rs      # Outgoing packet construction & pacing
+```text
+application
+  ├─ ZtConnectionHandle: stream and datagram lifecycle
+  └─ ZtStream: reliable bytes, AsyncRead, AsyncWrite
+endpoint
+  └─ UDP receive loop and DCID routing
+connection actor
+  ├─ handshake and key epochs
+  ├─ frame processing and stream state
+  ├─ flow/congestion control and recovery
+  └─ path validation and PMTUD
+wire
+  └─ protected packet header + protected frame sequence + AEAD tag
 ```
 
----
+The relevant source directories are `src/protocol` (encoding), `src/crypto` (key schedule and
+packet protection), `src/transport` (state machines), and `src/stream` (application handles).
 
-## Public API & Component Reference
+## 2. Version and compatibility
 
-### `ZtEndpoint`
+The four-byte long-header version is `0x00000002`. An endpoint silently drops unsupported versions;
+there is no version-negotiation packet. Version 2 is incompatible with version 1 because it:
 
-Binds directly to a local UDP port. Manages connection routing, handshakes, and actor generation.
+- includes transport parameters in the signed handshake transcript;
+- carries stream direction in `STREAM` frames; and
+- carries `final_size` in `STREAM_CLOSE` frames.
 
-```rust
-pub struct ZtEndpoint {
-    pub ed_public_key: VerifyingKey,
-    pub verify_peer_key: Option<PeerKeyVerifier>,
-    // Private fields: socket, routing tables, and configurations.
-}
+The protocol has no compatibility relationship with QUIC, DTLS, TCP, or TLS. Before a stable crate
+release, any wire field may change in a new protocol version.
+
+## 3. Packet headers
+
+The first byte has this common structure:
+
+```text
+bit       7        6        5 4 3 2        1 0
+long    long=1   unused     packet type   PN length - 1
+short   long=0  key phase   packet type   PN length - 1
 ```
 
-#### Constructors & Methods
-- `pub async fn bind(addr: &str, psk: Option<[u8; 32]>) -> Result<Arc<Self>>`
-  Binds the endpoint using the default **CUBIC** congestion control algorithm.
-- `pub async fn bind_with_config(addr: &str, psk: Option<[u8; 32]>, cc_algo: CongestionControlAlgorithm) -> Result<Arc<Self>>`
-  Binds the endpoint specifying the congestion control algorithm used for all connections accepted or initiated by this endpoint.
-- `pub async fn connect(self: &Arc<Self>, addr: SocketAddr) -> Result<ZtConnectionHandle>`
-  Initiates an outgoing handshake to a server. Times out after 5 seconds if unanswered.
-- `pub async fn accept(&self) -> Option<ZtConnectionHandle>`
-  Yields the next established connection handle accepted by the server. Returns `None` if the endpoint is dropped.
-- `pub fn local_addr(&self) -> Result<SocketAddr>`
-  Returns the bound socket address.
+Packet number length is therefore 1 through 4 bytes. The sender transmits the least-significant
+bytes and the receiver expands them relative to its largest processed packet number.
 
----
+### 3.1 Long header
 
-### `ZtConnectionHandle`
-
-Exposes stream and datagram APIs on a successfully established connection.
-
-```rust
-pub struct ZtConnectionHandle {
-    endpoint: Arc<ZtEndpoint>,
-    cid: Vec<u8>,
-    incoming_streams: mpsc::Receiver<ZtStream>,
-    incoming_datagrams: mpsc::Receiver<Bytes>,
-}
+```text
+first:u8
+version:u32
+dcid_len:u8 | dcid:bytes[dcid_len]
+scid_len:u8 | scid:bytes[scid_len]
+packet_number:bytes[pn_len]
+protected_payload:bytes[..]
+tag:bytes[16]
 ```
 
-#### Methods
-- `pub async fn open_stream(&self) -> Result<ZtStream>`
-  Asynchronously opens a new outgoing stream to the remote peer.
-- `pub async fn accept_stream(&mut self) -> Option<ZtStream>`
-  Yields the next incoming stream initiated by the remote peer. Returns `None` when closed.
-- `pub async fn send_datagram(&self, data: Bytes) -> Result<()>`
-  Transmits an unreliable datagram. Datagrams bypass stream reordering buffers and packet retransmission logic but remain subject to congestion control limits and transmission pacing.
-- `pub async fn recv_datagram(&mut self) -> Option<Bytes>`
-  Retrieves the next unreliable datagram received from the remote peer.
-- `pub async fn close(&self) -> Result<()>`
-  Gracefully terminates the connection.
-- `pub async fn stats(&self) -> Result<ConnectionStats>`
-  Returns a snapshot of the connection's transport-level statistics.
+Valid long-header packet-type nibbles are:
 
----
+| Value | Name | Purpose |
+|---:|---|---|
+| `0x0` | Initial | Client handshake attempt |
+| `0x1` | Handshake | Server handshake response |
+| `0xC` | Retry | Stateless address-validation cookie |
 
-### `ZtConfig`
+### 3.2 Short header
 
-Centralized configuration for a ZettaTransport endpoint. All parameters have sensible defaults.
-
-```rust
-use zetta_transport::config::ZtConfig;
-use zetta_transport::transport::CongestionControlAlgorithm;
-
-let config = ZtConfig {
-    cc_algorithm: CongestionControlAlgorithm::Reno,
-    max_concurrent_streams: 200,
-    idle_timeout: std::time::Duration::from_secs(120),
-    ..ZtConfig::default()
-};
+```text
+first:u8
+dcid_len:u8 | dcid:bytes[dcid_len]
+packet_number:bytes[pn_len]
+protected_payload:bytes[..]
+tag:bytes[16]
 ```
 
-#### Key Parameters
-| Parameter | Default | Description |
-|---|---|---|
-| `connect_timeout` | 5s | Handshake timeout |
-| `idle_timeout` | 60s | Connection inactivity timeout |
-| `max_concurrent_streams` | 100 | Max streams per connection |
-| `initial_stream_window` | 1 MB | Per-stream receive window |
-| `max_stream_window` | 16 MB | Max auto-tuned window |
-| `initial_max_data` | 1 MB | Connection-level flow control |
-| `mtu_min` / `mtu_max` | 1200 / 9000 | PMTUD bounds |
-| `key_update_packet_interval` | 1M packets | Key rotation trigger |
-| `cc_algorithm` | Cubic | Congestion control algorithm |
+Valid short-header packet-type nibbles are:
 
----
+| Value | Name | Purpose |
+|---:|---|---|
+| `0x2` | Data | Streams, datagrams, ACKs, and control frames |
+| `0xA` | Close | Connection shutdown |
+| `0xB` | MtuProbe | Padded path-MTU probe |
 
-### `ConnectionStats`
+Connection IDs are normally eight random bytes in this implementation. Parsers must honor the
+encoded lengths and reject truncation rather than assuming eight.
 
-Real-time connection telemetry obtained via `ZtConnectionHandle::stats()`.
+## 4. Packet protection
 
-```rust
-let stats = conn.stats().await?;
-println!("RTT: {:?}, CWND: {}, In-flight: {}", stats.rtt, stats.cwnd, stats.bytes_in_flight);
+The encoded header, through the truncated packet number, is AEAD associated data. The frame bytes
+are encrypted in place with ChaCha20-Poly1305 and followed by its 16-byte tag. A nonce is derived
+from the direction's 12-byte IV and packet number. Do not process frames until authentication has
+succeeded.
+
+After payload encryption, ChaCha20 header protection masks selected low bits of the first byte and
+the packet-number bytes using a sample from the ciphertext. A receiver removes header protection
+before decoding the packet-number width and reconstructing the full number.
+
+Initial, Handshake, and Retry packets use keys derived from the public version-specific initial salt
+and DCID. They provide packet-format protection and anti-spoofing mechanics, not confidentiality
+against an observer. Active-connection keys come from ephemeral X25519 agreement, HKDF-SHA-256,
+the ordered client/server connection IDs, and the optional PSK.
+
+Directional AEAD keys and IVs are derived separately. The short-header key-phase bit is the parity
+of the sending epoch. After the configured packet interval, the sender ratchets its secret with a
+domain-separated HKDF step; the receiver retains the immediately previous epoch and pre-derives the
+next one to tolerate reordering without unbounded trial derivation.
+
+Each packet number is accepted at most once. The receiver uses a 2048-packet sliding replay bitmap;
+duplicates and packets older than the window are discarded.
+
+## 5. Frames
+
+A protected payload is a concatenation of frames. There is no outer frame-count field. A decoder
+must either consume one complete frame or return an error; it must never retry without advancing.
+
+| ID | Frame layout after the one-byte ID |
+|---:|---|
+| `0x00` | `PADDING`: consecutive zero bytes form one padding run |
+| `0x01` | `STREAM`: `id:u32, direction:u8, offset:u64, len:varint, data[len]` |
+| `0x02` | `ACK`: `largest:u64, receive_window:u32, ack_delay_us:varint, range_count:u8, (start:u64, end:u64)[range_count]` |
+| `0x03` | `CONNECTION_CLOSE`: no fields |
+| `0x04` | `HANDSHAKE`: `x25519_key[32], ed25519_key[32], hash_len:u16, hash[hash_len], signature[64], alpn_len:u8, alpn[alpn_len]` |
+| `0x05` | `COOKIE`: `len:u16, cookie[len]` |
+| `0x06` | `STREAM_CLOSE`: `id:u32, final_size:u64` |
+| `0x07` | `MAX_STREAM_DATA`: `id:u32, max_data:u64` |
+| `0x08` | `MAX_DATA`: `max_data:u64` |
+| `0x09` | `DATAGRAM`: `len:varint, data[len]` |
+| `0x0A` | `PATH_CHALLENGE`: `token[8]` |
+| `0x0B` | `PATH_RESPONSE`: `token[8]` |
+| `0x0C` | `CRYPTO`: `offset:u64, len:varint, data[len]` |
+| `0x0D` | `PING`: no fields |
+| `0x0E` | `RESET_STREAM`: `id:u32, error_code:varint, final_size:varint` |
+| `0x0F` | `STOP_SENDING`: `id:u32, error_code:varint` |
+| `0x10` | `DATA_BLOCKED`: `max_data:varint` |
+| `0x11` | `STREAM_DATA_BLOCKED`: `id:u32, max_data:varint` |
+| `0x12` | `MAX_STREAMS`: `max_streams:u64` |
+| `0x13` | `STREAMS_BLOCKED`: `max_streams:u64` |
+| `0x14` | `CONNECTION_CLOSE_V2`: `error_code:varint, reason_len:varint, UTF-8 reason[reason_len]` |
+| `0x15` | `TRANSPORT_PARAMETERS`: fixed 36-byte structure described below |
+
+Unknown IDs are fatal to that packet's frame decoding. ACK range count is limited to 128. A
+`CONNECTION_CLOSE_V2` reason is limited to 1024 bytes. Frame lengths and offset additions must be
+checked for integer overflow before allocation or buffer access.
+
+Stream direction values are `0` bidirectional, `1` unidirectional from the initiator, and `2`
+unidirectional toward the initiator. Applications may open values 0 and 1; value 2 is the local
+view created when the peer opens a value-1 stream.
+
+## 6. Transport parameters
+
+The fixed body of frame `0x15` is:
+
+```text
+max_streams:u64
+initial_stream_window:u64
+initial_max_data:u64
+max_datagram_size:u32
+idle_timeout_ms:u64
 ```
 
-#### Fields
-| Field | Type | Description |
-|---|---|---|
-| `rtt` | `Duration` | Smoothed RTT estimate |
-| `rttvar` | `Duration` | RTT variance (jitter) |
-| `cwnd` | `usize` | Current congestion window |
-| `bytes_in_flight` | `usize` | Bytes sent but not acknowledged |
-| `bytes_sent` | `usize` | Total bytes sent |
-| `bytes_received` | `usize` | Total bytes received |
-| `active_streams` | `usize` | Number of active streams |
-| `key_epoch` | `u64` | Current key rotation epoch |
-| `mtu` | `usize` | Current path MTU |
-| `cc_algorithm` | `CongestionControlAlgorithm` | Active CC algorithm |
+Both peers send exactly one transport-parameter frame during the handshake. Duplicate or missing
+parameters fail the handshake. The peer values limit local sending; the effective idle timeout is
+the smaller of the local and peer timeout. Values are signed as part of the handshake transcript,
+preventing an unauthenticated intermediary from raising or lowering them.
 
----
+Required validation includes non-zero stream, flow-control, datagram, and timeout values;
+`max_streams <= u32::MAX / 2`; and `initial_max_data <= u32::MAX` because the ACK receive-window
+field is 32 bits.
 
-### `ZtStream`
+## 7. Handshake
 
-Represents a reliable, multiplexed data stream. Fully implements `tokio::io::AsyncRead` and `tokio::io::AsyncWrite`.
+The normal exchange is:
 
-```rust
-pub struct ZtStream {
-    stream_id: u32,
-    receiver: mpsc::Receiver<Bytes>,
-    window_opened: Arc<Notify>,
-    closed: Arc<std::sync::atomic::AtomicBool>,
-    // Private read and write states.
-}
+```text
+client                                                server
+  | Initial: HANDSHAKE + PARAMETERS + padding >=1200    |
+  |----------------------------------------------------->|
+  | Retry: COOKIE                                       |
+  |<-----------------------------------------------------|
+  | Initial: HANDSHAKE + PARAMETERS + COOKIE + padding  |
+  |----------------------------------------------------->|
+  | Handshake: HANDSHAKE + PARAMETERS                   |
+  |<-----------------------------------------------------|
+  |              protected short-header traffic         |
 ```
 
-#### Async I/O State Machine
-`ZtStream` manages asynchronous writing using a state machine:
-- `WriteState::Idle`: Ready to receive new writes from the application layer.
-- `WriteState::Sending`: Packet chunk dispatched to the connection actor; waiting on confirmation.
-- `WriteState::Blocked`: Yields the task when congestion window or peer flow-control window is exhausted. Automatically resumes upon ACK reception.
-- `WriteState::Pacing`: Yields when the transmission pacing timer restricts output burst.
+An Initial datagram shorter than 1200 bytes is dropped. The retry cookie is HMAC-SHA-256 over the
+source address, source port, client SCID, and issue time, and expires according to
+`cookie_max_age_ms`. A server consumes a valid cookie only after transcript and signature checks;
+reuse is rejected by a bounded-time replay filter.
 
-#### Methods
-- `pub async fn send_bytes(&self, mut data: Bytes) -> Result<()>`
-  Zero-copy transmission. Splits a `Bytes` reference into MTU-friendly slices without data allocation or copying.
-- `pub async fn close(&self) -> Result<()>`
-  Closes the stream. Sends a `StreamClose` frame to the peer.
+Each side's `HANDSHAKE` contains an ephemeral X25519 public key and an Ed25519 identity public key.
+The transcript hash is SHA-256 and the signature is Ed25519 over that hash.
 
----
+The client transcript concatenates, without length prefixes beyond fields that already have a
+fixed representation:
 
-### `CongestionControlAlgorithm`
-
-Defines choices for pluggable congestion control:
-- `CongestionControlAlgorithm::Cubic`: CUBIC congestion control (RFC 8312). Scales window growth as a cubic function of time since the last loss event, rendering it independent of RTT.
-- `CongestionControlAlgorithm::Reno`: TCP Reno. Standard AIMD (Additive Increase, Multiplicative Decrease) algorithm.
-
----
-
-### `ZtError`
-
-```rust
-pub enum ZtError {
-    Io(std::io::Error),
-    Crypto(String),
-    InvalidPacket(String),
-    Timeout,
-    Unauthorized,
-    PacketNumberOverflow,
-    ConnectionIdExhausted,
-    ActorFailed,
-    FlowControlBlocked,
-    CongestionWindowFull,
-    PacingBlocked(std::time::Duration),
-    TooManyStreams { limit: usize },
-    StreamReset { stream_id: u32, error_code: u64 },
-    ConnectionClosedByPeer { error_code: u64, reason: String },
-    IdleTimeout,
-}
+```text
+version:u32
+client_scid
+initial_server_dcid
+client_x25519_key[32]
+retry_cookie (only on the retried Initial)
+client_transport_parameters[36]
 ```
 
----
+The server transcript extends that exact client transcript with:
 
-## Protocol & Packet Format
-
-Every UDP packet is classified by its first byte (Header Byte).
-
-```
-Long Header Flag (MSB = 1)   : 1xxxxxxx
-Short Header Flag (MSB = 0)  : 0xxxxxxx
+```text
+server_scid
+server_x25519_key[32]
+server_transport_parameters[36]
 ```
 
-### Long Header Packets
+The ALPN bytes are carried in the handshake frame and must equal the endpoint's configured ALPN;
+this version does not negotiate from a list. ALPN is not currently included in the signed
+transcript, so applications must not treat it as a strong channel binding.
 
-Used for connection setup (Initial, Handshake, Retry).
+By default, any correctly self-signed Ed25519 identity is accepted. A conforming application that
+needs authenticated peers must pin or otherwise validate the presented identity. Endpoint
+identities generated by this crate last only for the bound endpoint's lifetime. The optional PSK
+is mixed into the active master secret and must match on both sides.
 
-```
-+------------------+-----------------------+-------------------+
-| First Byte (1 B) | Version (4 B = 0x01)  | DCID Length (1 B) |
-+------------------+-----------------------+-------------------+
-| DCID (Var-Len)   | SCID Length (1 B)     | SCID (Var-Len)    |
-+------------------+-----------------------+-------------------+
-| Packet Number (1-4 B, Truncated)         | Encrypted Payload |
-+------------------------------------------+-------------------+
-| AEAD Auth Tag (16 B, ChaCha20-Poly1305)                      |
-+--------------------------------------------------------------+
-```
+## 8. Streams
 
-### Short Header Packets
+Client-created stream IDs are even; server-created IDs are odd. This implementation reserves zero,
+starts client allocation at 2 and server allocation at 1, and increments by 2. A receiver rejects a
+new stream with the wrong initiator parity. `max_streams` is counted independently for streams
+opened by each side.
 
-Used for active data transmission (Data, Close, MtuProbe).
+`STREAM.offset` is the absolute byte offset. Data can arrive out of order and is retained until all
+preceding bytes exist. Overlaps, duplicate data, integer overflow, final-size violations, per-stream
+window violations, and connection-memory-limit violations must be rejected or ignored according to
+the established state without delivering duplicate bytes.
 
-```
-+------------------+-----------------------+-------------------+
-| First Byte (1 B) | DCID Length (1 B)     | DCID (Var-Len)    |
-+------------------+-----------------------+-------------------+
-| Packet Number (1-4 B, Truncated)         | Encrypted Payload |
-+------------------------------------------+-------------------+
-| AEAD Auth Tag (16 B, ChaCha20-Poly1305)                      |
-+--------------------------------------------------------------+
-```
+`STREAM_CLOSE.final_size` establishes the exclusive final byte offset. EOF becomes visible only
+after every byte through that offset has been delivered, so a reordered close cannot discard tail
+data. A different final size or data beyond the final size is a protocol error.
 
----
+`RESET_STREAM` aborts receive delivery with an application code and final size. `STOP_SENDING`
+instructs the peer to cease transmission. The Rust API exposes a received reset as
+`ZtError::StreamReset` when the application uses an error-preserving receive method.
 
-## Frame Reference
+## 9. Flow control and backpressure
 
-Inside decrypted packet payloads, data is structured into sequential frames. ZettaTransport supports the following frames:
+There are two byte limits:
 
-| ID | Frame Name | Payload Fields | Description |
-|---|---|---|---|
-| `0x00` | `Padding` | None | Variable length padding for anti-amplification. |
-| `0x01` | `Stream` | `id: u32, offset: u64, data: Bytes` | Transmits stream-multiplexed data. |
-| `0x02` | `Ack` | `largest_acked: u64, window: u32, ranges: Vec` | Signals packet reception and peer window size. |
-| `0x03` | `ConnectionClose`| None | Terminates the connection immediately. |
-| `0x04` | `Handshake` | `pub_key: [u8;32], ed_pub: [u8;32], hash: Vec, sig: [u8;64], alpn: Vec` | Handshake credentials exchange. |
-| `0x05` | `Cookie` | `cookie: Bytes` | Anti-DoS proof verification. |
-| `0x06` | `StreamClose` | `id: u32` | Notifies peer that a stream has ended. |
-| `0x07` | `MaxStreamData` | `id: u32, max_data: u64` | Expands flow control limit for a specific stream. |
-| `0x08` | `MaxData` | `max_data: u64` | Expands flow control limit for the connection. |
-| `0x09` | `Datagram` | `data: Bytes` | Transmits an unreliable datagram chunk. |
-| `0x0A` | `PathChallenge` | `data: [u8; 8]` | Asks candidate path to echo a secure random token. |
-| `0x0B` | `PathResponse` | `data: [u8; 8]` | Echoes token back to validate path bidirectionality. |
-| `0x0C` | `Crypto` | `offset: u64, data: Bytes` | Transmits TLS-like handshake and key data. |
-| `0x0D` | `Ping` | None | Keep-alive signal; elicits an ACK from the peer. |
-| `0x0E` | `ResetStream` | `stream_id: u32, error_code: u64, final_size: u64` | Abruptly terminates a stream with an error code. |
-| `0x0F` | `StopSending` | `stream_id: u32, error_code: u64` | Requests peer to stop sending on a stream. |
-| `0x10` | `DataBlocked` | `max_data: u64` | Signals sender is blocked by connection-level flow control. |
-| `0x11` | `StreamDataBlocked` | `stream_id: u32, max_data: u64` | Signals sender is blocked by stream-level flow control. |
-| `0x12` | `MaxStreams` | `max_streams: u64` | Updates peer's maximum concurrent stream limit. |
-| `0x13` | `StreamsBlocked` | `max_streams: u64` | Signals sender is blocked by connection-level stream limits. |
-| `0x14` | `ConnectionCloseV2` | `error_code: u64, reason: Vec<u8>` | Enhanced connection close with error code and diagnostic reason. |
+- `MAX_STREAM_DATA` advances an absolute per-stream receive limit.
+- `MAX_DATA` advances an absolute connection-wide receive limit.
 
----
+The sender must not transmit beyond either peer-advertised value. If blocked, it can emit
+`STREAM_DATA_BLOCKED` or `DATA_BLOCKED` and wait for an update. `MAX_STREAMS` similarly increases
+the number of peer-created streams; `STREAMS_BLOCKED` reports exhaustion.
 
-## Cryptographic Design
+As the application consumes stream bytes, the receiver returns credit. If more than half the
+window is consumed within approximately two RTTs, the implementation doubles the stream window up
+to `max_stream_window`. Total buffered stream data is capped by `max_connection_buffer`. Bounded
+actor, stream, datagram, and accept queues provide additional backpressure.
 
-### Handshake Cryptography
+## 10. ACK, loss recovery, congestion control, and pacing
 
-The handshake establishes mutual authentication and keys using:
-1. **Key Exchange**: Ephemeral Diffie-Hellman using Curve25519 (X25519).
-2. **Authentication**: Ed25519 signing over the handshake transcript hash.
-3. **Secret Derivation**: HKDF-SHA256 generates master secrets combining DH results, connection IDs, and optional PSKs.
-4. **Key Rotation**: Long-lived connections ratchet secrets using HKDF-SHA256 upon moving to subsequent key epochs.
+ACK frames carry the largest packet number, advertised connection receive window, peer ACK delay in
+microseconds, and inclusive SACK ranges. ACK ranges must be ordered, internally valid
+(`start <= end`), and bounded. RTT sampling subtracts a credible ACK delay.
 
-### In-Place Encryption
+A reliable packet is declared lost after a later ACK establishes a three-packet gap or after the
+time threshold. The retransmission timeout is at least 50 ms, uses smoothed RTT plus four times RTT
+variance, backs off exponentially, and is capped at 10 seconds. Reliable frames are retransmitted;
+application datagrams are removed when lost and are never retransmitted.
 
-To minimize allocation overhead and optimize CPU caches, ZettaTransport performs **in-place AEAD** encryption and decryption using `ChaCha20-Poly1305` over a single contiguous buffer (`BytesMut`), appending or verifying the 16-byte authentication tag at the end.
+Every packet consumes congestion-window capacity. The configured controller is either Reno (AIMD)
+or CUBIC. Pacing spaces transmissions to avoid bursts even when the congestion window has room.
+Flow-control, congestion-window, and pacing backpressure propagate to stream writers rather than
+allowing unbounded buffering.
 
-### Header Protection
+## 11. Datagrams
 
-To prevent passive network observers from tracking packet numbers, packet headers are obfuscated:
-- A 16-byte sample is extracted from the encrypted payload.
-- The sample is encrypted using `AES-128-ECB` (seeded by header protection keys derived during handshake).
-- The resulting mask is XOR-ed with the packet number bytes and the low-order bits of the first byte.
+One `DATAGRAM` frame carries one application message. Messages are encrypted and participate in
+congestion control and pacing, but delivery is unordered, unreliable, and at most once within the
+packet replay window. The protocol does not fragment a datagram; the sender must keep it within the
+peer's `max_datagram_size`. Receiving applications must tolerate loss and reordering.
 
-### Replay Protection
+## 12. Path validation and migration
 
-Each connection maintains a sliding 2048-bit replay window mask. If an incoming packet's decrypted packet number falls behind the window edge or matches a bit already set in the mask, it is rejected immediately as a replay attempt.
+After authenticated short-header traffic arrives from a different source address, the connection
+retains the current path and sends an unpredictable eight-byte `PATH_CHALLENGE` to the candidate.
+The candidate echoes it in `PATH_RESPONSE`. Only an exact response from the pending candidate
+commits the new address. Challenges are retried using an RTT-derived timeout up to
+`max_path_validation_retries`; failure abandons the candidate.
 
----
+Packets from an unvalidated address do not immediately redirect ordinary transmission. This is
+essential to prevent an attacker who can inject a packet from turning the endpoint into a
+reflection source.
 
-## Connection Lifecycle & Path Validation
+## 13. Path-MTU discovery
 
-### Handshake Sequence
+Connections begin at `mtu_min` (at least 1200 bytes). Periodic padded `MtuProbe` packets search up
+to `mtu_max`. An acknowledged probe raises the working MTU; a failed probe narrows the search.
+Repeated loss of ordinary packets sent above the base MTU triggers black-hole recovery: the
+connection returns to the base MTU and restarts discovery below the failed size.
 
-```
-Client                                      Server
-  │                                           │
-  │─── Initial Packet (padded ≥ 1200 B) ─────▶│  (1) Anti-Amplification Guard
-  │◀── Retry Packet (HMAC Cookie) ────────────│  (2) DoS Cookie Verification
-  │─── Initial + Cookie ─────────────────────▶│
-  │◀── Handshake (Server X25519 Public) ──────│  (3) Keys Established
-  │             [ ACTIVE STATE ]              │
-  │◀══════ Encrypted Streams / Datagrams ════▶│
-```
+Applications should choose conservative limits for real networks. The configured MTU must leave
+room within the maximum UDP payload, and application datagram limits are negotiated separately.
 
-1. **Anti-Amplification**: Client Initial packets are padded with zeros to at least 1200 bytes. This ensures servers do not respond to spoofed IPs with larger response payloads.
-2. **Retry Cookie**: The server verifies the client's IP address by issuing a stateless `Retry` packet containing an HMAC-SHA256 cookie that binds the client IP, port, and timestamp.
+## 14. Connection termination and errors
 
-### Path Validation and IP Migration
+`CONNECTION_CLOSE` represents a reasonless shutdown. `CONNECTION_CLOSE_V2` transports a 62-bit code
+and a UTF-8 diagnostic reason. Idle timeout is a local terminal condition. Once terminal state is
+published, pending stream, accept, and datagram operations are awakened.
 
-If the connection actor receives a valid, decrypted short header packet from an IP address or port that differs from `self.state.addr`, it flags a potential **Connection Migration**:
+The Rust convenience receive APIs return `None` for EOF or termination. Implementations that need
+the cause should use the `*_result` forms, which preserve `StreamReset`, `ConnectionClosedByPeer`,
+and `IdleTimeout`.
 
-```
-Connection Actor (Server)                  New Peer Path (Client)
-  │                                           │
-  │─── PathChallenge (8-byte random token) ──▶│  (Buffered queue for new path)
-  │◀── PathResponse (matching token) ─────────│  (Validated)
-  │             [ PATH UPDATED ]              │
-```
+## 15. Implementation checklist
 
-1. **Validation Probing**: The actor generates an 8-byte random token and sends a `PathChallenge` frame immediately to the candidate address.
-2. **Buffer Queue**: During validation, normal data frames received from the unvalidated path are buffered or discarded.
-3. **PFS and Timeouts**: Challenges are retransmitted up to 3 times if no response arrives within `2 * RTT`. If no `PathResponse` containing the matching token is received after 3 attempts, the candidate path is abandoned.
+A compatible implementation should, at minimum:
 
----
+1. enforce protocol version 2, header bounds, frame bounds, and checked integer arithmetic;
+2. authenticate a packet before parsing frames or changing replay state;
+3. reconstruct packet numbers and reject duplicates with a bounded replay window;
+4. validate retry cookies, signed transcripts, ALPN equality, and application trust policy;
+5. treat Initial encryption as public protection rather than peer authentication;
+6. enforce stream direction, initiator parity, final size, byte windows, stream limits, and memory
+   limits before buffering data;
+7. never retransmit `DATAGRAM` frames;
+8. couple all outgoing traffic to congestion control and pacing;
+9. validate a changed address before migrating the active path; and
+10. test truncation at every field boundary, varint edges, duplicates, reorderings, loss bursts,
+    slow consumers, key-phase transitions, MTU black holes, and terminal-state wakeups.
 
-## Stream Multiplexing & Flow Control
-
-### Multiplexing Mechanics
-
-Stream IDs prevent collisions through parities:
-- Clients initiate even-numbered stream IDs.
-- Servers initiate odd-numbered stream IDs.
-- Stream 0 is pre-allocated upon connection establishment.
-- A maximum of 100 concurrent streams are supported per connection.
-
-### Auto-Tuning Flow Control
-
-To maximize throughput across high Bandwidth-Delay Product (BDP) pipes:
-- Each stream tracks the volume of bytes read by the application.
-- If the application reads more than half of the stream window size within `2 * RTT`, it indicates the flow control window is throttling throughput.
-- The stream doubles its window size (capped at 16MB) and resizes its circular `StreamReceiveBuffer` in-place, mapping old indices safely around wrap boundaries.
-- The actor transmits a `MaxStreamData` frame notifying the peer of the expanded window limit.
-
----
-
-## Congestion Control & Pacing
-
-### Pluggable Congestion Controller
-
-The `CongestionController` trait abstracts all congestion control interactions:
-
-```rust
-pub(crate) trait CongestionController: Send + Sync {
-    fn on_packet_sent(&mut self, pn: u64, bytes: usize, sent_at: Instant);
-    fn on_packet_acked(&mut self, bytes_acked: usize, rtt: Duration, now: Instant);
-    fn on_congestion_event(&mut self, rtt: Duration, now: Instant);
-    fn cwnd(&self) -> usize;
-    fn ssthresh(&self) -> usize;
-    fn set_cwnd(&mut self, cwnd: usize);
-    fn set_ssthresh(&mut self, ssthresh: usize);
-    fn set_mtu(&mut self, mtu: usize);
-}
-```
-
-The active congestion controller performs pacing on outgoing data frames. If the controller signals a `PacingBlocked` status, the actor yields and queues a sleep timer before resuming transmissions.
-
-### Unreliable Datagram Lifecycle
-
-Datagram payloads are integrated into the congestion control system:
-- Outgoing datagram size is accounted for in `cwnd` utilization.
-- They are subject to pacing limits to prevent burst flooding.
-- Unlike streams, datagrams do **not** trigger retransmissions. When a datagram packet is flagged as lost via SACK or RTO timeout, it is removed from the `unacked_packets` table immediately without incrementing retry thresholds.
-
----
-
-## Actor Loop Architecture
-
-Each ZettaTransport connection is isolated inside an async actor loop (`ZtConnectionActor` running in a spawned `tokio` task) executing a `select!` loop:
-
-```
-                  ┌───────────────────────────┐
-                  │   Actor Select Loop       │
-                  └─────────────┬─────────────┘
-                                │
-        ┌───────────────────────┼───────────────────────┐
-        ▼                       ▼                       ▼
- ┌──────────────┐        ┌──────────────┐        ┌──────────────┐
- │ Socket Rx    │        │ Stream Tx    │        │ Timer Fire   │
- │ (UDP Read)   │        │ (App Writes) │        │ (RTO/Pacing) │
- └──────────────┘        └──────────────┘        └──────────────┘
-```
-
-By confining connection state modifications to a single-threaded async event loop, ZettaTransport avoids locks (`Mutex` / `RwLock`) in the hot path, ensuring predictable, high-performance packet processing.
+For executable behavior, see the unit tests in `src/`, the adversarial integration scenarios in
+`tests/`, and the fuzz target in `fuzz/fuzz_targets/frame_decode.rs`.

@@ -1,3 +1,6 @@
 /target
+/fuzz/target
+/fuzz/artifacts
+/fuzz/corpus
 zetta_full_project.txt
 /tests/zetta_full_test.txt

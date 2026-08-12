@@ -1,3 +1,11 @@
+//! UDP endpoint lifecycle and connection establishment.
+//!
+//! A [`ZtEndpoint`](crate::transport::endpoint::ZtEndpoint) may initiate and accept connections
+//! concurrently. It owns the UDP socket, endpoint identity, routing table, and per-connection
+//! actor tasks. Application code normally keeps the returned
+//! [`Arc<ZtEndpoint>`](std::sync::Arc) alive for as long as its connections are needed.
+
+use crate::config::ZtConfig;
 use crate::error::{Result, ZtError};
 use crate::stream::{ZtConnectionHandle, ZtStream};
 use crate::transport::actor::{ActorMessage, ZtConnectionActor};
@@ -14,7 +22,10 @@ use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 
 const MAX_ACTIVE_CONNECTIONS: usize = 1000;
 
-/// Type alias for the optional peer key verification callback.
+/// Callback used to accept or reject a peer's Ed25519 identity key.
+///
+/// The callback runs during the authenticated handshake. Returning `false` aborts the connection
+/// with [`ZtError::Unauthorized`]. Keep it fast and free of blocking operations.
 pub type PeerKeyVerifier = Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>;
 
 /// The main entry point for the ZettaTransport protocol.
@@ -27,14 +38,19 @@ pub struct ZtEndpoint {
     pub(crate) routing_table: Arc<DashMap<Vec<u8>, mpsc::Sender<ActorMessage>>>,
     // Signing key must stay private; only the verifying key is shared.
     pub(crate) ed_signing_key: SigningKey,
+    /// Public half of the endpoint's in-memory Ed25519 identity.
+    ///
+    /// The corresponding signing key is private. A peer can pin these bytes through
+    /// [`ZtEndpoint::set_peer_key_verifier`]. A new key is generated on every bind.
     pub ed_public_key: VerifyingKey,
     pub(crate) psk: Option<[u8; 32]>,
     pub(crate) cookie_key: [u8; 32],
-    pub verify_peer_key: Option<PeerKeyVerifier>,
     pub(crate) handshake_semaphore: Arc<Semaphore>,
     pub(crate) handshake_replay_filter: Arc<DashMap<[u8; 32], u64>>,
     pub(crate) cc_algo: crate::transport::congestion::CongestionControlAlgorithm,
     pub(crate) alpn: std::sync::RwLock<Vec<u8>>,
+    pub(crate) config: Arc<ZtConfig>,
+    verify_peer_key: std::sync::RwLock<Option<PeerKeyVerifier>>,
 
     incoming_rx: Mutex<mpsc::Receiver<ZtConnectionHandle>>,
     pub(crate) incoming_tx: mpsc::Sender<ZtConnectionHandle>,
@@ -47,7 +63,11 @@ impl ZtEndpoint {
     /// The `Cubic` algorithm is optimized for high-bandwidth, high-latency (BDP) networks
     /// and is the recommended default for most applications over the classic `Reno` algorithm.
     pub async fn bind(addr: &str, psk: Option<[u8; 32]>) -> Result<Arc<Self>> {
-        Self::bind_with_config(addr, psk, crate::transport::congestion::CongestionControlAlgorithm::Cubic).await
+        let config = ZtConfig {
+            psk,
+            ..ZtConfig::default()
+        };
+        Self::bind_with_zt_config(addr, config).await
     }
 
     /// Binds an endpoint with the specified configuration, including a custom
@@ -62,11 +82,25 @@ impl ZtEndpoint {
         psk: Option<[u8; 32]>,
         cc_algo: crate::transport::congestion::CongestionControlAlgorithm,
     ) -> Result<Arc<Self>> {
+        let config = ZtConfig {
+            psk,
+            cc_algorithm: cc_algo,
+            ..ZtConfig::default()
+        };
+        Self::bind_with_zt_config(addr, config).await
+    }
+
+    /// Binds an endpoint using the complete [`ZtConfig`] surface.
+    pub async fn bind_with_zt_config(addr: &str, config: ZtConfig) -> Result<Arc<Self>> {
+        config.validate()?;
+        let config = Arc::new(config);
         let mut csprng = rand::rngs::OsRng;
         let ed_signing_key = SigningKey::generate(&mut csprng);
         let ed_public_key = ed_signing_key.verifying_key();
 
-        let socket_addr: SocketAddr = addr.parse().map_err(|e| std::io::Error::other(format!("Invalid address: {}", e)))?;
+        let socket_addr: SocketAddr = addr
+            .parse()
+            .map_err(|e| std::io::Error::other(format!("Invalid address: {}", e)))?;
         let cookie_key = rand::thread_rng().r#gen::<[u8; 32]>();
         let (tx, rx) = mpsc::channel(1024);
 
@@ -75,30 +109,39 @@ impl ZtEndpoint {
             SocketAddr::V4(_) => socket2::Domain::IPV4,
             SocketAddr::V6(_) => socket2::Domain::IPV6,
         };
-        let std_socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+        let std_socket =
+            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
         #[cfg(unix)]
         if let Err(e) = std_socket.set_reuse_port(true) {
             tracing::debug!("set_reuse_port failed on main socket: {:?}", e);
         }
-        
+
         let buf_size = 2 * 1024 * 1024;
         if let Err(e) = std_socket.set_recv_buffer_size(buf_size) {
-            tracing::debug!("Failed to set socket receive buffer size to {}: {:?}", buf_size, e);
+            tracing::debug!(
+                "Failed to set socket receive buffer size to {}: {:?}",
+                buf_size,
+                e
+            );
             let _ = std_socket.set_recv_buffer_size(256 * 1024);
         }
         if let Err(e) = std_socket.set_send_buffer_size(buf_size) {
-            tracing::debug!("Failed to set socket send buffer size to {}: {:?}", buf_size, e);
+            tracing::debug!(
+                "Failed to set socket send buffer size to {}: {:?}",
+                buf_size,
+                e
+            );
             let _ = std_socket.set_send_buffer_size(256 * 1024);
         }
 
         std_socket.set_nonblocking(true)?;
         std_socket.bind(&socket_addr.into())?;
-        
+
         let actual_addr: SocketAddr = std_socket
             .local_addr()?
             .as_socket()
             .ok_or_else(|| std::io::Error::other("Failed to resolve local socket addr"))?;
-        
+
         let socket = Arc::new(UdpSocket::from_std(std_socket.into())?);
 
         let endpoint = Arc::new(Self {
@@ -106,15 +149,16 @@ impl ZtEndpoint {
             routing_table: Arc::new(DashMap::new()),
             ed_signing_key,
             ed_public_key,
-            psk,
+            psk: config.psk,
             cookie_key,
-            verify_peer_key: None,
+            verify_peer_key: std::sync::RwLock::new(None),
             handshake_semaphore: Arc::new(Semaphore::new(256)),
             handshake_replay_filter: Arc::new(DashMap::new()),
             incoming_rx: Mutex::new(rx),
             incoming_tx: tx,
-            cc_algo,
-            alpn: std::sync::RwLock::new(b"zetta".to_vec()),
+            cc_algo: config.cc_algorithm,
+            alpn: std::sync::RwLock::new(config.alpn.clone()),
+            config,
         });
 
         // Main socket routing
@@ -123,7 +167,8 @@ impl ZtEndpoint {
         let cores = num_cpus::get();
         // Since we already have 1 task on main socket, start cores - 1 more
         for _ in 1..cores {
-            let task_socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+            let task_socket =
+                socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
             #[cfg(unix)]
             task_socket.set_reuse_port(true)?;
             #[cfg(not(unix))]
@@ -131,11 +176,19 @@ impl ZtEndpoint {
 
             let buf_size = 2 * 1024 * 1024;
             if let Err(e) = task_socket.set_recv_buffer_size(buf_size) {
-                tracing::debug!("Failed to set task socket receive buffer size to {}: {:?}", buf_size, e);
+                tracing::debug!(
+                    "Failed to set task socket receive buffer size to {}: {:?}",
+                    buf_size,
+                    e
+                );
                 let _ = task_socket.set_recv_buffer_size(256 * 1024);
             }
             if let Err(e) = task_socket.set_send_buffer_size(buf_size) {
-                tracing::debug!("Failed to set task socket send buffer size to {}: {:?}", buf_size, e);
+                tracing::debug!(
+                    "Failed to set task socket send buffer size to {}: {:?}",
+                    buf_size,
+                    e
+                );
                 let _ = task_socket.set_send_buffer_size(256 * 1024);
             }
 
@@ -144,20 +197,18 @@ impl ZtEndpoint {
             let tokio_socket = Arc::new(UdpSocket::from_std(task_socket.into())?);
             Self::start_router(endpoint.clone(), tokio_socket);
         }
-        
+
         Ok(endpoint)
     }
 
     /// Starts the packet router task that dispatches incoming datagrams
     /// to the correct per-connection actor or initiates new handshakes.
     fn start_router(endpoint: Arc<Self>, socket: Arc<UdpSocket>) {
-        // Buffer size must accommodate the largest possible PMTUD probe (mtu_max=9000)
-        // plus header/tag overhead. 9200 bytes safely covers jumbo frames.
-        const RECV_BUF_SIZE: usize = 9200;
-
         tokio::spawn(async move {
+            // Leave room for headers around the configured path MTU.
+            let recv_buf_size = endpoint.config.mtu_max.saturating_add(256).min(65_535);
             let mut local_routing_table = std::collections::HashMap::new();
-            let mut buf = bytes::BytesMut::zeroed(RECV_BUF_SIZE);
+            let mut buf = bytes::BytesMut::zeroed(recv_buf_size);
             loop {
                 let mut processed = 0;
                 while processed < 64 {
@@ -186,14 +237,14 @@ impl ZtEndpoint {
                     };
 
                     let data = buf.split_to(len);
-                    if buf.capacity() < RECV_BUF_SIZE {
-                        buf = bytes::BytesMut::zeroed(RECV_BUF_SIZE);
+                    if buf.capacity() < recv_buf_size {
+                        buf = bytes::BytesMut::zeroed(recv_buf_size);
                     } else {
                         // Reset length without re-zeroing the buffer contents.
                         // The recv_from call will overwrite exactly what it reads,
                         // and `split_to(len)` already gave us only the valid bytes.
                         buf.clear();
-                        buf.resize(RECV_BUF_SIZE, 0);
+                        buf.resize(recv_buf_size, 0);
                     }
 
                     if let Some(dcid_slice) = crate::protocol::routing::extract_dcid_fast(&data) {
@@ -203,14 +254,22 @@ impl ZtEndpoint {
                             let tx: &mpsc::Sender<ActorMessage> = tx;
                             if tx.is_closed() {
                                 local_routing_table.remove(&dcid);
-                            } else if tx.try_send(ActorMessage::IncomingPacket { data: data.clone(), addr }).is_ok() {
+                            } else if tx
+                                .try_send(ActorMessage::IncomingPacket {
+                                    data: data.clone(),
+                                    addr,
+                                })
+                                .is_ok()
+                            {
                                 routed = true;
                             } else {
-                                tracing::debug!("Local routing cache try_send failed for dcid, removing from cache");
+                                tracing::debug!(
+                                    "Local routing cache try_send failed for dcid, removing from cache"
+                                );
                                 local_routing_table.remove(&dcid);
                             }
                         }
-                        
+
                         if !routed {
                             if let Some(tx) = endpoint.routing_table.get(&dcid) {
                                 if tx.is_closed() {
@@ -218,31 +277,38 @@ impl ZtEndpoint {
                                     endpoint.routing_table.remove(&dcid);
                                 } else {
                                     local_routing_table.insert(dcid.clone(), tx.clone());
-                                    let _ = tx.try_send(ActorMessage::IncomingPacket { data, addr });
+                                    let _ =
+                                        tx.try_send(ActorMessage::IncomingPacket { data, addr });
                                 }
                             } else {
-                                let is_initial = data.len() >= 1200
-                                    && (data[0] & 0x80) != 0;
+                                let is_initial = data.len() >= 1200 && (data[0] & 0x80) != 0;
 
                                 if is_initial {
                                     if endpoint.routing_table.len() >= MAX_ACTIVE_CONNECTIONS {
-                                        tracing::warn!("Dropped incoming handshake: server at maximum connection capacity");
-                                    } else if let Ok(permit) = endpoint.handshake_semaphore.clone().try_acquire_owned() {
+                                        tracing::warn!(
+                                            "Dropped incoming handshake: server at maximum connection capacity"
+                                        );
+                                    } else if let Ok(permit) =
+                                        endpoint.handshake_semaphore.clone().try_acquire_owned()
+                                    {
                                         let ep_clone = endpoint.clone();
                                         tokio::spawn(async move {
                                             let _permit = permit;
-                                            if let Err(e) = crate::transport::handshake::handle_handshake(
-                                                ep_clone,
-                                                data.freeze(),
-                                                addr,
-                                            )
-                                            .await
+                                            if let Err(e) =
+                                                crate::transport::handshake::handle_handshake(
+                                                    ep_clone,
+                                                    data.freeze(),
+                                                    addr,
+                                                )
+                                                .await
                                             {
                                                 tracing::debug!("Handshake failed: {:?}", e);
                                             }
                                         });
                                     } else {
-                                        tracing::debug!("Dropped incoming handshake: server at capacity");
+                                        tracing::debug!(
+                                            "Dropped incoming handshake: server at capacity"
+                                        );
                                     }
                                 }
                             }
@@ -256,9 +322,29 @@ impl ZtEndpoint {
 
     /// Sets the ALPN protocols supported by this endpoint.
     pub fn set_alpn(&self, alpn: Vec<u8>) {
+        if alpn.is_empty() || alpn.len() > u8::MAX as usize {
+            tracing::warn!("Ignoring invalid ALPN length: {}", alpn.len());
+            return;
+        }
         if let Ok(mut guard) = self.alpn.write() {
             *guard = alpn;
         }
+    }
+
+    /// Installs or clears the callback used to authenticate the peer's
+    /// Ed25519 public key during the handshake.
+    pub fn set_peer_key_verifier(&self, verifier: Option<PeerKeyVerifier>) {
+        if let Ok(mut guard) = self.verify_peer_key.write() {
+            *guard = verifier;
+        }
+    }
+
+    pub(crate) fn verify_peer_key(&self, key: &[u8; 32]) -> bool {
+        self.verify_peer_key
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .is_none_or(|verifier| verifier(key))
     }
 
     /// Returns the MTU for a given connection.
@@ -298,9 +384,11 @@ impl ZtEndpoint {
     pub async fn get_stats(&self, cid: &[u8]) -> Result<crate::stats::ConnectionStats> {
         if let Some(tx) = self.routing_table.get(cid) {
             let (resp_tx, resp_rx) = oneshot::channel();
-            tx.send(ActorMessage::GetStats { respond_to: resp_tx })
-                .await
-                .map_err(|_| ZtError::ActorFailed)?;
+            tx.send(ActorMessage::GetStats {
+                respond_to: resp_tx,
+            })
+            .await
+            .map_err(|_| ZtError::ActorFailed)?;
             return resp_rx.await.map_err(|_| ZtError::ActorFailed);
         }
         Err(ZtError::ActorFailed)
@@ -331,11 +419,16 @@ impl ZtEndpoint {
 
     /// Opens a new stream on an existing connection.
     pub async fn open_stream(&self, cid: &[u8]) -> Result<ZtStream> {
-        self.open_stream_with_type(cid, crate::transport::state::StreamType::Bidirectional).await
+        self.open_stream_with_type(cid, crate::transport::state::StreamType::Bidirectional)
+            .await
     }
 
     /// Opens a new stream of a specific type on an existing connection.
-    pub async fn open_stream_with_type(&self, cid: &[u8], stream_type: crate::transport::state::StreamType) -> Result<ZtStream> {
+    pub async fn open_stream_with_type(
+        &self,
+        cid: &[u8],
+        stream_type: crate::transport::state::StreamType,
+    ) -> Result<ZtStream> {
         if let Some(tx) = self.routing_table.get(cid) {
             let (resp_tx, resp_rx) = oneshot::channel();
             tx.send(ActorMessage::OpenStream {
@@ -358,6 +451,29 @@ impl ZtEndpoint {
         Ok(())
     }
 
+    /// Closes a connection with a typed error code and diagnostic reason.
+    pub async fn close_with_error(
+        &self,
+        cid: &[u8],
+        error_code: u64,
+        reason: String,
+    ) -> Result<()> {
+        if reason.len() > 1024 {
+            return Err(ZtError::InvalidPacket(
+                "connection close reason exceeds 1024 bytes".into(),
+            ));
+        }
+        if let Some((_, tx)) = self.routing_table.remove(cid) {
+            tx.send(ActorMessage::CloseWithError {
+                error_code,
+                reason: reason.into_bytes(),
+            })
+            .await
+            .map_err(|_| ZtError::ActorFailed)?;
+        }
+        Ok(())
+    }
+
     /// Accepts an incoming connection.
     pub async fn accept(&self) -> Option<ZtConnectionHandle> {
         let mut rx = self.incoming_rx.lock().await;
@@ -376,8 +492,10 @@ impl ZtEndpoint {
         rand::thread_rng().fill(&mut scid[..]);
         rand::thread_rng().fill(&mut dcid[..]);
 
-        let mut conn = ZtConnection::new_with_cc(addr, scid.clone(), dcid.clone(), self.cc_algo);
+        let mut conn =
+            ZtConnection::new_with_config(addr, scid.clone(), dcid.clone(), &self.config);
         conn.state = ConnectionState::Handshaking;
+        let termination = conn.termination.clone();
 
         let (actor_tx, actor_rx) = mpsc::channel(1024);
         let (stream_tx, stream_rx) = mpsc::channel(128);
@@ -386,9 +504,11 @@ impl ZtEndpoint {
         let (wait_tx, wait_rx) = oneshot::channel();
 
         let (ephemeral_secret, ephemeral_public) = crate::crypto::keypair::generate_keypair();
-        
-        let mut csprng = rand::rngs::OsRng;
-        let client_ed_signing_key = SigningKey::generate(&mut csprng);
+
+        // Use the endpoint identity for every outgoing connection so a server
+        // can reliably pin/authenticate `ed_public_key`. Ephemeral X25519 keys
+        // still provide forward secrecy for each connection.
+        let client_ed_signing_key = self.ed_signing_key.clone();
         let client_ed_public_key = client_ed_signing_key.verifying_key();
 
         let actor = ZtConnectionActor::new(
@@ -413,10 +533,14 @@ impl ZtEndpoint {
         self.routing_table.insert(scid.clone(), actor_tx);
         tokio::spawn(actor.run());
 
-        match tokio::time::timeout(std::time::Duration::from_secs(5), wait_rx).await {
-            Ok(Ok(_)) => {
-                Ok(ZtConnectionHandle::new(self.clone(), scid, stream_rx, datagram_rx))
-            }
+        match tokio::time::timeout(self.config.connect_timeout, wait_rx).await {
+            Ok(Ok(_)) => Ok(ZtConnectionHandle::new(
+                self.clone(),
+                scid,
+                stream_rx,
+                datagram_rx,
+                termination,
+            )),
             _ => {
                 self.routing_table.remove(&scid);
                 Err(ZtError::Timeout)

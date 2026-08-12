@@ -1,8 +1,8 @@
 use crate::error::Result;
 use crate::transport::state::StreamType;
-use bytes::{Bytes, BytesMut, Buf};
-use std::sync::Arc;
+use bytes::{Buf, Bytes, BytesMut};
 use std::future::Future;
+use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
 
 /// Internal state machine for managing write backpressure, pacing, and acknowledgement
@@ -36,9 +36,9 @@ enum WriteState {
 }
 
 /// Represents a reliable, encrypted, and multiplexed data stream over a UDP connection.
-/// 
+///
 /// `ZtStream` operates very similarly to a `TcpStream` but with the distinct advantage of being
-/// multiplexed. You can open hundreds of independent `ZtStream` instances on a single 
+/// multiplexed. You can open hundreds of independent `ZtStream` instances on a single
 /// `ZtConnectionHandle` without suffering from Head-of-Line (HoL) blocking.
 ///
 /// **Async I/O Integration:**
@@ -65,14 +65,18 @@ pub struct ZtStream {
 
     // Read buffering
     current_read_chunk: Option<Bytes>,
+    pending_read_credit: usize,
 
     // Write buffering and state machine
     write_buffer: BytesMut,
     write_state: WriteState,
     pub(crate) stream_type: StreamType,
+    operation_timeout: std::time::Duration,
+    termination: Arc<crate::stream::termination::Termination>,
 }
 
 impl ZtStream {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         stream_id: u32,
         receiver: mpsc::Receiver<Bytes>,
@@ -81,6 +85,8 @@ impl ZtStream {
         actor_tx: mpsc::Sender<crate::transport::actor::ActorMessage>,
         mtu: Arc<std::sync::atomic::AtomicUsize>,
         stream_type: StreamType,
+        operation_timeout: std::time::Duration,
+        termination: Arc<crate::stream::termination::Termination>,
     ) -> Self {
         Self {
             stream_id,
@@ -90,10 +96,18 @@ impl ZtStream {
             actor_tx,
             mtu,
             current_read_chunk: None,
+            pending_read_credit: 0,
             write_buffer: BytesMut::new(),
             write_state: WriteState::Idle,
             stream_type,
+            operation_timeout,
+            termination,
         }
+    }
+
+    /// Returns whether this endpoint may read, write, or do both on the stream.
+    pub fn stream_type(&self) -> StreamType {
+        self.stream_type
     }
 
     /// Sends a payload reliably to the remote peer.
@@ -118,22 +132,30 @@ impl ZtStream {
             loop {
                 // Check if the connection has been closed before waiting.
                 if self.closed.load(std::sync::atomic::Ordering::Acquire) {
-                    return Err(crate::error::ZtError::ActorFailed);
+                    return Err(self
+                        .termination
+                        .error()
+                        .unwrap_or(crate::error::ZtError::ActorFailed));
                 }
-                
+
                 let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                if self.actor_tx.send(crate::transport::actor::ActorMessage::OutgoingData {
-                    stream_id: self.stream_id,
-                    data: Bytes::copy_from_slice(chunk),
-                    respond_to: resp_tx,
-                })
-                .await
-                .is_err()
+                if self
+                    .actor_tx
+                    .send(crate::transport::actor::ActorMessage::OutgoingData {
+                        stream_id: self.stream_id,
+                        data: Bytes::copy_from_slice(chunk),
+                        respond_to: resp_tx,
+                    })
+                    .await
+                    .is_err()
                 {
                     return Err(crate::error::ZtError::ActorFailed);
                 }
 
-                match resp_rx.await.unwrap_or(Err(crate::error::ZtError::ActorFailed)) {
+                match resp_rx
+                    .await
+                    .unwrap_or(Err(crate::error::ZtError::ActorFailed))
+                {
                     Ok(_) => break,
                     Err(crate::error::ZtError::FlowControlBlocked)
                     | Err(crate::error::ZtError::CongestionWindowFull) => {
@@ -141,7 +163,7 @@ impl ZtStream {
                         // received), the congestion window grows, or the
                         // connection is closed.
                         if tokio::time::timeout(
-                            std::time::Duration::from_secs(60),
+                            self.operation_timeout,
                             self.window_opened.notified(),
                         )
                         .await
@@ -170,37 +192,45 @@ impl ZtStream {
         }
         let mtu = self.mtu.load(std::sync::atomic::Ordering::Relaxed);
         let chunk_size = mtu.saturating_sub(64).max(512);
-        
+
         while !data.is_empty() {
             let to_send = if data.len() > chunk_size {
                 data.split_to(chunk_size)
             } else {
                 std::mem::take(&mut data)
             };
-            
+
             loop {
                 if self.closed.load(std::sync::atomic::Ordering::Acquire) {
-                    return Err(crate::error::ZtError::ActorFailed);
+                    return Err(self
+                        .termination
+                        .error()
+                        .unwrap_or(crate::error::ZtError::ActorFailed));
                 }
-                
+
                 let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                if self.actor_tx.send(crate::transport::actor::ActorMessage::OutgoingData {
-                    stream_id: self.stream_id,
-                    data: to_send.clone(),
-                    respond_to: resp_tx,
-                })
-                .await
-                .is_err()
+                if self
+                    .actor_tx
+                    .send(crate::transport::actor::ActorMessage::OutgoingData {
+                        stream_id: self.stream_id,
+                        data: to_send.clone(),
+                        respond_to: resp_tx,
+                    })
+                    .await
+                    .is_err()
                 {
                     return Err(crate::error::ZtError::ActorFailed);
                 }
 
-                match resp_rx.await.unwrap_or(Err(crate::error::ZtError::ActorFailed)) {
+                match resp_rx
+                    .await
+                    .unwrap_or(Err(crate::error::ZtError::ActorFailed))
+                {
                     Ok(_) => break,
                     Err(crate::error::ZtError::FlowControlBlocked)
                     | Err(crate::error::ZtError::CongestionWindowFull) => {
                         if tokio::time::timeout(
-                            std::time::Duration::from_secs(60),
+                            self.operation_timeout,
                             self.window_opened.notified(),
                         )
                         .await
@@ -219,49 +249,98 @@ impl ZtStream {
         Ok(())
     }
 
-    pub async fn recv(&mut self) -> Option<Bytes> {
+    /// Receives the next chunk and preserves peer reset/close reasons.
+    pub async fn recv_result(&mut self) -> Result<Option<Bytes>> {
         if self.stream_type == StreamType::UnidirectionalOut {
-            return None;
+            return Ok(None);
         }
         if let Some(chunk) = self.current_read_chunk.take()
-            && chunk.remaining() > 0 {
-                let _ = self.actor_tx.send(crate::transport::actor::ActorMessage::StreamDataRead {
+            && chunk.remaining() > 0
+        {
+            let bytes_read = chunk.len();
+            let _ = self
+                .actor_tx
+                .send(crate::transport::actor::ActorMessage::StreamDataRead {
                     stream_id: self.stream_id,
-                }).await;
-                return Some(chunk);
-            }
-        let chunk = self.receiver.recv().await?;
-        let _ = self.actor_tx.send(crate::transport::actor::ActorMessage::StreamDataRead {
-            stream_id: self.stream_id,
-        }).await;
-        Some(chunk)
+                    bytes_read,
+                })
+                .await;
+            return Ok(Some(chunk));
+        }
+        let Some(chunk) = self.receiver.recv().await else {
+            return self.termination.error().map_or(Ok(None), Err);
+        };
+        let bytes_read = chunk.len();
+        let _ = self
+            .actor_tx
+            .send(crate::transport::actor::ActorMessage::StreamDataRead {
+                stream_id: self.stream_id,
+                bytes_read,
+            })
+            .await;
+        Ok(Some(chunk))
+    }
+
+    /// Receives the next chunk, returning `None` for EOF or peer termination.
+    /// Use [`Self::recv_result`] when the peer's reset/close reason is needed.
+    pub async fn recv(&mut self) -> Option<Bytes> {
+        self.recv_result().await.ok().flatten()
     }
 
     /// Gracefully closes the stream.
     pub async fn close(&self) -> Result<()> {
-        let _ = self.actor_tx.send(crate::transport::actor::ActorMessage::CloseStream {
-            stream_id: self.stream_id,
-        }).await;
+        let _ = self
+            .actor_tx
+            .send(crate::transport::actor::ActorMessage::CloseStream {
+                stream_id: self.stream_id,
+            })
+            .await;
         Ok(())
+    }
+
+    /// Abruptly terminates the stream and delivers `error_code` to the peer.
+    pub async fn reset(&self, error_code: u64) -> Result<()> {
+        self.actor_tx
+            .send(crate::transport::actor::ActorMessage::ResetStream {
+                stream_id: self.stream_id,
+                error_code,
+            })
+            .await
+            .map_err(|_| crate::error::ZtError::ActorFailed)
     }
 }
 
 impl Drop for ZtStream {
     fn drop(&mut self) {
-        let _ = self.actor_tx.try_send(crate::transport::actor::ActorMessage::CloseStream {
-            stream_id: self.stream_id,
-        });
+        let _ = self
+            .actor_tx
+            .try_send(crate::transport::actor::ActorMessage::CloseStream {
+                stream_id: self.stream_id,
+            });
     }
 }
 
 impl tokio::io::AsyncRead for ZtStream {
     fn poll_read(
-            mut self: std::pin::Pin<&mut Self>,
-            cx: &mut std::task::Context<'_>,
-            buf: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         if self.stream_type == StreamType::UnidirectionalOut {
             return std::task::Poll::Ready(Ok(()));
+        }
+        if self.pending_read_credit > 0 {
+            let bytes_read = self.pending_read_credit;
+            if self
+                .actor_tx
+                .try_send(crate::transport::actor::ActorMessage::StreamDataRead {
+                    stream_id: self.stream_id,
+                    bytes_read,
+                })
+                .is_ok()
+            {
+                self.pending_read_credit = 0;
+            }
         }
         loop {
             // 1. If we have a buffered read chunk from a previous socket read, consume from it.
@@ -270,6 +349,18 @@ impl tokio::io::AsyncRead for ZtStream {
                     let amt = std::cmp::min(chunk.remaining(), buf.remaining());
                     let slice = chunk.split_to(amt);
                     buf.put_slice(&slice);
+                    self.pending_read_credit = self.pending_read_credit.saturating_add(amt);
+                    let bytes_read = self.pending_read_credit;
+                    if self
+                        .actor_tx
+                        .try_send(crate::transport::actor::ActorMessage::StreamDataRead {
+                            stream_id: self.stream_id,
+                            bytes_read,
+                        })
+                        .is_ok()
+                    {
+                        self.pending_read_credit = 0;
+                    }
                     return std::task::Poll::Ready(Ok(()));
                 } else {
                     // Chunk is fully consumed, clear it.
@@ -284,8 +375,12 @@ impl tokio::io::AsyncRead for ZtStream {
                     self.current_read_chunk = Some(bytes);
                 }
                 std::task::Poll::Ready(None) => {
-                    // The channel was closed by the actor, signaling EOF.
-                    return std::task::Poll::Ready(Ok(()));
+                    return self
+                        .termination
+                        .io_error()
+                        .map_or(std::task::Poll::Ready(Ok(())), |error| {
+                            std::task::Poll::Ready(Err(error))
+                        });
                 }
                 std::task::Poll::Pending => {
                     // No data available yet; the caller's waker has been registered by poll_recv.
@@ -310,10 +405,9 @@ impl tokio::io::AsyncWrite for ZtStream {
         }
         // Guard: check if connection closed.
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
-            return std::task::Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "Connection closed",
-            )));
+            return std::task::Poll::Ready(Err(self.termination.io_error().unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "Connection closed")
+            })));
         }
 
         let this = self.as_mut().get_mut();
@@ -329,24 +423,31 @@ impl tokio::io::AsyncWrite for ZtStream {
                         std::task::Poll::Ready(Ok(Ok(()))) => {
                             // Successfully sent chunk, state remains Idle
                         }
-                        std::task::Poll::Ready(Ok(Err(crate::error::ZtError::FlowControlBlocked)))
-                        | std::task::Poll::Ready(Ok(Err(crate::error::ZtError::CongestionWindowFull))) => {
+                        std::task::Poll::Ready(Ok(Err(
+                            crate::error::ZtError::FlowControlBlocked,
+                        )))
+                        | std::task::Poll::Ready(Ok(Err(
+                            crate::error::ZtError::CongestionWindowFull,
+                        ))) => {
                             let notify = this.window_opened.clone();
                             this.write_state = WriteState::Blocked {
                                 notify_fut: Box::pin(async move { notify.notified().await }),
                                 chunk,
                             };
                         }
-                        std::task::Poll::Ready(Ok(Err(crate::error::ZtError::PacingBlocked(dur)))) => {
+                        std::task::Poll::Ready(Ok(Err(crate::error::ZtError::PacingBlocked(
+                            dur,
+                        )))) => {
                             this.write_state = WriteState::Pacing {
                                 sleep_fut: Box::pin(tokio::time::sleep(dur)),
                                 chunk,
                             };
                         }
                         std::task::Poll::Ready(Ok(Err(e))) => {
-                            return std::task::Poll::Ready(Err(std::io::Error::other(
-                                format!("Write failed: {:?}", e),
-                            )));
+                            return std::task::Poll::Ready(Err(std::io::Error::other(format!(
+                                "Write failed: {:?}",
+                                e
+                            ))));
                         }
                         std::task::Poll::Ready(Err(_)) => {
                             return std::task::Poll::Ready(Err(std::io::Error::new(
@@ -360,56 +461,66 @@ impl tokio::io::AsyncWrite for ZtStream {
                         }
                     }
                 }
-                WriteState::Blocked { mut notify_fut, chunk } => {
-                    match notify_fut.as_mut().poll(cx) {
-                        std::task::Poll::Ready(()) => {
-                            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                            if this.actor_tx.try_send(crate::transport::actor::ActorMessage::OutgoingData {
+                WriteState::Blocked {
+                    mut notify_fut,
+                    chunk,
+                } => match notify_fut.as_mut().poll(cx) {
+                    std::task::Poll::Ready(()) => {
+                        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                        if this
+                            .actor_tx
+                            .try_send(crate::transport::actor::ActorMessage::OutgoingData {
                                 stream_id: this.stream_id,
                                 data: chunk.clone(),
                                 respond_to: resp_tx,
-                            }).is_err() {
-                                return std::task::Poll::Ready(Err(std::io::Error::new(
-                                    std::io::ErrorKind::ConnectionAborted,
-                                    "Actor failed",
-                                )));
-                            }
-                            this.write_state = WriteState::Sending {
-                                resp_rx,
+                            })
+                            .is_err()
+                        {
+                            this.write_state = WriteState::Pacing {
+                                sleep_fut: Box::pin(tokio::time::sleep(
+                                    std::time::Duration::from_millis(1),
+                                )),
                                 chunk,
                             };
-                        }
-                        std::task::Poll::Pending => {
-                            this.write_state = WriteState::Blocked { notify_fut, chunk };
                             return std::task::Poll::Pending;
                         }
+                        this.write_state = WriteState::Sending { resp_rx, chunk };
                     }
-                }
-                WriteState::Pacing { mut sleep_fut, chunk } => {
-                    match sleep_fut.as_mut().poll(cx) {
-                        std::task::Poll::Ready(()) => {
-                            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                            if this.actor_tx.try_send(crate::transport::actor::ActorMessage::OutgoingData {
+                    std::task::Poll::Pending => {
+                        this.write_state = WriteState::Blocked { notify_fut, chunk };
+                        return std::task::Poll::Pending;
+                    }
+                },
+                WriteState::Pacing {
+                    mut sleep_fut,
+                    chunk,
+                } => match sleep_fut.as_mut().poll(cx) {
+                    std::task::Poll::Ready(()) => {
+                        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                        if this
+                            .actor_tx
+                            .try_send(crate::transport::actor::ActorMessage::OutgoingData {
                                 stream_id: this.stream_id,
                                 data: chunk.clone(),
                                 respond_to: resp_tx,
-                            }).is_err() {
-                                return std::task::Poll::Ready(Err(std::io::Error::new(
-                                    std::io::ErrorKind::ConnectionAborted,
-                                    "Actor failed",
-                                )));
-                            }
-                            this.write_state = WriteState::Sending {
-                                resp_rx,
+                            })
+                            .is_err()
+                        {
+                            this.write_state = WriteState::Pacing {
+                                sleep_fut: Box::pin(tokio::time::sleep(
+                                    std::time::Duration::from_millis(1),
+                                )),
                                 chunk,
                             };
-                        }
-                        std::task::Poll::Pending => {
-                            this.write_state = WriteState::Pacing { sleep_fut, chunk };
                             return std::task::Poll::Pending;
                         }
+                        this.write_state = WriteState::Sending { resp_rx, chunk };
                     }
-                }
+                    std::task::Poll::Pending => {
+                        this.write_state = WriteState::Pacing { sleep_fut, chunk };
+                        return std::task::Poll::Pending;
+                    }
+                },
             }
         }
 
@@ -418,9 +529,9 @@ impl tokio::io::AsyncWrite for ZtStream {
         let mtu = this.mtu.load(std::sync::atomic::Ordering::Relaxed);
         let chunk_size = mtu.saturating_sub(64).max(512);
 
-        this.write_buffer.extend_from_slice(buf);
-        let written = buf.len();
-
+        // A previous call may have filled the bounded staging buffer while the
+        // actor channel was busy. Dispatch it before accepting the caller's
+        // bytes again; returning Pending must never consume or duplicate `buf`.
         if this.write_buffer.len() >= chunk_size {
             match this.actor_tx.try_reserve() {
                 Ok(permit) => {
@@ -437,9 +548,30 @@ impl tokio::io::AsyncWrite for ZtStream {
                     };
                 }
                 Err(_) => {
+                    cx.waker().wake_by_ref();
                     return std::task::Poll::Pending;
                 }
             }
+        }
+
+        let available = chunk_size.saturating_sub(this.write_buffer.len());
+        let written = available.min(buf.len());
+        this.write_buffer.extend_from_slice(&buf[..written]);
+
+        if this.write_buffer.len() >= chunk_size
+            && let Ok(permit) = this.actor_tx.try_reserve()
+        {
+            let chunk_data = this.write_buffer.split_to(chunk_size).freeze();
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+            permit.send(crate::transport::actor::ActorMessage::OutgoingData {
+                stream_id: this.stream_id,
+                data: chunk_data.clone(),
+                respond_to: resp_tx,
+            });
+            this.write_state = WriteState::Sending {
+                resp_rx,
+                chunk: chunk_data,
+            };
         }
 
         std::task::Poll::Ready(Ok(written))
@@ -480,6 +612,7 @@ impl tokio::io::AsyncWrite for ZtStream {
                         }
                         Err(_) => {
                             this.write_state = WriteState::Idle;
+                            cx.waker().wake_by_ref();
                             return std::task::Poll::Pending;
                         }
                     }
@@ -489,24 +622,31 @@ impl tokio::io::AsyncWrite for ZtStream {
                         std::task::Poll::Ready(Ok(Ok(()))) => {
                             // Successfully sent chunk, state remains Idle
                         }
-                        std::task::Poll::Ready(Ok(Err(crate::error::ZtError::FlowControlBlocked)))
-                        | std::task::Poll::Ready(Ok(Err(crate::error::ZtError::CongestionWindowFull))) => {
+                        std::task::Poll::Ready(Ok(Err(
+                            crate::error::ZtError::FlowControlBlocked,
+                        )))
+                        | std::task::Poll::Ready(Ok(Err(
+                            crate::error::ZtError::CongestionWindowFull,
+                        ))) => {
                             let notify = this.window_opened.clone();
                             this.write_state = WriteState::Blocked {
                                 notify_fut: Box::pin(async move { notify.notified().await }),
                                 chunk,
                             };
                         }
-                        std::task::Poll::Ready(Ok(Err(crate::error::ZtError::PacingBlocked(dur)))) => {
+                        std::task::Poll::Ready(Ok(Err(crate::error::ZtError::PacingBlocked(
+                            dur,
+                        )))) => {
                             this.write_state = WriteState::Pacing {
                                 sleep_fut: Box::pin(tokio::time::sleep(dur)),
                                 chunk,
                             };
                         }
                         std::task::Poll::Ready(Ok(Err(e))) => {
-                            return std::task::Poll::Ready(Err(std::io::Error::other(
-                                format!("Flush failed: {:?}", e),
-                            )));
+                            return std::task::Poll::Ready(Err(std::io::Error::other(format!(
+                                "Flush failed: {:?}",
+                                e
+                            ))));
                         }
                         std::task::Poll::Ready(Err(_)) => {
                             return std::task::Poll::Ready(Err(std::io::Error::new(
@@ -520,56 +660,66 @@ impl tokio::io::AsyncWrite for ZtStream {
                         }
                     }
                 }
-                WriteState::Blocked { mut notify_fut, chunk } => {
-                    match notify_fut.as_mut().poll(cx) {
-                        std::task::Poll::Ready(()) => {
-                            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                            if this.actor_tx.try_send(crate::transport::actor::ActorMessage::OutgoingData {
+                WriteState::Blocked {
+                    mut notify_fut,
+                    chunk,
+                } => match notify_fut.as_mut().poll(cx) {
+                    std::task::Poll::Ready(()) => {
+                        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                        if this
+                            .actor_tx
+                            .try_send(crate::transport::actor::ActorMessage::OutgoingData {
                                 stream_id: this.stream_id,
                                 data: chunk.clone(),
                                 respond_to: resp_tx,
-                            }).is_err() {
-                                return std::task::Poll::Ready(Err(std::io::Error::new(
-                                    std::io::ErrorKind::ConnectionAborted,
-                                    "Actor failed",
-                                )));
-                            }
-                            this.write_state = WriteState::Sending {
-                                resp_rx,
+                            })
+                            .is_err()
+                        {
+                            this.write_state = WriteState::Pacing {
+                                sleep_fut: Box::pin(tokio::time::sleep(
+                                    std::time::Duration::from_millis(1),
+                                )),
                                 chunk,
                             };
-                        }
-                        std::task::Poll::Pending => {
-                            this.write_state = WriteState::Blocked { notify_fut, chunk };
                             return std::task::Poll::Pending;
                         }
+                        this.write_state = WriteState::Sending { resp_rx, chunk };
                     }
-                }
-                WriteState::Pacing { mut sleep_fut, chunk } => {
-                    match sleep_fut.as_mut().poll(cx) {
-                        std::task::Poll::Ready(()) => {
-                            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                            if this.actor_tx.try_send(crate::transport::actor::ActorMessage::OutgoingData {
+                    std::task::Poll::Pending => {
+                        this.write_state = WriteState::Blocked { notify_fut, chunk };
+                        return std::task::Poll::Pending;
+                    }
+                },
+                WriteState::Pacing {
+                    mut sleep_fut,
+                    chunk,
+                } => match sleep_fut.as_mut().poll(cx) {
+                    std::task::Poll::Ready(()) => {
+                        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                        if this
+                            .actor_tx
+                            .try_send(crate::transport::actor::ActorMessage::OutgoingData {
                                 stream_id: this.stream_id,
                                 data: chunk.clone(),
                                 respond_to: resp_tx,
-                            }).is_err() {
-                                return std::task::Poll::Ready(Err(std::io::Error::new(
-                                    std::io::ErrorKind::ConnectionAborted,
-                                    "Actor failed",
-                                )));
-                            }
-                            this.write_state = WriteState::Sending {
-                                resp_rx,
+                            })
+                            .is_err()
+                        {
+                            this.write_state = WriteState::Pacing {
+                                sleep_fut: Box::pin(tokio::time::sleep(
+                                    std::time::Duration::from_millis(1),
+                                )),
                                 chunk,
                             };
-                        }
-                        std::task::Poll::Pending => {
-                            this.write_state = WriteState::Pacing { sleep_fut, chunk };
                             return std::task::Poll::Pending;
                         }
+                        this.write_state = WriteState::Sending { resp_rx, chunk };
                     }
-                }
+                    std::task::Poll::Pending => {
+                        this.write_state = WriteState::Pacing { sleep_fut, chunk };
+                        return std::task::Poll::Pending;
+                    }
+                },
             }
         }
     }
@@ -589,13 +739,15 @@ impl tokio::io::AsyncWrite for ZtStream {
         }
 
         let this = self.as_mut().get_mut();
-        if this.actor_tx.try_send(crate::transport::actor::ActorMessage::CloseStream {
-            stream_id: this.stream_id,
-        }).is_err() {
-            return std::task::Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "Actor failed to close stream",
-            )));
+        if this
+            .actor_tx
+            .try_send(crate::transport::actor::ActorMessage::CloseStream {
+                stream_id: this.stream_id,
+            })
+            .is_err()
+        {
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
         }
 
         std::task::Poll::Ready(Ok(()))

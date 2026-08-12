@@ -30,8 +30,16 @@ pub(crate) trait CryptoEngine: Send + Sync {
         tag: &[u8; 16],
     ) -> crate::error::Result<()>;
 
-    fn apply_header_protection(&self, packet: &mut [u8], pn_offset: usize) -> crate::error::Result<()>;
-    fn remove_header_protection(&self, packet: &mut [u8], pn_offset: usize) -> crate::error::Result<()>;
+    fn apply_header_protection(
+        &self,
+        packet: &mut [u8],
+        pn_offset: usize,
+    ) -> crate::error::Result<()>;
+    fn remove_header_protection(
+        &self,
+        packet: &mut [u8],
+        pn_offset: usize,
+    ) -> crate::error::Result<()>;
 
     fn rotate_keys(&mut self);
     #[allow(dead_code)]

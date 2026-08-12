@@ -1,3 +1,9 @@
+//! Read-only connection telemetry.
+//!
+//! Obtain a snapshot with [`crate::stream::ZtConnectionHandle::stats`]. Counters are cumulative
+//! for the connection; gauges such as congestion window and bytes in flight reflect the instant
+//! at which the snapshot was requested.
+
 use crate::transport::congestion::CongestionControlAlgorithm;
 use std::time::Duration;
 
@@ -28,4 +34,14 @@ pub struct ConnectionStats {
     pub mtu: usize,
     /// Current congestion control algorithm.
     pub cc_algorithm: CongestionControlAlgorithm,
+    /// Packets declared lost by packet/time thresholds or retransmission timeout.
+    pub packets_lost: u64,
+    /// Reliable packets transmitted again after loss.
+    pub packets_retransmitted: u64,
+    /// Successful path-MTU probes.
+    pub mtu_probe_successes: u64,
+    /// Failed path-MTU probes.
+    pub mtu_probe_failures: u64,
+    /// Times an established larger MTU was rolled back after black-hole detection.
+    pub mtu_blackhole_recoveries: u64,
 }

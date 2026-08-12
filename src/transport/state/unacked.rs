@@ -9,6 +9,7 @@ pub(crate) enum UnackedPayload {
     },
     Stream {
         stream_id: u32,
+        stream_type: super::StreamType,
         offset: u64,
         data: Bytes,
     },
@@ -17,12 +18,22 @@ pub(crate) enum UnackedPayload {
     },
     StreamClose {
         stream_id: u32,
+        final_size: u64,
     },
     MaxStreamData {
         stream_id: u32,
         max_data: u64,
     },
+    ResetStream {
+        stream_id: u32,
+        error_code: u64,
+        final_size: u64,
+    },
     Close,
+    ConnectionCloseV2 {
+        error_code: u64,
+        reason: Vec<u8>,
+    },
     /// Unreliable datagram transmission payload.
     Datagram {
         /// The raw payload of the datagram.
@@ -34,11 +45,14 @@ impl UnackedPayload {
     pub(crate) fn len(&self) -> usize {
         match self {
             UnackedPayload::Initial { .. } => 0,
-            UnackedPayload::Stream { data, .. }
-            | UnackedPayload::Datagram { data, .. } => data.len(),
+            UnackedPayload::Stream { data, .. } | UnackedPayload::Datagram { data, .. } => {
+                data.len()
+            }
             UnackedPayload::MtuProbe { target_size } => *target_size,
             UnackedPayload::StreamClose { .. }
             | UnackedPayload::MaxStreamData { .. }
+            | UnackedPayload::ResetStream { .. }
+            | UnackedPayload::ConnectionCloseV2 { .. }
             | UnackedPayload::Close => 0,
         }
     }

@@ -1,8 +1,15 @@
+//! Errors returned by endpoint, connection, and stream operations.
+
 use thiserror::Error;
 
 /// Error types for the ZettaTransport protocol.
 #[derive(Error, Debug)]
 pub enum ZtError {
+    /// The endpoint configuration contains an invalid or internally
+    /// inconsistent value.
+    #[error("Invalid configuration: {0}")]
+    InvalidConfiguration(String),
+
     /// Errors related to underlying network IO.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -51,15 +58,28 @@ pub enum ZtError {
 
     /// The connection has reached its maximum number of concurrent streams.
     #[error("Too many concurrent streams (limit: {limit})")]
-    TooManyStreams { limit: usize },
+    TooManyStreams {
+        /// Maximum number of streams advertised by the peer.
+        limit: usize,
+    },
 
     /// The remote peer reset a stream with an error code.
     #[error("Stream {stream_id} reset by peer (error code: {error_code})")]
-    StreamReset { stream_id: u32, error_code: u64 },
+    StreamReset {
+        /// Identifier of the reset stream.
+        stream_id: u32,
+        /// Application-defined code supplied by the peer.
+        error_code: u64,
+    },
 
     /// The connection was closed by the peer with an error code and optional reason.
     #[error("Connection closed by peer (error code: {error_code}, reason: {reason})")]
-    ConnectionClosedByPeer { error_code: u64, reason: String },
+    ConnectionClosedByPeer {
+        /// Transport or application-defined code supplied by the peer.
+        error_code: u64,
+        /// UTF-8 diagnostic reason supplied by the peer.
+        reason: String,
+    },
 
     /// The connection was closed due to idle timeout.
     #[error("Connection closed due to idle timeout")]

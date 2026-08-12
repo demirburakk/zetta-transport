@@ -7,10 +7,8 @@ use bytes::{BufMut, Bytes, BytesMut};
 use ed25519_dalek::Signer;
 use sha2::Digest;
 use std::io::IoSlice;
-use std::time::{Duration, Instant as StdInstant};
 use std::net::SocketAddr;
-
-const KEY_UPDATE_PACKET_INTERVAL: u64 = 1 << 20;
+use std::time::{Duration, Instant as StdInstant};
 
 impl ZtConnectionActor {
     fn note_packet_sent(&mut self) {
@@ -20,9 +18,8 @@ impl ZtConnectionActor {
         let Some(crypto) = self.state.crypto.as_mut() else {
             return;
         };
-        self.state.packets_since_key_update =
-            self.state.packets_since_key_update.saturating_add(1);
-        if self.state.packets_since_key_update >= KEY_UPDATE_PACKET_INTERVAL {
+        self.state.packets_since_key_update = self.state.packets_since_key_update.saturating_add(1);
+        if self.state.packets_since_key_update >= self.endpoint.config.key_update_packet_interval {
             crypto.rotate_keys();
             self.state.current_key_epoch = self.state.current_key_epoch.saturating_add(1);
             self.state.packets_since_key_update = 0;
@@ -42,35 +39,66 @@ impl ZtConnectionActor {
         #[cfg(any(test, feature = "testing"))]
         {
             if self.state.state == ConnectionState::Active {
-                let loss_rate = crate::simulation::get_loss_rate();
+                self.simulation_packet_sequence = self.simulation_packet_sequence.saturating_add(1);
+                let sequence = self.simulation_packet_sequence;
+                let simulation = self.endpoint.config.simulation;
+                let periodic_drop = simulation.drop_every_n > 0
+                    && sequence.is_multiple_of(u64::from(simulation.drop_every_n));
+                let burst_drop = simulation.burst_period > 0
+                    && sequence % u64::from(simulation.burst_period)
+                        < u64::from(simulation.burst_length);
+                let mtu_drop = simulation.blackhole_mtu > 0 && total_len > simulation.blackhole_mtu;
+                if periodic_drop || burst_drop || mtu_drop {
+                    tracing::debug!(
+                        "[SIM] deterministic drop: sequence={}, len={}, periodic={}, burst={}, mtu={}",
+                        sequence,
+                        total_len,
+                        periodic_drop,
+                        burst_drop,
+                        mtu_drop
+                    );
+                    self.state.bytes_sent += total_len;
+                    return Ok(());
+                }
+                let loss_rate = self.endpoint.config.simulation.loss_rate_pct;
                 if loss_rate > 0 {
                     use rand::Rng;
-                    let roll = rand::thread_rng().gen_range(0..100);
+                    let roll = self.simulation_rng.gen_range(0..100);
                     if roll < loss_rate {
-                        tracing::debug!("[SIM] Loss simulation: dropping packet of len {}", total_len);
+                        tracing::debug!(
+                            "[SIM] Loss simulation: dropping packet of len {}",
+                            total_len
+                        );
                         self.state.bytes_sent += total_len;
                         return Ok(());
                     }
                 }
 
-                let reorder_rate = crate::simulation::get_reorder_rate();
-                let reorder_delay = crate::simulation::get_reorder_delay();
+                let reorder_rate = self.endpoint.config.simulation.reorder_rate_pct;
+                let reorder_delay = self.endpoint.config.simulation.reorder_delay_ms;
                 if reorder_rate > 0 && reorder_delay > 0 {
                     use rand::Rng;
-                    let roll = rand::thread_rng().gen_range(0..100);
+                    let roll = self.simulation_rng.gen_range(0..100);
                     if roll < reorder_rate {
-                        tracing::debug!("[SIM] Reorder simulation: delaying packet of len {} by {}ms", total_len, reorder_delay);
+                        tracing::debug!(
+                            "[SIM] Reorder simulation: delaying packet of len {} by {}ms",
+                            total_len,
+                            reorder_delay
+                        );
                         self.state.bytes_sent += total_len;
                         let socket = self.socket.clone();
                         let addr = self.state.addr;
-                        
+
                         let mut buf = Vec::with_capacity(total_len);
                         for slice in iov {
                             buf.extend_from_slice(slice);
                         }
-                        
+
                         tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(reorder_delay as u64)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                reorder_delay as u64,
+                            ))
+                            .await;
                             let _ = socket.send_to(&buf, addr).await;
                         });
                         return Ok(());
@@ -96,7 +124,9 @@ impl ZtConnectionActor {
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 self.socket_blocked = true;
-                Err(ZtError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)))
+                Err(ZtError::Io(std::io::Error::from(
+                    std::io::ErrorKind::WouldBlock,
+                )))
             }
             Err(e) => {
                 tracing::debug!("Failed to send packet: {}", e);
@@ -109,18 +139,22 @@ impl ZtConnectionActor {
         if self.state.state != ConnectionState::Active {
             return Ok(());
         }
-        
+
         // Binary search based PMTUD
         if self.state.mtu_max <= self.state.mtu_min + 10 {
             return Ok(()); // Converged
         }
-        
+
         let target_size = self.state.mtu_min + (self.state.mtu_max - self.state.mtu_min) / 2;
-        
+
         let pn = self.state.get_next_packet_number()?;
         let key_phase = self.current_key_phase();
         let total_buffered = self.state.get_total_buffered_bytes();
-        self.state.local_window = (1024u64 * 1024u64).saturating_sub(total_buffered as u64);
+        self.state.local_window = self
+            .endpoint
+            .config
+            .initial_max_data
+            .saturating_sub(total_buffered as u64);
         let lowest_unacked = self.state.unacked_packets.keys().next().unwrap_or(pn);
         let (_, pn_len) =
             crate::protocol::packet_number::truncate_pn(pn, lowest_unacked.saturating_sub(1));
@@ -168,6 +202,7 @@ impl ZtConnectionActor {
                 sent_bytes,
             },
         );
+        self.state.bytes_in_flight = self.state.bytes_in_flight.saturating_add(sent_bytes);
         self.state.mtu_probes.insert(pn, target_size);
         self.note_packet_sent();
         Ok(())
@@ -179,8 +214,11 @@ impl ZtConnectionActor {
         }
         let pn = self.state.get_next_packet_number()?;
         let kp = self.current_key_phase();
-        self.state.local_window =
-            (1024u64 * 1024u64).saturating_sub(self.state.get_total_buffered_bytes() as u64);
+        self.state.local_window = self
+            .endpoint
+            .config
+            .initial_max_data
+            .saturating_sub(self.state.get_total_buffered_bytes() as u64);
         let lowest_unacked = self.state.unacked_packets.keys().next().unwrap_or(pn);
         let (_, pn_len) =
             crate::protocol::packet_number::truncate_pn(pn, lowest_unacked.saturating_sub(1));
@@ -198,7 +236,9 @@ impl ZtConnectionActor {
         header.encode(&mut packet);
         let header_len = packet.len();
         let ack_ranges = self.state.get_ack_ranges();
-        let ack_delay = self.state.largest_acked_received_at
+        let ack_delay = self
+            .state
+            .largest_acked_received_at
             .map_or(0, |t| t.elapsed().as_micros() as u64);
         Frame::Ack {
             largest_acked: self.state.ack_tracker.highest_processed.unwrap_or(0),
@@ -244,14 +284,29 @@ impl ZtConnectionActor {
         }
 
         // Check stream flow control
-        let stream = self.state.streams.get_mut(&stream_id).ok_or(ZtError::ActorFailed)?;
+        let stream = self
+            .state
+            .streams
+            .get_mut(&stream_id)
+            .ok_or(ZtError::ActorFailed)?;
+        if let Some(error_code) = stream.send_stopped_error {
+            return Err(ZtError::StreamReset {
+                stream_id,
+                error_code,
+            });
+        }
+        if stream.stream_type == crate::transport::state::StreamType::UnidirectionalIn {
+            return Err(ZtError::InvalidPacket(
+                "cannot send on a receive-only stream".into(),
+            ));
+        }
         if stream.tx_window < to_send_len {
             return Err(ZtError::FlowControlBlocked);
         }
 
         let to_send_len_usize = to_send_len as usize;
         let queued_bytes = self.state.queued_bytes;
-        
+
         if self.state.bytes_in_flight + to_send_len_usize + queued_bytes > self.state.cc.cwnd() {
             return Err(ZtError::CongestionWindowFull);
         }
@@ -259,14 +314,14 @@ impl ZtConnectionActor {
         let start = stream.next_tx_offset;
         stream.next_tx_offset += to_send_len;
         stream.tx_window -= to_send_len;
-        self.state.conn_tx_offset =
-            self.state.conn_tx_offset.saturating_add(to_send_len);
-        
+        self.state.conn_tx_offset = self.state.conn_tx_offset.saturating_add(to_send_len);
+
         self.state.remote_window -= to_send_len;
-        
+
         let payload_len = data.len();
         let payload = UnackedPayload::Stream {
             stream_id,
+            stream_type: stream.stream_type,
             offset: start,
             data,
         };
@@ -295,17 +350,22 @@ impl ZtConnectionActor {
         self.state.last_pacing_update = Some(now);
 
         while let Some((payload, retries)) = self.state.unpaced_queue.front().cloned() {
-            
             let len = payload.len() as f64;
             let payload_len = payload.len();
-            
+
             if self.state.pacing_tokens >= len {
                 if let Err(e) = self.send_payload_with_retries(payload, retries) {
                     if self.socket_blocked {
                         return None;
                     }
-                    if matches!(e, ZtError::Unauthorized | ZtError::Crypto(_) | ZtError::PacketNumberOverflow) {
-                        tracing::error!("Fatal error during paced send: {:?}. Closing connection.", e);
+                    if matches!(
+                        e,
+                        ZtError::Unauthorized | ZtError::Crypto(_) | ZtError::PacketNumberOverflow
+                    ) {
+                        tracing::error!(
+                            "Fatal error during paced send: {:?}. Closing connection.",
+                            e
+                        );
                         self.state.state = ConnectionState::Closed;
                         return None;
                     }
@@ -313,12 +373,18 @@ impl ZtConnectionActor {
                         *r += 1;
                         let r_val = *r;
                         if r_val > 10 {
-                            tracing::error!("Paced send failed after 10 retries. Closing connection.");
+                            tracing::error!(
+                                "Paced send failed after 10 retries. Closing connection."
+                            );
                             self.state.state = ConnectionState::Closed;
                             return None;
                         }
                         let backoff = std::time::Duration::from_millis(1 << r_val);
-                        tracing::warn!("Failed to send paced payload: {}. Retrying in {:?}.", e, backoff);
+                        tracing::warn!(
+                            "Failed to send paced payload: {}. Retrying in {:?}.",
+                            e,
+                            backoff
+                        );
                         return Some(backoff);
                     }
                     return Some(std::time::Duration::from_millis(1));
@@ -335,8 +401,16 @@ impl ZtConnectionActor {
                         if self.socket_blocked {
                             return None;
                         }
-                        if matches!(e, ZtError::Unauthorized | ZtError::Crypto(_) | ZtError::PacketNumberOverflow) {
-                            tracing::error!("Fatal error during paced send: {:?}. Closing connection.", e);
+                        if matches!(
+                            e,
+                            ZtError::Unauthorized
+                                | ZtError::Crypto(_)
+                                | ZtError::PacketNumberOverflow
+                        ) {
+                            tracing::error!(
+                                "Fatal error during paced send: {:?}. Closing connection.",
+                                e
+                            );
                             self.state.state = ConnectionState::Closed;
                             return None;
                         }
@@ -344,12 +418,18 @@ impl ZtConnectionActor {
                             *r += 1;
                             let r_val = *r;
                             if r_val > 10 {
-                                tracing::error!("Paced send failed after 10 retries. Closing connection.");
+                                tracing::error!(
+                                    "Paced send failed after 10 retries. Closing connection."
+                                );
                                 self.state.state = ConnectionState::Closed;
                                 return None;
                             }
                             let backoff = std::time::Duration::from_millis(1 << r_val);
-                            tracing::warn!("Failed to send paced payload: {}. Retrying in {:?}.", e, backoff);
+                            tracing::warn!(
+                                "Failed to send paced payload: {}. Retrying in {:?}.",
+                                e,
+                                backoff
+                            );
                             return Some(backoff);
                         }
                         return Some(std::time::Duration::from_millis(1));
@@ -370,6 +450,8 @@ impl ZtConnectionActor {
         let rto = (self.state.rtt + self.state.rttvar * 4).max(Duration::from_millis(50));
         let mut to_retransmit = std::collections::HashSet::new();
         let mut to_drop = Vec::new();
+        let mut failed_probe_targets = Vec::new();
+        let mut blackhole_detected = false;
         let mut timed_out = false;
         for (pn, up) in self.state.unacked_packets.iter_mut() {
             let backoff_multiplier = 1_u32.checked_shl(up.retries).unwrap_or(64).min(64);
@@ -378,6 +460,9 @@ impl ZtConnectionActor {
                 // MTU probes and unreliable datagram payloads are never retransmitted.
                 // Upon RTO expiration, they are discarded from the unacked tracking table.
                 if up.is_mtu_probe || matches!(up.payload, UnackedPayload::Datagram { .. }) {
+                    if let UnackedPayload::MtuProbe { target_size } = up.payload {
+                        failed_probe_targets.push(target_size);
+                    }
                     to_drop.push(pn);
                 } else {
                     up.retries += 1;
@@ -386,8 +471,7 @@ impl ZtConnectionActor {
                         break;
                     }
                     if up.retries > 3 {
-                        self.state.mtu = 1200; // MTU Fallback
-                        self.state.shared_mtu.store(1200, std::sync::atomic::Ordering::Relaxed);
+                        blackhole_detected = true;
                     }
                     up.sent_at = now;
                     to_drop.push(pn);
@@ -399,6 +483,19 @@ impl ZtConnectionActor {
         if timed_out {
             let _ = self.initiate_close();
             return Err(ZtError::Timeout);
+        }
+
+        for target_size in failed_probe_targets {
+            self.state.record_mtu_probe_failure(target_size);
+        }
+        if blackhole_detected && self.state.mtu > self.state.base_mtu {
+            let previous_mtu = self.state.mtu;
+            self.state.recover_mtu_blackhole();
+            tracing::warn!(
+                "PMTUD black hole detected; MTU reduced from {} to {}",
+                previous_mtu,
+                self.state.base_mtu
+            );
         }
 
         let mut payloads_to_resend = Vec::new();
@@ -415,8 +512,14 @@ impl ZtConnectionActor {
         }
 
         if !payloads_to_resend.is_empty() {
+            self.state.packets_lost = self
+                .state
+                .packets_lost
+                .saturating_add(payloads_to_resend.len() as u64);
             tracing::debug!("RTO Retransmitting {} packets", payloads_to_resend.len());
-            self.state.cc.on_congestion_event(self.state.rtt, StdInstant::now());
+            self.state
+                .cc
+                .on_congestion_event(self.state.rtt, StdInstant::now());
             for (payload, retries) in payloads_to_resend {
                 if let Err(e) = self.retransmit_payload(payload, retries) {
                     tracing::warn!("Failed to retransmit: {}", e);
@@ -426,16 +529,23 @@ impl ZtConnectionActor {
 
         if !to_drop.is_empty() {
             for stream in self.state.streams.values() {
-                stream.window_opened.notify_waiters();
+                stream.signal_window_opened();
             }
         }
 
         Ok(())
     }
 
-    pub(crate) fn retransmit_payload(&mut self, payload: UnackedPayload, retries: u32) -> Result<()> {
+    pub(crate) fn retransmit_payload(
+        &mut self,
+        payload: UnackedPayload,
+        retries: u32,
+    ) -> Result<()> {
         if let Err(e) = self.send_payload_with_retries(payload.clone(), retries) {
-            tracing::warn!("Failed to retransmit payload: {}. Queueing to pacing queue.", e);
+            tracing::warn!(
+                "Failed to retransmit payload: {}. Queueing to pacing queue.",
+                e
+            );
             self.state.unpaced_queue.push_front((payload, retries));
         }
         Ok(())
@@ -490,11 +600,13 @@ impl ZtConnectionActor {
             }
             UnackedPayload::Stream {
                 stream_id,
+                stream_type,
                 offset,
                 data,
             } => {
                 Frame::Stream {
                     id: *stream_id,
+                    stream_type: *stream_type,
                     offset: *offset,
                     data: data.clone(),
                 }
@@ -503,14 +615,47 @@ impl ZtConnectionActor {
             UnackedPayload::MtuProbe { target_size } => {
                 Frame::Padding(target_size.saturating_sub(h_len + 16)).encode(&mut packet);
             }
-            UnackedPayload::StreamClose { stream_id } => {
-                Frame::StreamClose { id: *stream_id }.encode(&mut packet);
+            UnackedPayload::StreamClose {
+                stream_id,
+                final_size,
+            } => {
+                Frame::StreamClose {
+                    id: *stream_id,
+                    final_size: *final_size,
+                }
+                .encode(&mut packet);
             }
-            UnackedPayload::MaxStreamData { stream_id, max_data } => {
-                Frame::MaxStreamData { id: *stream_id, max_data: *max_data }.encode(&mut packet);
+            UnackedPayload::MaxStreamData {
+                stream_id,
+                max_data,
+            } => {
+                Frame::MaxStreamData {
+                    id: *stream_id,
+                    max_data: *max_data,
+                }
+                .encode(&mut packet);
+            }
+            UnackedPayload::ResetStream {
+                stream_id,
+                error_code,
+                final_size,
+            } => {
+                Frame::ResetStream {
+                    stream_id: *stream_id,
+                    error_code: *error_code,
+                    final_size: *final_size,
+                }
+                .encode(&mut packet);
             }
             UnackedPayload::Close => {
                 Frame::ConnectionClose.encode(&mut packet);
+            }
+            UnackedPayload::ConnectionCloseV2 { error_code, reason } => {
+                Frame::ConnectionCloseV2 {
+                    error_code: *error_code,
+                    reason: reason.clone(),
+                }
+                .encode(&mut packet);
             }
             UnackedPayload::Datagram { data } => {
                 Frame::Datagram { data: data.clone() }.encode(&mut packet);
@@ -540,10 +685,23 @@ impl ZtConnectionActor {
         let packet_len = frozen.len();
 
         let is_client_str = if self.is_client { "CLIENT" } else { "SERVER" };
-        tracing::debug!("[{}] sendmsg_vectored: pn={}, len={}", is_client_str, pn, packet_len);
+        tracing::debug!(
+            "[{}] sendmsg_vectored: pn={}, len={}",
+            is_client_str,
+            pn,
+            packet_len
+        );
         let res = self.sendmsg_vectored(&[IoSlice::new(&frozen)]);
-        tracing::debug!("[{}] sendmsg_vectored res: pn={}, {:?}", is_client_str, pn, res);
+        tracing::debug!(
+            "[{}] sendmsg_vectored res: pn={}, {:?}",
+            is_client_str,
+            pn,
+            res
+        );
         res?;
+        if retries > 0 {
+            self.state.packets_retransmitted = self.state.packets_retransmitted.saturating_add(1);
+        }
         let is_mtu_probe = matches!(payload, UnackedPayload::MtuProbe { .. });
         self.state.unacked_packets.insert(
             pn,
@@ -562,7 +720,15 @@ impl ZtConnectionActor {
     }
 
     pub(super) fn send_stream_close(&mut self, stream_id: u32) -> Result<()> {
-        self.send_payload(UnackedPayload::StreamClose { stream_id })
+        let final_size = self
+            .state
+            .streams
+            .get(&stream_id)
+            .map_or(0, |stream| stream.next_tx_offset);
+        self.send_payload(UnackedPayload::StreamClose {
+            stream_id,
+            final_size,
+        })
     }
 
     pub(super) fn initiate_close(&mut self) -> Result<()> {
@@ -570,11 +736,37 @@ impl ZtConnectionActor {
         self.send_payload(UnackedPayload::Close)
     }
 
+    pub(super) fn reset_stream(&mut self, stream_id: u32, error_code: u64) -> Result<()> {
+        let final_size = self
+            .state
+            .streams
+            .get(&stream_id)
+            .map_or(0, |stream| stream.next_tx_offset);
+        self.send_payload(UnackedPayload::ResetStream {
+            stream_id,
+            error_code,
+            final_size,
+        })
+    }
+
+    pub(super) fn initiate_close_with_error(
+        &mut self,
+        error_code: u64,
+        reason: Vec<u8>,
+    ) -> Result<()> {
+        self.state.state = ConnectionState::Closing;
+        self.send_payload(UnackedPayload::ConnectionCloseV2 { error_code, reason })
+    }
+
     pub(super) fn send_initial_packet(&mut self, cookie: Option<bytes::Bytes>) -> Result<()> {
         self.send_initial_packet_internal(cookie, 0)
     }
 
-    fn send_initial_packet_internal(&mut self, cookie: Option<bytes::Bytes>, retries: u32) -> Result<()> {
+    fn send_initial_packet_internal(
+        &mut self,
+        cookie: Option<bytes::Bytes>,
+        retries: u32,
+    ) -> Result<()> {
         let pn = self.state.get_next_packet_number()?;
         let lowest_unacked = self.state.unacked_packets.keys().next().unwrap_or(pn);
         let (_, pn_len) =
@@ -582,7 +774,7 @@ impl ZtConnectionActor {
         let h = PacketHeader {
             p_type: PacketType::Initial,
             is_long: true,
-            version: 1,
+            version: crate::protocol::PROTOCOL_VERSION,
             dcid: self.state.dcid.clone(),
             scid: self.state.scid.clone(),
             packet_number: pn,
@@ -594,7 +786,9 @@ impl ZtConnectionActor {
         let h_len = p.len();
 
         let mut hasher = sha2::Sha256::new();
-        sha2::Digest::update(&mut hasher, 1u32.to_be_bytes());
+        let local_parameters =
+            crate::protocol::frame::TransportParameters::from_config(&self.endpoint.config);
+        sha2::Digest::update(&mut hasher, crate::protocol::PROTOCOL_VERSION.to_be_bytes());
         sha2::Digest::update(&mut hasher, &self.state.scid);
         sha2::Digest::update(&mut hasher, &self.state.dcid);
         sha2::Digest::update(&mut hasher, self.public_key.as_bytes());
@@ -602,16 +796,23 @@ impl ZtConnectionActor {
             self.state.cookie = Some(c.clone());
             sha2::Digest::update(&mut hasher, c);
         }
+        sha2::Digest::update(&mut hasher, local_parameters.transcript_bytes());
         let transcript_hash = sha2::Digest::finalize(hasher).to_vec();
 
         Frame::Handshake {
             public_key: *self.public_key.as_bytes(),
             ed_public_key: *self.ed_public_key.as_bytes(),
             transcript_hash: transcript_hash.clone(),
-            signature: self.ed_signing_key.as_ref().expect("Signing key missing").sign(&transcript_hash).to_bytes(),
+            signature: self
+                .ed_signing_key
+                .as_ref()
+                .expect("Signing key missing")
+                .sign(&transcript_hash)
+                .to_bytes(),
             alpn: self.endpoint.alpn.read().unwrap().clone(),
         }
         .encode(&mut p);
+        Frame::TransportParameters(local_parameters).encode(&mut p);
         if let Some(c) = cookie.clone() {
             Frame::Cookie { cookie: c }.encode(&mut p);
         }
@@ -696,7 +897,7 @@ impl ZtConnectionActor {
             crypto.apply_header_protection(packet.as_mut(), offset)?;
         }
         let frozen = packet.freeze();
-        
+
         let old_addr = self.state.addr;
         self.state.addr = to_addr;
         let res = self.sendmsg_vectored(&[std::io::IoSlice::new(&frozen)]);

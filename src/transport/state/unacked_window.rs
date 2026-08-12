@@ -112,6 +112,7 @@ mod tests {
         UnackedPacket {
             payload: UnackedPayload::Stream {
                 stream_id: 0,
+                stream_type: crate::transport::state::StreamType::Bidirectional,
                 offset: 0,
                 data: Bytes::from_static(b"x"),
             },

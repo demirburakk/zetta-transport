@@ -2,9 +2,9 @@ use crate::error::Result;
 use crate::stats::ConnectionStats;
 use crate::stream::ZtStream;
 use crate::transport::endpoint::ZtEndpoint;
+use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use bytes::Bytes;
 
 /// Represents a connection handle to a remote peer.
 pub struct ZtConnectionHandle {
@@ -13,6 +13,7 @@ pub struct ZtConnectionHandle {
     incoming_streams: mpsc::Receiver<ZtStream>,
     /// Receiver queue for incoming unreliable datagrams received from the remote peer.
     incoming_datagrams: mpsc::Receiver<Bytes>,
+    termination: Arc<crate::stream::termination::Termination>,
 }
 
 impl ZtConnectionHandle {
@@ -21,12 +22,14 @@ impl ZtConnectionHandle {
         cid: Vec<u8>,
         incoming_streams: mpsc::Receiver<ZtStream>,
         incoming_datagrams: mpsc::Receiver<Bytes>,
+        termination: Arc<crate::stream::termination::Termination>,
     ) -> Self {
         Self {
             endpoint,
             cid,
             incoming_streams,
             incoming_datagrams,
+            termination,
         }
     }
 
@@ -36,18 +39,38 @@ impl ZtConnectionHandle {
     }
 
     /// Opens a new stream of a specific type to the remote peer.
-    pub async fn open_stream_with_type(&self, stream_type: crate::transport::state::StreamType) -> Result<ZtStream> {
-        self.endpoint.open_stream_with_type(&self.cid, stream_type).await
+    pub async fn open_stream_with_type(
+        &self,
+        stream_type: crate::transport::state::StreamType,
+    ) -> Result<ZtStream> {
+        self.endpoint
+            .open_stream_with_type(&self.cid, stream_type)
+            .await
     }
 
     /// Accepts an incoming stream initiated by the remote peer.
     pub async fn accept_stream(&mut self) -> Option<ZtStream> {
-        self.incoming_streams.recv().await
+        self.accept_stream_result().await.ok().flatten()
+    }
+
+    /// Accepts an incoming stream while preserving a peer close reason.
+    pub async fn accept_stream_result(&mut self) -> Result<Option<ZtStream>> {
+        match self.incoming_streams.recv().await {
+            Some(stream) => Ok(Some(stream)),
+            None => self.termination.error().map_or(Ok(None), Err),
+        }
     }
 
     /// Gracefully closes the connection.
     pub async fn close(&self) -> Result<()> {
         self.endpoint.close(&self.cid).await
+    }
+
+    /// Closes the connection with a transport error code and UTF-8 diagnostic reason.
+    pub async fn close_with_error(&self, error_code: u64, reason: impl Into<String>) -> Result<()> {
+        self.endpoint
+            .close_with_error(&self.cid, error_code, reason.into())
+            .await
     }
 
     /// Sends an unreliable datagram to the remote peer.
@@ -56,7 +79,7 @@ impl ZtConnectionHandle {
     /// Unlike multiplexed streams, datagrams bypass stream sequencing, packet sorting, and
     /// retransmissions. This makes them ideal for loss-tolerant, low-latency applications where
     /// stale data is useless (e.g., VoIP voice frames, multiplayer game state synchronizations).
-    /// 
+    ///
     /// **Note on Congestion Control:**
     /// While datagrams bypass stream reliability, they are still subject to the connection's
     /// active congestion control algorithm (e.g., CUBIC or Reno) and packet pacing to prevent
@@ -70,7 +93,15 @@ impl ZtConnectionHandle {
     /// This method will yield the next available datagram payload without waiting for previous
     /// lost packets. If the connection is gracefully closed or abruptly terminated, it returns `None`.
     pub async fn recv_datagram(&mut self) -> Option<Bytes> {
-        self.incoming_datagrams.recv().await
+        self.recv_datagram_result().await.ok().flatten()
+    }
+
+    /// Receives a datagram while preserving a peer close reason.
+    pub async fn recv_datagram_result(&mut self) -> Result<Option<Bytes>> {
+        match self.incoming_datagrams.recv().await {
+            Some(data) => Ok(Some(data)),
+            None => self.termination.error().map_or(Ok(None), Err),
+        }
     }
 
     /// Returns a snapshot of the connection's current transport-level telemetry and statistics.

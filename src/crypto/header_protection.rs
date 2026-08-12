@@ -1,5 +1,8 @@
 use crate::error::{Result, ZtError};
-use chacha20::{ChaCha20, cipher::{KeyIvInit, StreamCipher}};
+use chacha20::{
+    ChaCha20,
+    cipher::{KeyIvInit, StreamCipher},
+};
 
 /// Applies header protection to a packet in-place using ChaCha20.
 pub(crate) fn apply_header_protection(
@@ -19,7 +22,7 @@ pub(crate) fn apply_header_protection(
 
     // For ChaCha20 header protection: counter = sample[0..4], nonce = sample[4..16]
     let counter = u32::from_le_bytes(sample[0..4].try_into().unwrap());
-    
+
     let mut cipher = ChaCha20::new_from_slices(tx_hp_key, &sample[4..16]).unwrap();
     use chacha20::cipher::StreamCipherSeek;
     cipher.seek(counter as u64 * 64);
@@ -58,7 +61,7 @@ pub(crate) fn remove_header_protection(
     sample.copy_from_slice(&packet[sample_offset..sample_offset + 16]);
 
     let counter = u32::from_le_bytes(sample[0..4].try_into().unwrap());
-    
+
     let mut cipher = ChaCha20::new_from_slices(hp_key, &sample[4..16]).unwrap();
     use chacha20::cipher::StreamCipherSeek;
     cipher.seek(counter as u64 * 64);
@@ -138,4 +141,3 @@ mod tests {
         assert_eq!(packet[0] & 0xF0, original_first & 0xF0);
     }
 }
-

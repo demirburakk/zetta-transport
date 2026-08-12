@@ -4,7 +4,7 @@ use std::time::Duration;
 
 /// Supported congestion control algorithms for ZettaTransport.
 ///
-/// **CUBIC** is the default algorithm, providing superior performance on modern, 
+/// **CUBIC** is the default algorithm, providing superior performance on modern,
 /// high-bandwidth networks with high latency.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CongestionControlAlgorithm {
@@ -25,7 +25,7 @@ pub enum CongestionControlAlgorithm {
 pub(crate) trait CongestionController: Send + Sync {
     /// Invoked when a packet is sent out. Allows tracking of outstanding bytes and pacing.
     fn on_packet_sent(&mut self, pn: u64, bytes: usize, sent_at: std::time::Instant);
-    
+
     /// Invoked when one or more packets are acknowledged. Updates the congestion window
     /// according to the active phase (slow start vs congestion avoidance).
     fn on_packet_acked(
@@ -34,27 +34,23 @@ pub(crate) trait CongestionController: Send + Sync {
         rtt: std::time::Duration,
         now: std::time::Instant,
     );
-    
+
     /// Invoked when a loss event is detected (e.g. triple duplicate ACKs or RTO timeout).
     /// Halves the window (or performs Cubic convergence reduction) and updates ssthresh.
-    fn on_congestion_event(
-        &mut self,
-        rtt: std::time::Duration,
-        now: std::time::Instant,
-    );
-    
+    fn on_congestion_event(&mut self, rtt: std::time::Duration, now: std::time::Instant);
+
     /// Returns the current congestion window size in bytes.
     fn cwnd(&self) -> usize;
-    
+
     /// Returns the current slow start threshold in bytes.
     fn ssthresh(&self) -> usize;
-    
+
     /// Mutates the congestion window size.
     fn set_cwnd(&mut self, cwnd: usize);
-    
+
     /// Mutates the slow start threshold size.
     fn set_ssthresh(&mut self, ssthresh: usize);
-    
+
     /// Updates the Maximum Transmission Unit (MTU) used to calculate segment boundaries.
     fn set_mtu(&mut self, mtu: usize);
 }
@@ -122,7 +118,7 @@ impl CongestionController for CubicController {
                 Some(last) => now.duration_since(last) >= rtt,
                 None => true,
             };
-            
+
             if should_update {
                 self.last_cubic_update = Some(now);
                 let c = 0.4;
@@ -147,15 +143,12 @@ impl CongestionController for CubicController {
         }
     }
 
-    fn on_congestion_event(
-        &mut self,
-        rtt: std::time::Duration,
-        now: std::time::Instant,
-    ) {
+    fn on_congestion_event(&mut self, rtt: std::time::Duration, now: std::time::Instant) {
         if let Some(last_loss) = self.last_congestion_time
-            && now.duration_since(last_loss) < rtt {
-                return; // Reduce cwnd at most once per RTT
-            }
+            && now.duration_since(last_loss) < rtt
+        {
+            return; // Reduce cwnd at most once per RTT
+        }
         self.last_congestion_time = Some(now);
 
         let beta = 0.7;
@@ -178,11 +171,21 @@ impl CongestionController for CubicController {
         self.last_cubic_update = None;
     }
 
-    fn cwnd(&self) -> usize { self.cwnd }
-    fn ssthresh(&self) -> usize { self.ssthresh }
-    fn set_cwnd(&mut self, cwnd: usize) { self.cwnd = cwnd; }
-    fn set_ssthresh(&mut self, ssthresh: usize) { self.ssthresh = ssthresh; }
-    fn set_mtu(&mut self, mtu: usize) { self.mtu = mtu; }
+    fn cwnd(&self) -> usize {
+        self.cwnd
+    }
+    fn ssthresh(&self) -> usize {
+        self.ssthresh
+    }
+    fn set_cwnd(&mut self, cwnd: usize) {
+        self.cwnd = cwnd;
+    }
+    fn set_ssthresh(&mut self, ssthresh: usize) {
+        self.ssthresh = ssthresh;
+    }
+    fn set_mtu(&mut self, mtu: usize) {
+        self.mtu = mtu;
+    }
 }
 
 /// An implementation of classic TCP Reno congestion control (AIMD).
@@ -230,26 +233,33 @@ impl CongestionController for RenoController {
         }
     }
 
-    fn on_congestion_event(
-        &mut self,
-        rtt: std::time::Duration,
-        now: std::time::Instant,
-    ) {
+    fn on_congestion_event(&mut self, rtt: std::time::Duration, now: std::time::Instant) {
         if let Some(last_loss) = self.last_congestion_time
-            && now.duration_since(last_loss) < rtt {
-                return; // Reduce cwnd at most once per RTT
-            }
+            && now.duration_since(last_loss) < rtt
+        {
+            return; // Reduce cwnd at most once per RTT
+        }
         self.last_congestion_time = Some(now);
 
         self.ssthresh = (self.cwnd / 2).max(self.mtu * 2);
         self.cwnd = self.ssthresh;
     }
 
-    fn cwnd(&self) -> usize { self.cwnd }
-    fn ssthresh(&self) -> usize { self.ssthresh }
-    fn set_cwnd(&mut self, cwnd: usize) { self.cwnd = cwnd; }
-    fn set_ssthresh(&mut self, ssthresh: usize) { self.ssthresh = ssthresh; }
-    fn set_mtu(&mut self, mtu: usize) { self.mtu = mtu; }
+    fn cwnd(&self) -> usize {
+        self.cwnd
+    }
+    fn ssthresh(&self) -> usize {
+        self.ssthresh
+    }
+    fn set_cwnd(&mut self, cwnd: usize) {
+        self.cwnd = cwnd;
+    }
+    fn set_ssthresh(&mut self, ssthresh: usize) {
+        self.ssthresh = ssthresh;
+    }
+    fn set_mtu(&mut self, mtu: usize) {
+        self.mtu = mtu;
+    }
 }
 
 impl ZtConnection {
@@ -290,7 +300,8 @@ impl ZtConnection {
         // 1. Process SACK ranges first (Selective ACK)
         for &(start, end) in sack_ranges {
             let lower = start.max(self.unacked_packets.base_pn);
-            let upper = end.min(self.unacked_packets.base_pn + self.unacked_packets.deque.len() as u64);
+            let upper =
+                end.min(self.unacked_packets.base_pn + self.unacked_packets.deque.len() as u64);
             if lower <= upper {
                 for pn in lower..=upper {
                     if let Some(up) = self.unacked_packets.remove(pn) {
@@ -306,9 +317,7 @@ impl ZtConnection {
                             && up.payload.len() > self.mtu
                         {
                             let new_mtu = up.payload.len();
-                            self.mtu = new_mtu;
-                            self.shared_mtu.store(new_mtu, std::sync::atomic::Ordering::Relaxed);
-                            self.cc.set_mtu(new_mtu);
+                            self.record_mtu_probe_success(new_mtu);
                             tracing::info!("MTU upgraded to {} via SACK'd PMTUD", self.mtu);
                         }
                     }
@@ -341,7 +350,10 @@ impl ZtConnection {
         // 3. Fast Retransmit Detection (SACK-based gap and time-based threshold detection)
         let mut lost_pns = Vec::new();
         let now = std::time::Instant::now();
-        let time_threshold = self.rtt.mul_f64(1.25).max(std::time::Duration::from_millis(15));
+        let time_threshold = self
+            .rtt
+            .mul_f64(1.25)
+            .max(std::time::Duration::from_millis(15));
         for (pn, up) in self.unacked_packets.iter() {
             if pn < largest_acked_pn {
                 let packet_threshold = pn + 3 <= largest_acked_pn;
@@ -354,11 +366,15 @@ impl ZtConnection {
             }
         }
         let mut loss_detected = false;
+        self.packets_lost = self.packets_lost.saturating_add(lost_pns.len() as u64);
         for pn in lost_pns {
             if let Some(up) = self.unacked_packets.remove(pn) {
                 self.bytes_in_flight = self.bytes_in_flight.saturating_sub(up.sent_bytes);
                 if up.is_mtu_probe {
                     self.mtu_probes.remove(&pn);
+                    if let UnackedPayload::MtuProbe { target_size } = up.payload {
+                        self.record_mtu_probe_failure(target_size);
+                    }
                 } else if matches!(up.payload, UnackedPayload::Datagram { .. }) {
                     // Do not retransmit datagram!
                     loss_detected = true;
@@ -372,9 +388,7 @@ impl ZtConnection {
             self.cc.on_congestion_event(self.rtt, now);
         }
 
-        self.bytes_in_flight = self
-            .bytes_in_flight
-            .saturating_sub(bytes_in_flight_acked);
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(bytes_in_flight_acked);
 
         if let Some(mut rtt) = sample_rtt {
             let ack_delay = Duration::from_micros(ack_delay_us);
@@ -401,7 +415,7 @@ impl ZtConnection {
 
         if (window_size as u64) > old_remote_window || bytes_acked > 0 {
             for stream in self.streams.values() {
-                stream.window_opened.notify_waiters();
+                stream.signal_window_opened();
             }
         }
     }

@@ -1,45 +1,59 @@
-//! > [!NOTE]
-//! > The test suite includes a simulation test `test_extreme_network_conditions_and_congestion_recovery` which globally sets a 25% packet loss and 20% reorder rate. 
-//! > When `cargo test` runs all tests concurrently in parallel, this global state leaks into other tests, causing them to experience massive packet loss and potentially fail. 
-//! > To guarantee reliable test results across the entire project, tests should be run sequentially using `cargo test --features testing -- --test-threads=1`.
-
 #![cfg(feature = "testing")]
 
-use zetta_transport::transport::endpoint::ZtEndpoint;
-use zetta_transport::transport::CongestionControlAlgorithm;
-use zetta_transport::simulation;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use bytes::Bytes;
 use rand::RngCore;
 use std::time::Instant;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use zetta_transport::config::ZtConfig;
+use zetta_transport::simulation::SimulationConfig;
+use zetta_transport::transport::CongestionControlAlgorithm;
+use zetta_transport::transport::endpoint::ZtEndpoint;
 
 const PAYLOAD_SIZE: usize = 150 * 1024; // 150 KB for extreme loss test
 
-async fn run_extreme_loss_transfer(test_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_extreme_loss_transfer(
+    test_name: &str,
+    simulation: SimulationConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("[{}] Starting extreme transfer test...", test_name);
 
-    let server = ZtEndpoint::bind("127.0.0.1:0", None).await?;
+    let server = ZtEndpoint::bind_with_zt_config(
+        "127.0.0.1:0",
+        ZtConfig {
+            simulation,
+            ..ZtConfig::default()
+        },
+    )
+    .await?;
     let server_addr = server.local_addr()?;
 
     let server_handle = tokio::spawn(async move {
         if let Some(mut conn) = server.accept().await
-            && let Some(mut stream) = conn.accept_stream().await {
-                let mut received = Vec::new();
-                while received.len() < PAYLOAD_SIZE {
-                    if let Some(chunk) = stream.recv().await {
-                        received.extend_from_slice(&chunk);
-                    } else {
-                        break;
-                    }
+            && let Some(mut stream) = conn.accept_stream().await
+        {
+            let mut received = Vec::new();
+            while received.len() < PAYLOAD_SIZE {
+                if let Some(chunk) = stream.recv().await {
+                    received.extend_from_slice(&chunk);
+                } else {
+                    break;
                 }
-                // Echo back
-                let _ = stream.send(&received).await;
-                // Wait for EOF
-                while stream.recv().await.is_some() {}
             }
+            // Echo back
+            let _ = stream.send(&received).await;
+            // Wait for EOF
+            while stream.recv().await.is_some() {}
+        }
     });
 
-    let client = ZtEndpoint::bind("127.0.0.1:0", None).await?;
+    let client = ZtEndpoint::bind_with_zt_config(
+        "127.0.0.1:0",
+        ZtConfig {
+            simulation,
+            ..ZtConfig::default()
+        },
+    )
+    .await?;
     let conn = client.connect(server_addr).await?;
     let mut stream = conn.open_stream().await?;
 
@@ -57,37 +71,41 @@ async fn run_extreme_loss_transfer(test_name: &str) -> Result<(), Box<dyn std::e
         }
     }
 
-    assert_eq!(original_data.len(), received_data.len(), "[{}] Data length mismatch", test_name);
-    assert_eq!(original_data, received_data, "[{}] Content mismatch", test_name);
+    assert_eq!(
+        original_data.len(),
+        received_data.len(),
+        "[{}] Data length mismatch",
+        test_name
+    );
+    assert_eq!(
+        original_data, received_data,
+        "[{}] Content mismatch",
+        test_name
+    );
     stream.close().await?;
     server_handle.await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn test_extreme_network_conditions_and_congestion_recovery() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_extreme_network_conditions_and_congestion_recovery()
+-> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     // --- Extreme Simulation Scenario: 25% Loss, 20% Reordering (30ms delay) ---
     println!("\n=== RUNNING EXTREME LOSS & REORDERING SCENARIO ===");
-    simulation::set_loss_rate(25);
-    simulation::set_reorder_rate(20);
-    simulation::set_reorder_delay(30);
+    let simulation = SimulationConfig::new(25, 20, 30);
 
     let start = Instant::now();
-    run_extreme_loss_transfer("ExtremeLossTest").await?;
+    run_extreme_loss_transfer("ExtremeLossTest", simulation).await?;
     println!("=== EXTREME SCENARIO PASSED in {:?} ===\n", start.elapsed());
-
-    // Reset simulation config to defaults
-    simulation::set_loss_rate(0);
-    simulation::set_reorder_rate(0);
-    simulation::set_reorder_delay(0);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_concurrent_different_congestion_control_algorithms() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_concurrent_different_congestion_control_algorithms()
+-> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let server = ZtEndpoint::bind("127.0.0.1:0", None).await?;
@@ -121,11 +139,14 @@ async fn test_concurrent_different_congestion_control_algorithms() -> Result<(),
     });
 
     // Client 1 using Reno
-    let client_reno = ZtEndpoint::bind_with_config("127.0.0.1:0", None, CongestionControlAlgorithm::Reno).await?;
+    let client_reno =
+        ZtEndpoint::bind_with_config("127.0.0.1:0", None, CongestionControlAlgorithm::Reno).await?;
     let conn_reno = client_reno.connect(server_addr).await?;
 
     // Client 2 using Cubic
-    let client_cubic = ZtEndpoint::bind_with_config("127.0.0.1:0", None, CongestionControlAlgorithm::Cubic).await?;
+    let client_cubic =
+        ZtEndpoint::bind_with_config("127.0.0.1:0", None, CongestionControlAlgorithm::Cubic)
+            .await?;
     let conn_cubic = client_cubic.connect(server_addr).await?;
 
     let t1 = tokio::spawn(async move {
@@ -168,7 +189,8 @@ async fn test_concurrent_different_congestion_control_algorithms() -> Result<(),
 }
 
 #[tokio::test]
-async fn test_datagram_stream_interleaving_holb_mitigation() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_datagram_stream_interleaving_holb_mitigation()
+-> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     let server = ZtEndpoint::bind("127.0.0.1:0", None).await?;
@@ -188,7 +210,7 @@ async fn test_datagram_stream_interleaving_holb_mitigation() -> Result<(), Box<d
                         break;
                     }
                 }
-                
+
                 println!("[SERVER] Datagram loop finished. Reading stream...");
                 if let Some(chunk) = stream.recv().await {
                     println!("[SERVER] Received stream chunk: {:?}", chunk);
@@ -209,7 +231,9 @@ async fn test_datagram_stream_interleaving_holb_mitigation() -> Result<(), Box<d
     // Open a stream and write some data (simulating blocked stream)
     let stream = conn.open_stream().await?;
     println!("[CLIENT] Stream opened. Sending stream payload...");
-    stream.send(b"stream_blocked_payload_data_waiting_to_be_read_by_server_with_delay").await?;
+    stream
+        .send(b"stream_blocked_payload_data_waiting_to_be_read_by_server_with_delay")
+        .await?;
     println!("[CLIENT] Stream payload sent. Starting datagram loop...");
 
     // Now, send unreliable datagrams concurrently

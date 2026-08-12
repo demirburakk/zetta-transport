@@ -1,6 +1,53 @@
 use crate::error::{Result, ZtError};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TransportParameters {
+    pub(crate) max_streams: u64,
+    pub(crate) initial_stream_window: u64,
+    pub(crate) initial_max_data: u64,
+    pub(crate) max_datagram_size: u32,
+    pub(crate) idle_timeout_ms: u64,
+}
+
+impl TransportParameters {
+    pub(crate) fn from_config(config: &crate::config::ZtConfig) -> Self {
+        Self {
+            max_streams: config.max_concurrent_streams,
+            initial_stream_window: config.initial_stream_window,
+            initial_max_data: config.initial_max_data,
+            max_datagram_size: config.mtu_max.saturating_sub(64) as u32,
+            idle_timeout_ms: config.idle_timeout.as_millis() as u64,
+        }
+    }
+
+    pub(crate) fn validate(self) -> Result<Self> {
+        if self.max_streams == 0
+            || self.max_streams > (u32::MAX / 2) as u64
+            || self.initial_stream_window == 0
+            || self.initial_max_data == 0
+            || self.initial_max_data > u32::MAX as u64
+            || self.max_datagram_size == 0
+            || self.idle_timeout_ms == 0
+        {
+            return Err(ZtError::InvalidPacket(
+                "invalid peer transport parameters".into(),
+            ));
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn transcript_bytes(self) -> [u8; 36] {
+        let mut bytes = [0u8; 36];
+        bytes[0..8].copy_from_slice(&self.max_streams.to_be_bytes());
+        bytes[8..16].copy_from_slice(&self.initial_stream_window.to_be_bytes());
+        bytes[16..24].copy_from_slice(&self.initial_max_data.to_be_bytes());
+        bytes[24..28].copy_from_slice(&self.max_datagram_size.to_be_bytes());
+        bytes[28..36].copy_from_slice(&self.idle_timeout_ms.to_be_bytes());
+        bytes
+    }
+}
+
 pub(crate) fn put_varint(dst: &mut BytesMut, val: u64) {
     if val < 64 {
         dst.put_u8(val as u8);
@@ -45,12 +92,13 @@ pub(crate) fn get_varint(src: &mut Bytes) -> Result<u64> {
 
 /// Frame types for ZettaTransport payloads.
 ///
-/// Frame type discriminants occupy bytes 0x00–0x14.
+/// Frame type discriminants occupy bytes 0x00–0x15.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
     Padding(usize),
     Stream {
         id: u32,
+        stream_type: crate::transport::state::StreamType,
         offset: u64,
         data: Bytes,
     },
@@ -73,6 +121,7 @@ pub enum Frame {
     },
     StreamClose {
         id: u32,
+        final_size: u64,
     },
     MaxStreamData {
         id: u32,
@@ -147,6 +196,7 @@ pub enum Frame {
         /// Human-readable diagnostic reason (UTF-8).
         reason: Vec<u8>,
     },
+    TransportParameters(TransportParameters),
 }
 
 impl Frame {
@@ -157,9 +207,15 @@ impl Frame {
                     dst.put_u8(0x00);
                 }
             }
-            Frame::Stream { id, offset, data } => {
+            Frame::Stream {
+                id,
+                stream_type,
+                offset,
+                data,
+            } => {
                 dst.put_u8(0x01);
                 dst.put_u32(*id);
+                dst.put_u8(stream_type.to_wire());
                 dst.put_u64(*offset);
                 put_varint(dst, data.len() as u64);
                 dst.put_slice(data);
@@ -205,9 +261,10 @@ impl Frame {
                 dst.put_u16(cookie.len() as u16);
                 dst.put_slice(cookie);
             }
-            Frame::StreamClose { id } => {
+            Frame::StreamClose { id, final_size } => {
                 dst.put_u8(0x06);
                 dst.put_u32(*id);
+                dst.put_u64(*final_size);
             }
             Frame::MaxStreamData { id, max_data } => {
                 dst.put_u8(0x07);
@@ -248,13 +305,20 @@ impl Frame {
             Frame::Ping => {
                 dst.put_u8(0x0D);
             }
-            Frame::ResetStream { stream_id, error_code, final_size } => {
+            Frame::ResetStream {
+                stream_id,
+                error_code,
+                final_size,
+            } => {
                 dst.put_u8(0x0E);
                 dst.put_u32(*stream_id);
                 put_varint(dst, *error_code);
                 put_varint(dst, *final_size);
             }
-            Frame::StopSending { stream_id, error_code } => {
+            Frame::StopSending {
+                stream_id,
+                error_code,
+            } => {
                 dst.put_u8(0x0F);
                 dst.put_u32(*stream_id);
                 put_varint(dst, *error_code);
@@ -263,7 +327,10 @@ impl Frame {
                 dst.put_u8(0x10);
                 put_varint(dst, *max_data);
             }
-            Frame::StreamDataBlocked { stream_id, max_data } => {
+            Frame::StreamDataBlocked {
+                stream_id,
+                max_data,
+            } => {
                 dst.put_u8(0x11);
                 dst.put_u32(*stream_id);
                 put_varint(dst, *max_data);
@@ -273,6 +340,10 @@ impl Frame {
                 put_varint(dst, *error_code);
                 put_varint(dst, reason.len() as u64);
                 dst.put_slice(reason);
+            }
+            Frame::TransportParameters(parameters) => {
+                dst.put_u8(0x15);
+                dst.put_slice(&parameters.transcript_bytes());
             }
         }
     }
@@ -293,17 +364,24 @@ impl Frame {
                 Ok(Frame::Padding(padding_len))
             }
             0x01 => {
-                if src.remaining() < 13 {
+                if src.remaining() < 14 {
                     return Err(ZtError::InvalidPacket("Stream frame too short".into()));
                 }
                 let id = src.get_u32();
+                let stream_type = crate::transport::state::StreamType::from_wire(src.get_u8())
+                    .ok_or_else(|| ZtError::InvalidPacket("Invalid stream type".into()))?;
                 let offset = src.get_u64();
                 let len = get_varint(src)? as usize;
                 if src.remaining() < len {
                     return Err(ZtError::InvalidPacket("Stream frame truncated".into()));
                 }
                 let data = src.copy_to_bytes(len);
-                Ok(Frame::Stream { id, offset, data })
+                Ok(Frame::Stream {
+                    id,
+                    stream_type,
+                    offset,
+                    data,
+                })
             }
             0x02 => {
                 if src.remaining() < 13 {
@@ -313,7 +391,9 @@ impl Frame {
                 let window_size = src.get_u32();
                 let ack_delay = get_varint(src)?;
                 if src.remaining() < 1 {
-                    return Err(ZtError::InvalidPacket("Ack frame range count missing".into()));
+                    return Err(ZtError::InvalidPacket(
+                        "Ack frame range count missing".into(),
+                    ));
                 }
                 let range_count = src.get_u8() as usize;
                 if range_count > 128 {
@@ -328,9 +408,7 @@ impl Frame {
                     let start = src.get_u64();
                     let end = src.get_u64();
                     if start > end {
-                        return Err(ZtError::InvalidPacket(
-                            "Ack range start > end".into(),
-                        ));
+                        return Err(ZtError::InvalidPacket("Ack range start > end".into()));
                     }
                     ack_ranges.push((start, end));
                 }
@@ -361,11 +439,15 @@ impl Frame {
                 signature.copy_from_slice(&src.chunk()[..64]);
                 src.advance(64);
                 if src.remaining() < 1 {
-                    return Err(ZtError::InvalidPacket("Handshake frame ALPN length missing".into()));
+                    return Err(ZtError::InvalidPacket(
+                        "Handshake frame ALPN length missing".into(),
+                    ));
                 }
                 let alpn_len = src.get_u8() as usize;
                 if src.remaining() < alpn_len {
-                    return Err(ZtError::InvalidPacket("Handshake frame ALPN truncated".into()));
+                    return Err(ZtError::InvalidPacket(
+                        "Handshake frame ALPN truncated".into(),
+                    ));
                 }
                 let alpn = src.copy_to_bytes(alpn_len).to_vec();
                 Ok(Frame::Handshake {
@@ -388,15 +470,18 @@ impl Frame {
                 Ok(Frame::Cookie { cookie })
             }
             0x06 => {
-                if src.remaining() < 4 {
+                if src.remaining() < 12 {
                     return Err(ZtError::InvalidPacket("StreamClose frame too short".into()));
                 }
                 let id = src.get_u32();
-                Ok(Frame::StreamClose { id })
+                let final_size = src.get_u64();
+                Ok(Frame::StreamClose { id, final_size })
             }
             0x07 => {
                 if src.remaining() < 12 {
-                    return Err(ZtError::InvalidPacket("MaxStreamData frame too short".into()));
+                    return Err(ZtError::InvalidPacket(
+                        "MaxStreamData frame too short".into(),
+                    ));
                 }
                 let id = src.get_u32();
                 let max_data = src.get_u64();
@@ -419,7 +504,9 @@ impl Frame {
             }
             0x0A => {
                 if src.remaining() < 8 {
-                    return Err(ZtError::InvalidPacket("PathChallenge frame too short".into()));
+                    return Err(ZtError::InvalidPacket(
+                        "PathChallenge frame too short".into(),
+                    ));
                 }
                 let mut data = [0u8; 8];
                 src.copy_to_slice(&mut data);
@@ -427,7 +514,9 @@ impl Frame {
             }
             0x0B => {
                 if src.remaining() < 8 {
-                    return Err(ZtError::InvalidPacket("PathResponse frame too short".into()));
+                    return Err(ZtError::InvalidPacket(
+                        "PathResponse frame too short".into(),
+                    ));
                 }
                 let mut data = [0u8; 8];
                 src.copy_to_slice(&mut data);
@@ -454,7 +543,9 @@ impl Frame {
             }
             0x13 => {
                 if src.remaining() < 8 {
-                    return Err(ZtError::InvalidPacket("StreamsBlocked frame too short".into()));
+                    return Err(ZtError::InvalidPacket(
+                        "StreamsBlocked frame too short".into(),
+                    ));
                 }
                 let max_streams = src.get_u64();
                 Ok(Frame::StreamsBlocked { max_streams })
@@ -467,7 +558,11 @@ impl Frame {
                 let stream_id = src.get_u32();
                 let error_code = get_varint(src)?;
                 let final_size = get_varint(src)?;
-                Ok(Frame::ResetStream { stream_id, error_code, final_size })
+                Ok(Frame::ResetStream {
+                    stream_id,
+                    error_code,
+                    final_size,
+                })
             }
             0x0F => {
                 if src.remaining() < 4 {
@@ -475,7 +570,10 @@ impl Frame {
                 }
                 let stream_id = src.get_u32();
                 let error_code = get_varint(src)?;
-                Ok(Frame::StopSending { stream_id, error_code })
+                Ok(Frame::StopSending {
+                    stream_id,
+                    error_code,
+                })
             }
             0x10 => {
                 let max_data = get_varint(src)?;
@@ -483,20 +581,41 @@ impl Frame {
             }
             0x11 => {
                 if src.remaining() < 4 {
-                    return Err(ZtError::InvalidPacket("StreamDataBlocked frame too short".into()));
+                    return Err(ZtError::InvalidPacket(
+                        "StreamDataBlocked frame too short".into(),
+                    ));
                 }
                 let stream_id = src.get_u32();
                 let max_data = get_varint(src)?;
-                Ok(Frame::StreamDataBlocked { stream_id, max_data })
+                Ok(Frame::StreamDataBlocked {
+                    stream_id,
+                    max_data,
+                })
             }
             0x14 => {
                 let error_code = get_varint(src)?;
                 let reason_len = get_varint(src)? as usize;
                 if src.remaining() < reason_len {
-                    return Err(ZtError::InvalidPacket("ConnectionCloseV2 reason truncated".into()));
+                    return Err(ZtError::InvalidPacket(
+                        "ConnectionCloseV2 reason truncated".into(),
+                    ));
                 }
                 let reason = src.copy_to_bytes(reason_len).to_vec();
                 Ok(Frame::ConnectionCloseV2 { error_code, reason })
+            }
+            0x15 => {
+                if src.remaining() < 36 {
+                    return Err(ZtError::InvalidPacket(
+                        "TransportParameters frame too short".into(),
+                    ));
+                }
+                Ok(Frame::TransportParameters(TransportParameters {
+                    max_streams: src.get_u64(),
+                    initial_stream_window: src.get_u64(),
+                    initial_max_data: src.get_u64(),
+                    max_datagram_size: src.get_u32(),
+                    idle_timeout_ms: src.get_u64(),
+                }))
             }
             _ => Err(ZtError::InvalidPacket(format!(
                 "Unknown frame type: {}",
@@ -509,7 +628,7 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::{Bytes, BytesMut, BufMut};
+    use bytes::{BufMut, Bytes, BytesMut};
 
     fn roundtrip(frame: Frame) -> Frame {
         let mut buf = BytesMut::new();
@@ -522,10 +641,110 @@ mod tests {
     fn stream_frame_roundtrip() {
         let f = Frame::Stream {
             id: 42,
+            stream_type: crate::transport::state::StreamType::Bidirectional,
             offset: 1000,
             data: Bytes::from_static(b"hello world"),
         };
         assert_eq!(roundtrip(f.clone()), f);
+    }
+
+    #[test]
+    fn transport_parameters_roundtrip() {
+        let parameters = TransportParameters {
+            max_streams: 17,
+            initial_stream_window: 65_535,
+            initial_max_data: 262_144,
+            max_datagram_size: 1400,
+            idle_timeout_ms: 30_000,
+        };
+        let frame = Frame::TransportParameters(parameters);
+        assert_eq!(roundtrip(frame.clone()), frame);
+        assert_eq!(parameters.transcript_bytes().len(), 36);
+    }
+
+    #[test]
+    fn all_stream_directions_roundtrip_and_invalid_direction_is_rejected() {
+        for stream_type in [
+            crate::transport::state::StreamType::Bidirectional,
+            crate::transport::state::StreamType::UnidirectionalOut,
+            crate::transport::state::StreamType::UnidirectionalIn,
+        ] {
+            let frame = Frame::Stream {
+                id: 7,
+                stream_type,
+                offset: u32::MAX as u64 + 9,
+                data: Bytes::from_static(b"direction"),
+            };
+            assert_eq!(roundtrip(frame.clone()), frame);
+        }
+
+        let mut malformed = BytesMut::new();
+        malformed.put_u8(0x01);
+        malformed.put_u32(1);
+        malformed.put_u8(0xff);
+        malformed.put_u64(0);
+        malformed.put_u8(0);
+        assert!(Frame::decode(&mut malformed.freeze()).is_err());
+    }
+
+    #[test]
+    fn invalid_transport_parameters_are_rejected() {
+        let valid = TransportParameters {
+            max_streams: 1,
+            initial_stream_window: 1,
+            initial_max_data: 1,
+            max_datagram_size: 1,
+            idle_timeout_ms: 1,
+        };
+        assert!(valid.validate().is_ok());
+        for invalid in [
+            TransportParameters {
+                max_streams: 0,
+                ..valid
+            },
+            TransportParameters {
+                initial_stream_window: 0,
+                ..valid
+            },
+            TransportParameters {
+                initial_max_data: 0,
+                ..valid
+            },
+            TransportParameters {
+                max_datagram_size: 0,
+                ..valid
+            },
+            TransportParameters {
+                idle_timeout_ms: 0,
+                ..valid
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn decoder_fuzz_corpus_never_panics_or_stalls() {
+        let mut state = 0xd1ce_baad_f00d_u64;
+        for case in 0..20_000usize {
+            let len = case % 257;
+            let mut input = vec![0u8; len];
+            for byte in &mut input {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+            let original_len = input.len();
+            let mut bytes = Bytes::from(input);
+            let _ = Frame::decode(&mut bytes);
+            if original_len > 0 {
+                assert!(
+                    bytes.len() < original_len,
+                    "decoder did not consume frame type"
+                );
+            }
+        }
     }
 
     #[test]
@@ -628,7 +847,9 @@ mod tests {
 
     #[test]
     fn data_blocked_frame_roundtrip() {
-        let f = Frame::DataBlocked { max_data: 1_048_576 };
+        let f = Frame::DataBlocked {
+            max_data: 1_048_576,
+        };
         assert_eq!(roundtrip(f.clone()), f);
     }
 

@@ -20,7 +20,10 @@ pub(crate) fn generate_keypair() -> (EphemeralSecret, PublicKey) {
 ///
 /// The intermediate `SharedSecret` bytes are wrapped in `Zeroizing` to
 /// guarantee they are wiped from the stack when the guard drops.
-pub(crate) fn compute_shared_secret(my_secret: EphemeralSecret, their_public: PublicKey) -> zeroize::Zeroizing<[u8; 32]> {
+pub(crate) fn compute_shared_secret(
+    my_secret: EphemeralSecret,
+    their_public: PublicKey,
+) -> zeroize::Zeroizing<[u8; 32]> {
     let shared: SharedSecret = my_secret.diffie_hellman(&their_public);
     zeroize::Zeroizing::new(shared.to_bytes())
 }

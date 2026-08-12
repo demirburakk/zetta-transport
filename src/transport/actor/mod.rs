@@ -34,6 +34,10 @@ pub(crate) enum ActorMessage {
     CloseStream {
         stream_id: u32,
     },
+    ResetStream {
+        stream_id: u32,
+        error_code: u64,
+    },
     OpenStream {
         stream_type: StreamType,
         respond_to: oneshot::Sender<Result<ZtStream>>,
@@ -41,8 +45,13 @@ pub(crate) enum ActorMessage {
     SetHandshakePacket(Bytes),
     StreamDataRead {
         stream_id: u32,
+        bytes_read: usize,
     },
     Close,
+    CloseWithError {
+        error_code: u64,
+        reason: Vec<u8>,
+    },
     SendDatagram {
         data: Bytes,
         respond_to: oneshot::Sender<Result<()>>,
@@ -77,6 +86,10 @@ pub(crate) struct ZtConnectionActor {
     pub(super) is_client: bool,
     pub(super) actor_tx: mpsc::Sender<ActorMessage>,
     pub(super) socket_blocked: bool,
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) simulation_rng: rand::rngs::StdRng,
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) simulation_packet_sequence: u64,
 
     // Path validation state variables:
     /// Target candidate address representing the new socket route under validation.
@@ -112,6 +125,11 @@ impl ZtConnectionActor {
         // Client uses even stream IDs, Server uses odd stream IDs.
         // Stream 0 is explicitly created during handshake, so client starts at 2.
         let next_stream_id = if is_client { 2 } else { 1 };
+        #[cfg(any(test, feature = "testing"))]
+        let simulation_seed = endpoint.config.simulation.seed
+            ^ scid
+                .iter()
+                .fold(0u64, |seed, byte| seed.rotate_left(5) ^ u64::from(*byte));
         Self {
             endpoint,
             socket,
@@ -133,6 +151,13 @@ impl ZtConnectionActor {
             is_client,
             actor_tx,
             socket_blocked: false,
+            #[cfg(any(test, feature = "testing"))]
+            simulation_rng: {
+                use rand::SeedableRng;
+                rand::rngs::StdRng::seed_from_u64(simulation_seed)
+            },
+            #[cfg(any(test, feature = "testing"))]
+            simulation_packet_sequence: 0,
             pending_validation_addr: None,
             path_validation_token: None,
             path_validation_sent_at: None,

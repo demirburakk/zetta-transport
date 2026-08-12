@@ -1,24 +1,22 @@
 use crate::crypto::CryptoContext;
 use crate::error::{Result, ZtError};
-use crate::protocol::frame::Frame;
+use crate::protocol::PROTOCOL_VERSION;
+use crate::protocol::frame::{Frame, TransportParameters};
 use crate::protocol::packet::{PacketHeader, PacketType};
 use crate::stream::ZtConnectionHandle;
 use crate::transport::actor::ZtConnectionActor;
 use crate::transport::connection::ZtConnection;
 use crate::transport::cookie;
 use crate::transport::endpoint::ZtEndpoint;
-use crate::transport::state::{ConnectionState, StreamState, StreamType};
+use crate::transport::state::ConnectionState;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use rand::Rng;
 use sha2::Digest;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 use x25519_dalek::PublicKey;
-
-/// Current protocol version constant used in transcript binding.
-const PROTOCOL_VERSION: u32 = 1;
 
 /// Server-side handshake processing.
 ///
@@ -87,6 +85,7 @@ pub(crate) async fn handle_handshake(
 
     let mut remote_alpn = Vec::new();
     let mut cookie_data: Option<Bytes> = None;
+    let mut remote_parameters: Option<TransportParameters> = None;
     let mut handshake_found = false;
 
     while payload_bytes.remaining() > 0 {
@@ -108,6 +107,13 @@ pub(crate) async fn handle_handshake(
             Ok(Frame::Cookie { cookie: c }) => {
                 cookie_data = Some(c);
             }
+            Ok(Frame::TransportParameters(parameters)) => {
+                if remote_parameters.replace(parameters.validate()?).is_some() {
+                    return Err(ZtError::InvalidPacket(
+                        "duplicate transport parameters".into(),
+                    ));
+                }
+            }
             Ok(_) => {}
             Err(_) => break,
         }
@@ -118,11 +124,20 @@ pub(crate) async fn handle_handshake(
             "No handshake frame in Initial".into(),
         ));
     }
+    let remote_parameters = remote_parameters
+        .ok_or_else(|| ZtError::InvalidPacket("No transport parameters in Initial".into()))?;
 
     let current_time = cookie::current_time_millis();
 
     let is_cookie_valid = cookie_data.as_deref().is_some_and(|c| {
-        cookie::verify_retry_cookie(&endpoint.cookie_key, &addr, &header.scid, c, current_time)
+        cookie::verify_retry_cookie(
+            &endpoint.cookie_key,
+            &addr,
+            &header.scid,
+            c,
+            current_time,
+            endpoint.config.cookie_max_age_ms,
+        )
     });
 
     if !is_cookie_valid {
@@ -143,24 +158,34 @@ pub(crate) async fn handle_handshake(
         return Err(ZtError::InvalidPacket("ALPN negotiation failed".into()));
     }
 
-    // Handshake replay protection: Check if cookie has been processed before
-    if let Some(ref c) = cookie_data
-        && c.len() == 40 {
-            let cookie_hmac: [u8; 32] = c[8..40].try_into().unwrap();
-            
-            // Periodically clean up expired entries (probabilistically to avoid lock contention on every packet)
-            if rand::thread_rng().gen_ratio(1, 128) {
-                endpoint.handshake_replay_filter.retain(|_, &mut timestamp| {
-                    current_time.saturating_sub(timestamp) <= 5000
-                });
-            }
+    let replay_cookie_hmac = cookie_data.as_ref().and_then(|cookie| {
+        (cookie.len() == 40).then(|| {
+            let mut hmac = [0u8; 32];
+            hmac.copy_from_slice(&cookie[8..40]);
+            hmac
+        })
+    });
 
-            if endpoint.handshake_replay_filter.contains_key(&cookie_hmac) {
-                tracing::debug!("Replayed handshake attempt from {:?} with SCID={:?} dropped", addr, header.scid);
-                return Ok(());
-            }
-            endpoint.handshake_replay_filter.insert(cookie_hmac, current_time);
-        }
+    // Periodically clean up expired entries. Do not consume a cookie until
+    // the transcript and peer signature have both authenticated successfully.
+    if rand::thread_rng().gen_ratio(1, 128) {
+        endpoint
+            .handshake_replay_filter
+            .retain(|_, &mut timestamp| {
+                current_time.saturating_sub(timestamp) <= endpoint.config.cookie_max_age_ms
+            });
+    }
+    if replay_cookie_hmac
+        .as_ref()
+        .is_some_and(|hmac| endpoint.handshake_replay_filter.contains_key(hmac))
+    {
+        tracing::debug!(
+            "Replayed handshake attempt from {:?} with SCID={:?} dropped",
+            addr,
+            header.scid
+        );
+        return Ok(());
+    }
 
     {
         // Verify Ed25519 signature
@@ -177,6 +202,7 @@ pub(crate) async fn handle_handshake(
         if let Some(ref c) = cookie_data {
             sha2::Digest::update(&mut hasher, c);
         }
+        sha2::Digest::update(&mut hasher, remote_parameters.transcript_bytes());
         let expected_hash = sha2::Digest::finalize(hasher).to_vec();
 
         if expected_hash != remote_transcript_hash {
@@ -187,10 +213,18 @@ pub(crate) async fn handle_handshake(
             .verify(&expected_hash, &remote_sig)
             .map_err(|_| ZtError::Crypto("Invalid Handshake Signature".into()))?;
 
-        if let Some(verifier) = &endpoint.verify_peer_key
-            && !verifier(&remote_ed_pk_bytes)
-        {
+        if !endpoint.verify_peer_key(&remote_ed_pk_bytes) {
             return Err(ZtError::Unauthorized);
+        }
+
+        if let Some(cookie_hmac) = replay_cookie_hmac {
+            use dashmap::mapref::entry::Entry;
+            match endpoint.handshake_replay_filter.entry(cookie_hmac) {
+                Entry::Occupied(_) => return Ok(()),
+                Entry::Vacant(entry) => {
+                    entry.insert(current_time);
+                }
+            }
         }
 
         // Generate an ephemeral keypair. The secret is consumed by
@@ -214,14 +248,23 @@ pub(crate) async fn handle_handshake(
             return Err(ZtError::ConnectionIdExhausted);
         }
 
-        let mut new_conn = ZtConnection::new_with_cc(addr, scid.clone(), header.scid.clone(), endpoint.cc_algo);
+        let mut new_conn = ZtConnection::new_with_config(
+            addr,
+            scid.clone(),
+            header.scid.clone(),
+            &endpoint.config,
+        );
+        new_conn.peer_max_streams = remote_parameters.max_streams;
+        new_conn.peer_initial_stream_window = remote_parameters.initial_stream_window;
+        new_conn.remote_window = remote_parameters.initial_max_data;
+        new_conn.peer_max_datagram_size = remote_parameters.max_datagram_size as usize;
+        new_conn.idle_timeout = endpoint
+            .config
+            .idle_timeout
+            .min(std::time::Duration::from_millis(
+                remote_parameters.idle_timeout_ms,
+            ));
         new_conn.bytes_received = original_data.len();
-
-        let (data_tx, _data_rx) = mpsc::channel(2048);
-        let window_opened = Arc::new(Notify::new());
-        new_conn
-            .streams
-            .insert(0, StreamState::new(data_tx, window_opened.clone(), StreamType::Bidirectional));
 
         let handshake_pn = new_conn.get_next_packet_number()?;
         new_conn.mark_processed(header.packet_number);
@@ -262,10 +305,13 @@ pub(crate) async fn handle_handshake(
             actor_tx.clone(),
         );
 
-        endpoint.routing_table.insert(scid.clone(), actor_tx.clone());
+        endpoint
+            .routing_table
+            .insert(scid.clone(), actor_tx.clone());
 
         struct RoutingTableGuard {
-            table: Arc<dashmap::DashMap<Vec<u8>, mpsc::Sender<crate::transport::actor::ActorMessage>>>,
+            table:
+                Arc<dashmap::DashMap<Vec<u8>, mpsc::Sender<crate::transport::actor::ActorMessage>>>,
             scid: Vec<u8>,
             commit: bool,
         }
@@ -282,7 +328,13 @@ pub(crate) async fn handle_handshake(
             commit: false,
         };
 
-        let conn_handle = ZtConnectionHandle::new(endpoint.clone(), scid.clone(), stream_rx, datagram_rx);
+        let conn_handle = ZtConnectionHandle::new(
+            endpoint.clone(),
+            scid.clone(),
+            stream_rx,
+            datagram_rx,
+            actor.state.termination.clone(),
+        );
 
         if endpoint.incoming_tx.try_send(conn_handle).is_err() {
             tracing::warn!(
@@ -313,6 +365,7 @@ pub(crate) async fn handle_handshake(
 
         // Server transcript includes protocol version to prevent downgrade attacks.
         let mut hasher = sha2::Sha256::new();
+        let local_parameters = TransportParameters::from_config(&endpoint.config);
         sha2::Digest::update(&mut hasher, PROTOCOL_VERSION.to_be_bytes());
         sha2::Digest::update(&mut hasher, &header.scid);
         sha2::Digest::update(&mut hasher, &header.dcid);
@@ -320,8 +373,10 @@ pub(crate) async fn handle_handshake(
         if let Some(ref c) = cookie_data {
             sha2::Digest::update(&mut hasher, c);
         }
+        sha2::Digest::update(&mut hasher, remote_parameters.transcript_bytes());
         sha2::Digest::update(&mut hasher, &scid);
         sha2::Digest::update(&mut hasher, ephemeral_public.as_bytes());
+        sha2::Digest::update(&mut hasher, local_parameters.transcript_bytes());
         let transcript_hash = sha2::Digest::finalize(hasher).to_vec();
 
         let frame = Frame::Handshake {
@@ -332,6 +387,7 @@ pub(crate) async fn handle_handshake(
             alpn: endpoint.alpn.read().unwrap().clone(),
         };
         frame.encode(&mut buf);
+        Frame::TransportParameters(local_parameters).encode(&mut buf);
         let payload_len = buf.len() - header_len;
         buf.put_bytes(0, 16); // tag
 
@@ -351,7 +407,9 @@ pub(crate) async fn handle_handshake(
         }
 
         let hs_bytes = buf.freeze();
-        let _ = actor_tx.try_send(crate::transport::actor::ActorMessage::SetHandshakePacket(hs_bytes.clone()));
+        let _ = actor_tx.try_send(crate::transport::actor::ActorMessage::SetHandshakePacket(
+            hs_bytes.clone(),
+        ));
 
         if let Err(e) = endpoint.socket.try_send_to(&hs_bytes, addr) {
             tracing::debug!("Failed to send: {}", e);
@@ -400,12 +458,14 @@ mod tests {
     #[tokio::test]
     async fn test_handshake_replay_protection() {
         let endpoint = ZtEndpoint::bind("127.0.0.1:0", None).await.unwrap();
-        
+
         let mut dummy_hmac = [0u8; 32];
         dummy_hmac[0] = 0xFF;
-        
+
         let current_time = cookie::current_time_millis();
-        endpoint.handshake_replay_filter.insert(dummy_hmac, current_time);
+        endpoint
+            .handshake_replay_filter
+            .insert(dummy_hmac, current_time);
 
         assert!(endpoint.handshake_replay_filter.contains_key(&dummy_hmac));
     }

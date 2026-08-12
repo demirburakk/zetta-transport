@@ -1,29 +1,33 @@
-use zetta_transport::transport::endpoint::ZtEndpoint;
-use zetta_transport::transport::CongestionControlAlgorithm;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use bytes::Bytes;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use zetta_transport::config::ZtConfig;
+use zetta_transport::transport::CongestionControlAlgorithm;
+use zetta_transport::transport::endpoint::ZtEndpoint;
 
 #[tokio::test]
 async fn test_async_read_write_copy() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
     // Bind server with Reno congestion control to test both pluggable CC and Async I/O
-    let server = ZtEndpoint::bind_with_config("127.0.0.1:0", None, CongestionControlAlgorithm::Reno).await?;
+    let server =
+        ZtEndpoint::bind_with_config("127.0.0.1:0", None, CongestionControlAlgorithm::Reno).await?;
     let server_addr = server.local_addr()?;
 
     let server_handle = tokio::spawn(async move {
         if let Some(mut conn) = server.accept().await
-            && let Some(mut stream) = conn.accept_stream().await {
-                // Use AsyncRead / AsyncWrite standard wrappers to copy
-                let mut buf = vec![0u8; 1024];
-                let n = stream.read(&mut buf).await.unwrap();
-                assert_eq!(&buf[..n], b"Hello Async I/O!");
-                stream.write_all(b"Echo: Hello Async I/O!").await.unwrap();
-                stream.flush().await.unwrap();
-            }
+            && let Some(mut stream) = conn.accept_stream().await
+        {
+            // Use AsyncRead / AsyncWrite standard wrappers to copy
+            let mut buf = vec![0u8; 1024];
+            let n = stream.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"Hello Async I/O!");
+            stream.write_all(b"Echo: Hello Async I/O!").await.unwrap();
+            stream.flush().await.unwrap();
+        }
     });
 
-    let client = ZtEndpoint::bind_with_config("127.0.0.1:0", None, CongestionControlAlgorithm::Reno).await?;
+    let client =
+        ZtEndpoint::bind_with_config("127.0.0.1:0", None, CongestionControlAlgorithm::Reno).await?;
     let conn = client.connect(server_addr).await?;
     let mut stream = conn.open_stream().await?;
 
@@ -50,14 +54,19 @@ async fn test_zero_copy_and_datagrams() -> Result<(), Box<dyn std::error::Error>
             // 1. Receive unreliable datagram
             let datagram = conn.recv_datagram().await.unwrap();
             assert_eq!(&datagram[..], b"unreliable payload");
-            conn.send_datagram(Bytes::from_static(b"unreliable response")).await.unwrap();
+            conn.send_datagram(Bytes::from_static(b"unreliable response"))
+                .await
+                .unwrap();
 
             // 2. Receive zero-copy stream bytes
             if let Some(mut stream) = conn.accept_stream().await {
                 let mut buf = vec![0u8; 1024];
                 let n = stream.read(&mut buf).await.unwrap();
                 assert_eq!(&buf[..n], b"zero-copy stream data");
-                stream.send_bytes(Bytes::from_static(b"stream response")).await.unwrap();
+                stream
+                    .send_bytes(Bytes::from_static(b"stream response"))
+                    .await
+                    .unwrap();
             }
         }
     });
@@ -66,14 +75,17 @@ async fn test_zero_copy_and_datagrams() -> Result<(), Box<dyn std::error::Error>
     let mut conn = client.connect(server_addr).await?;
 
     // Send unreliable datagram
-    conn.send_datagram(Bytes::from_static(b"unreliable payload")).await?;
+    conn.send_datagram(Bytes::from_static(b"unreliable payload"))
+        .await?;
     let datagram_reply = conn.recv_datagram().await.unwrap();
     assert_eq!(&datagram_reply[..], b"unreliable response");
 
     // Open stream and send zero-copy bytes
     let mut stream = conn.open_stream().await?;
-    stream.send_bytes(Bytes::from_static(b"zero-copy stream data")).await?;
-    
+    stream
+        .send_bytes(Bytes::from_static(b"zero-copy stream data"))
+        .await?;
+
     let mut stream_reply = vec![0u8; 1024];
     let n = stream.read(&mut stream_reply).await?;
     assert_eq!(&stream_reply[..n], b"stream response");
@@ -96,28 +108,55 @@ async fn test_unidirectional_streams() -> Result<(), Box<dyn std::error::Error>>
                 let mut buf = vec![0u8; 1024];
                 let n = stream.read(&mut buf).await.unwrap();
                 assert_eq!(&buf[..n], b"unidirectional outbound data");
+                assert_eq!(
+                    stream.stream_type(),
+                    zetta_transport::transport::StreamType::UnidirectionalIn
+                );
+
+                let server_out = conn
+                    .open_stream_with_type(
+                        zetta_transport::transport::StreamType::UnidirectionalOut,
+                    )
+                    .await
+                    .unwrap();
+                server_out.send(b"server-only response").await.unwrap();
             }
         }
     });
 
     let client = ZtEndpoint::bind("127.0.0.1:0", None).await?;
-    let conn = client.connect(server_addr).await?;
+    let mut conn = client.connect(server_addr).await?;
 
     // 1. Test UnidirectionalOut (Local writes only)
-    let mut uni_out = conn.open_stream_with_type(zetta_transport::transport::StreamType::UnidirectionalOut).await?;
-    
+    let mut uni_out = conn
+        .open_stream_with_type(zetta_transport::transport::StreamType::UnidirectionalOut)
+        .await?;
+
     // Writing should succeed
     uni_out.send(b"unidirectional outbound data").await?;
-    
+
     // Reading should return EOF/None immediately
     let mut read_buf = vec![0u8; 10];
     let read_bytes = uni_out.read(&mut read_buf).await?;
     assert_eq!(read_bytes, 0); // EOF
     assert!(uni_out.recv().await.is_none());
 
-    // 2. Test UnidirectionalIn (Local reads only)
-    let mut uni_in = conn.open_stream_with_type(zetta_transport::transport::StreamType::UnidirectionalIn).await?;
-    
+    // Receive-only streams cannot be opened locally; they are created when
+    // the peer opens a send-only stream.
+    assert!(
+        conn.open_stream_with_type(zetta_transport::transport::StreamType::UnidirectionalIn)
+            .await
+            .is_err()
+    );
+
+    let mut uni_in = conn.accept_stream().await.unwrap();
+    assert_eq!(
+        uni_in.stream_type(),
+        zetta_transport::transport::StreamType::UnidirectionalIn
+    );
+    let inbound = uni_in.recv_result().await?.unwrap();
+    assert_eq!(&inbound[..], b"server-only response");
+
     // Writing should fail with PermissionDenied
     let write_res = uni_in.send(b"data").await;
     assert!(write_res.is_err());
@@ -127,7 +166,10 @@ async fn test_unidirectional_streams() -> Result<(), Box<dyn std::error::Error>>
     // AsyncWrite poll_write should also fail
     let write_all_res = uni_in.write_all(b"data").await;
     assert!(write_all_res.is_err());
-    assert_eq!(write_all_res.err().unwrap().kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        write_all_res.err().unwrap().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
 
     server_handle.await?;
     Ok(())
@@ -147,7 +189,11 @@ async fn test_alpn_negotiation_failure() -> Result<(), Box<dyn std::error::Error
     client.set_alpn(b"http3-client".to_vec());
 
     // Connect should fail due to ALPN mismatch
-    let connect_res = tokio::time::timeout(std::time::Duration::from_millis(500), client.connect(server_addr)).await;
+    let connect_res = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        client.connect(server_addr),
+    )
+    .await;
     assert!(connect_res.is_err() || connect_res.unwrap().is_err());
 
     Ok(())
@@ -157,7 +203,11 @@ async fn test_alpn_negotiation_failure() -> Result<(), Box<dyn std::error::Error
 async fn test_dynamic_stream_limits_and_blocked() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let server = ZtEndpoint::bind("127.0.0.1:0", None).await?;
+    let limit_config = || ZtConfig {
+        max_concurrent_streams: 3,
+        ..ZtConfig::default()
+    };
+    let server = ZtEndpoint::bind_with_zt_config("127.0.0.1:0", limit_config()).await?;
     let server_addr = server.local_addr()?;
 
     let server_handle = tokio::spawn(async move {
@@ -167,12 +217,12 @@ async fn test_dynamic_stream_limits_and_blocked() -> Result<(), Box<dyn std::err
         }
     });
 
-    let client = ZtEndpoint::bind("127.0.0.1:0", None).await?;
+    let client = ZtEndpoint::bind_with_zt_config("127.0.0.1:0", limit_config()).await?;
     let conn = client.connect(server_addr).await?;
 
     let mut streams = Vec::new();
     let mut reached_limit = false;
-    for _ in 0..110 {
+    for _ in 0..4 {
         match conn.open_stream().await {
             Ok(s) => streams.push(s),
             Err(e) => {
@@ -189,3 +239,45 @@ async fn test_dynamic_stream_limits_and_blocked() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+#[tokio::test]
+async fn test_slow_consumer_flow_control_preserves_async_write_data()
+-> Result<(), Box<dyn std::error::Error>> {
+    const WINDOW: u64 = 8 * 1024;
+    const PAYLOAD_LEN: usize = 128 * 1024;
+
+    let config = || ZtConfig {
+        initial_stream_window: WINDOW,
+        max_stream_window: WINDOW,
+        initial_max_data: WINDOW,
+        max_connection_buffer: WINDOW as usize,
+        idle_timeout: std::time::Duration::from_secs(10),
+        ..ZtConfig::default()
+    };
+
+    let server = ZtEndpoint::bind_with_zt_config("127.0.0.1:0", config()).await?;
+    let server_addr = server.local_addr()?;
+    let expected = vec![0xA5; PAYLOAD_LEN];
+    let server_expected = expected.clone();
+
+    let server_handle = tokio::spawn(async move {
+        let mut conn = server.accept().await.expect("connection");
+        let mut stream = conn.accept_stream().await.expect("stream");
+        // Force the sender to exhaust both stream and connection credit.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let mut received = vec![0u8; PAYLOAD_LEN];
+        stream.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, server_expected);
+    });
+
+    let client = ZtEndpoint::bind_with_zt_config("127.0.0.1:0", config()).await?;
+    let conn = client.connect(server_addr).await?;
+    let mut stream = conn.open_stream().await?;
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        stream.write_all(&expected).await?;
+        stream.flush().await
+    })
+    .await??;
+
+    server_handle.await?;
+    Ok(())
+}

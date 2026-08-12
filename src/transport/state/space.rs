@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-use crate::crypto::CryptoEngine;
 use super::{ReplayWindow, UnackedWindow};
+use crate::crypto::CryptoEngine;
 
 pub(crate) struct PacketSpace {
     pub(crate) next_packet_number: u64,

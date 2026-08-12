@@ -33,7 +33,9 @@ pub(crate) fn expand_pn(pn_truncated: u64, pn_len: usize, largest_pn: u64) -> u6
 
     if expected_pn >= pn_hwin && candidate_pn <= expected_pn - pn_hwin {
         candidate_pn.saturating_add(pn_win)
-    } else if expected_pn.checked_add(pn_hwin).is_some_and(|limit| candidate_pn > limit)
+    } else if expected_pn
+        .checked_add(pn_hwin)
+        .is_some_and(|limit| candidate_pn > limit)
         && candidate_pn >= pn_win
     {
         candidate_pn.saturating_sub(pn_win)
@@ -75,7 +77,7 @@ mod tests {
         let expanded = expand_pn(0, 1, 254);
         assert_eq!(expanded, 256);
     }
-    
+
     #[test]
     fn fuzz_packet_numbers() {
         // Pseudo-fuzzing with edge cases and random leaps
@@ -85,8 +87,11 @@ mod tests {
             let pn = largest_acked + step;
             let (truncated, len) = truncate_pn(pn, largest_acked);
             let expanded = expand_pn(truncated as u64, len, largest_acked);
-            assert_eq!(expanded, pn, "Failed to expand step {step} from {largest_acked} (len {len}, trunc {truncated})");
-            
+            assert_eq!(
+                expanded, pn,
+                "Failed to expand step {step} from {largest_acked} (len {len}, trunc {truncated})"
+            );
+
             // Advance largest acked arbitrarily occasionally
             if i % 10 == 0 {
                 largest_acked = pn;

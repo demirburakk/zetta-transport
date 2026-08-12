@@ -26,11 +26,15 @@ impl StreamReceiveBuffer {
         }
     }
 
+    pub(crate) fn allocated_size(&self) -> usize {
+        self.buffer.len()
+    }
+
     pub(crate) fn write(&mut self, offset: u64, data: &[u8]) -> Option<usize> {
         if data.is_empty() {
             return Some(0);
         }
-        let end_offset = offset + data.len() as u64;
+        let end_offset = offset.checked_add(data.len() as u64)?;
 
         // Cannot fit in the buffer.
         if end_offset > self.read_head + self.capacity as u64 {
@@ -93,10 +97,11 @@ impl StreamReceiveBuffer {
 
         // Also check if there's a range starting just after `end` that's adjacent.
         if let Some((&rs, &re)) = self.received_ranges.range(end..).next()
-            && rs <= merged_end {
-                merged_end = merged_end.max(re);
-                to_remove.push(rs);
-            }
+            && rs <= merged_end
+        {
+            merged_end = merged_end.max(re);
+            to_remove.push(rs);
+        }
 
         for key in to_remove {
             self.received_ranges.remove(&key);
@@ -143,10 +148,12 @@ impl StreamReceiveBuffer {
             }
             // Trim the first remaining range if it starts before read_head.
             if let Some((&rs, &re)) = self.received_ranges.iter().next()
-                && rs < self.read_head && re > self.read_head {
-                    self.received_ranges.remove(&rs);
-                    self.received_ranges.insert(self.read_head, re);
-                }
+                && rs < self.read_head
+                && re > self.read_head
+            {
+                self.received_ranges.remove(&rs);
+                self.received_ranges.insert(self.read_head, re);
+            }
 
             return Some(out.freeze());
         }
@@ -166,27 +173,27 @@ impl StreamReceiveBuffer {
         }
         let mut new_buf = vec![0u8; new_capacity];
         let old_cap = self.capacity;
-        
+
         // Copy unread data from old circular buffer to new circular buffer
         // using chunk-based copies (memcpy) instead of byte-by-byte iteration.
         let data_len = (self.write_head - self.read_head) as usize;
         let old_start = (self.read_head % old_cap as u64) as usize;
-        
+
         if data_len > 0 {
             // Extract contiguous data from old buffer (may wrap around)
             let first_chunk_len = data_len.min(old_cap - old_start);
             let new_start = (self.read_head % new_capacity as u64) as usize;
-            
+
             // Write first chunk into new buffer (may also wrap)
             let new_first_chunk_len = data_len.min(new_capacity - new_start);
-            
+
             // Build a temporary linear copy of old data to simplify wrap handling
             let mut linear = Vec::with_capacity(data_len);
             linear.extend_from_slice(&self.buffer[old_start..old_start + first_chunk_len]);
             if first_chunk_len < data_len {
                 linear.extend_from_slice(&self.buffer[..data_len - first_chunk_len]);
             }
-            
+
             // Write linear data into new circular buffer
             new_buf[new_start..new_start + new_first_chunk_len]
                 .copy_from_slice(&linear[..new_first_chunk_len]);
@@ -195,7 +202,7 @@ impl StreamReceiveBuffer {
                     .copy_from_slice(&linear[new_first_chunk_len..]);
             }
         }
-        
+
         self.buffer = new_buf;
         self.capacity = new_capacity;
     }
@@ -282,10 +289,10 @@ mod tests {
         buf.write(0, b"0123456789abcdef").unwrap();
         let chunk1 = buf.read_contiguous().unwrap();
         assert_eq!(&chunk1[..], b"0123456789abcdef");
-        
+
         buf.write(16, b"1234").unwrap();
         buf.resize(32);
-        
+
         buf.write(20, b"5678").unwrap();
         let chunk2 = buf.read_contiguous().unwrap();
         assert_eq!(&chunk2[..], b"12345678");

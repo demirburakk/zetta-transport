@@ -69,7 +69,7 @@ impl Drop for CryptoContext {
         self.rx_iv.zeroize();
         self.next_rx_key.zeroize();
         self.next_rx_iv.zeroize();
-        
+
         // Overwrite ciphers with zero-key instances to clear key material
         let zero_key = chacha20poly1305::Key::from([0u8; 32]);
         self.tx_cipher = ChaCha20Poly1305::new(&zero_key);
@@ -148,7 +148,8 @@ impl CryptoContext {
         // Pre-derive next epoch's RX key material for trial decryption
         let mut next_secret = self.secret;
         let next_secret_val = key_derivation::ratchet_secret(&mut next_secret);
-        let next_keys = key_derivation::derive_epoch_keys(&next_secret_val, epoch + 1, self.is_client);
+        let next_keys =
+            key_derivation::derive_epoch_keys(&next_secret_val, epoch + 1, self.is_client);
         self.next_rx_key = next_keys.rx_key;
         self.next_rx_iv = next_keys.rx_iv;
         self.next_rx_cipher = next_keys.rx_cipher;
@@ -203,9 +204,12 @@ impl CryptoContext {
         if use_prev_key {
             if let Some(ref prev) = self.prev_rx {
                 let prev_nonce = self.make_nonce_from_iv(&prev.rx_iv, packet_number);
-                return prev.rx_cipher
+                return prev
+                    .rx_cipher
                     .decrypt_in_place_detached(&prev_nonce, aad, payload, chacha_tag)
-                    .map_err(|e| ZtError::Crypto(format!("Decryption with prev key failed: {}", e)));
+                    .map_err(|e| {
+                        ZtError::Crypto(format!("Decryption with prev key failed: {}", e))
+                    });
             }
             return Err(ZtError::Crypto("No previous RX cipher available".into()));
         }
@@ -226,11 +230,11 @@ impl CryptoContext {
     ) -> Result<()> {
         let nonce = self.make_nonce_from_iv(&self.next_rx_iv, packet_number);
         let chacha_tag = chacha20poly1305::Tag::from_slice(tag);
-        
+
         self.next_rx_cipher
             .decrypt_in_place_detached(&nonce, aad, payload, chacha_tag)
             .map_err(|e| ZtError::Crypto(format!("Trial decryption failed: {}", e)))?;
-             
+
         // Trial succeeded, commit rotation
         self.rotate_keys();
         Ok(())
@@ -360,7 +364,9 @@ mod tests {
         let tag = client.encrypt_in_place(0, aad, &mut payload).unwrap();
         assert_ne!(&payload[..], plaintext);
 
-        server.decrypt_in_place(0, aad, &mut payload, &tag, false).unwrap();
+        server
+            .decrypt_in_place(0, aad, &mut payload, &tag, false)
+            .unwrap();
         assert_eq!(&payload[..], plaintext);
     }
 
@@ -408,7 +414,9 @@ mod tests {
 
         server.rotate_keys();
 
-        server.decrypt_in_place(0, aad, &mut payload, &tag, true).unwrap();
+        server
+            .decrypt_in_place(0, aad, &mut payload, &tag, true)
+            .unwrap();
     }
 
     #[test]
@@ -425,6 +433,3 @@ mod tests {
             .unwrap();
     }
 }
-
-
-

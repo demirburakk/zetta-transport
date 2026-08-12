@@ -1,9 +1,9 @@
 use super::ActorMessage;
-use crate::stats::ConnectionStats;
 use super::ZtConnectionActor;
+use crate::protocol::frame::Frame;
+use crate::stats::ConnectionStats;
 use crate::stream::ZtStream;
 use crate::transport::state::{ConnectionState, StreamState};
-use crate::protocol::frame::Frame;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
@@ -14,22 +14,25 @@ const SLEEP_FOREVER: Duration = Duration::from_secs(86400 * 365);
 impl ZtConnectionActor {
     pub(crate) async fn run(mut self) {
         let rto_deadline = TokioInstant::now() + self.state.rtt;
-        let mut idle_deadline = TokioInstant::now() + Duration::from_secs(60);
+        let mut idle_deadline = TokioInstant::now() + self.state.idle_timeout;
         let mut ack_deadline = TokioInstant::now() + SLEEP_FOREVER;
-        let mut mtu_probe_deadline = TokioInstant::now() + Duration::from_secs(15);
+        let mut mtu_probe_deadline = TokioInstant::now() + self.endpoint.config.mtu_probe_interval;
         let mut pacing_deadline = TokioInstant::now() + SLEEP_FOREVER;
+        let mut path_validation_deadline = TokioInstant::now() + SLEEP_FOREVER;
 
         let rto_timer = sleep_until(rto_deadline);
         let idle_timer = sleep_until(idle_deadline);
         let delayed_ack_timer = sleep_until(ack_deadline);
         let mtu_probe_timer = sleep_until(mtu_probe_deadline);
         let pacing_timer = sleep_until(pacing_deadline);
+        let path_validation_timer = sleep_until(path_validation_deadline);
 
         tokio::pin!(rto_timer);
         tokio::pin!(idle_timer);
         tokio::pin!(delayed_ack_timer);
         tokio::pin!(mtu_probe_timer);
         tokio::pin!(pacing_timer);
+        tokio::pin!(path_validation_timer);
 
         // Helper macro to reset the pacing timer after flushing the pacing queue.
         // Avoids duplicating the same if/else block across all select! branches.
@@ -59,7 +62,8 @@ impl ZtConnectionActor {
                     while self.receiver.recv().await.is_some() {
                         // In zombie state, just drain and drop messages
                     }
-                }).await;
+                })
+                .await;
                 break;
             }
 
@@ -67,12 +71,14 @@ impl ZtConnectionActor {
 
             tokio::select! {
                 Some(msg) = self.receiver.recv() => {
-                    idle_deadline = TokioInstant::now() + Duration::from_secs(60);
+                    idle_deadline = TokioInstant::now() + self.state.idle_timeout;
                     idle_timer.as_mut().reset(idle_deadline);
 
                     match msg {
                         ActorMessage::IncomingPacket { data, addr } => {
-                            let _ = self.process_incoming_packet(data, addr);
+                            if let Err(error) = self.process_incoming_packet(data, addr) {
+                                tracing::debug!("Dropping invalid incoming packet: {error}");
+                            }
                             unacked_changed = true;
                             if self.pending_acks > 0 {
                                 let next_ack = TokioInstant::now() + Duration::from_millis(25);
@@ -98,21 +104,31 @@ impl ZtConnectionActor {
                                 tracing::warn!("Failed to send StreamClose: {}", e);
                             }
                             self.state.streams.remove(&stream_id);
-
-                            if self.state.streams.is_empty() {
-                                let _ = self.initiate_close();
-                                idle_deadline = TokioInstant::now() + Duration::from_secs(5);
-                                idle_timer.as_mut().reset(idle_deadline);
+                            unacked_changed = true;
+                            reset_pacing!();
+                        }
+                        ActorMessage::ResetStream { stream_id, error_code } => {
+                            if let Err(error) = self.reset_stream(stream_id, error_code) {
+                                tracing::warn!("Failed to reset stream: {error}");
                             }
+                            self.state.streams.remove(&stream_id);
                             unacked_changed = true;
                             reset_pacing!();
                         }
                         ActorMessage::OpenStream { stream_type, respond_to } => {
-                            let opened_count = if self.is_client {
-                                if self.next_stream_id >= 2 { (self.next_stream_id - 2) / 2 } else { 0 }
-                            } else {
-                                if self.next_stream_id >= 1 { (self.next_stream_id - 1) / 2 } else { 0 }
-                            } as u64;
+                            if stream_type == crate::transport::state::StreamType::UnidirectionalIn {
+                                let _ = respond_to.send(Err(crate::error::ZtError::InvalidPacket(
+                                    "receive-only streams are created by the peer".into(),
+                                )));
+                                continue;
+                            }
+                            let local_parity = if self.is_client { 0 } else { 1 };
+                            let opened_count = self
+                                .state
+                                .streams
+                                .keys()
+                                .filter(|id| **id % 2 == local_parity)
+                                .count() as u64;
 
                             if opened_count >= self.state.peer_max_streams {
                                 let blocked_frame = Frame::StreamsBlocked { max_streams: self.state.peer_max_streams };
@@ -126,13 +142,27 @@ impl ZtConnectionActor {
                             }
 
                             let stream_id = self.next_stream_id;
-                            self.next_stream_id += 2;
+                            let Some(next_stream_id) = self.next_stream_id.checked_add(2) else {
+                                let _ = respond_to.send(Err(crate::error::ZtError::ConnectionIdExhausted));
+                                continue;
+                            };
+                            self.next_stream_id = next_stream_id;
 
                             let (data_tx, data_rx) = mpsc::channel(2048);
                             let window_opened = Arc::new(Notify::new());
+                            let termination = Arc::new(
+                                crate::stream::termination::Termination::default(),
+                            );
                             self.state.streams.insert(
                                 stream_id,
-                                StreamState::new(data_tx, window_opened.clone(), stream_type),
+                                StreamState::new(
+                                    data_tx,
+                                    window_opened.clone(),
+                                    stream_type,
+                                    self.endpoint.config.initial_stream_window,
+                                    self.state.peer_initial_stream_window,
+                                    termination.clone(),
+                                ),
                             );
 
                             let stream = ZtStream::new(
@@ -143,14 +173,24 @@ impl ZtConnectionActor {
                                 self.actor_tx.clone(),
                                 self.state.shared_mtu.clone(),
                                 stream_type,
+                                self.state.idle_timeout,
+                                termination,
                             );
                             let _ = respond_to.send(Ok(stream));
                         }
                         ActorMessage::SetHandshakePacket(hs) => {
                             self.state.handshake_packet = Some(hs);
                         }
-                        ActorMessage::StreamDataRead { stream_id } => {
-                            let _ = self.forward_stream_data(stream_id);
+                        ActorMessage::StreamDataRead { stream_id, bytes_read } => {
+                            let _ = self.forward_stream_data(stream_id, bytes_read);
+                            if bytes_read > 0 {
+                                // ACK frames also carry the connection-level
+                                // receive window. Emit an update immediately so
+                                // a sender blocked at zero credit cannot deadlock.
+                                self.pending_acks = self.pending_acks.max(1);
+                                let _ = self.flush_acks();
+                                unacked_changed = true;
+                            }
                             reset_pacing!();
                         }
                         ActorMessage::GetStats { respond_to } => {
@@ -165,6 +205,11 @@ impl ZtConnectionActor {
                                 key_epoch: self.state.current_key_epoch,
                                 mtu: self.state.mtu,
                                 cc_algorithm: self.endpoint.cc_algo,
+                                packets_lost: self.state.packets_lost,
+                                packets_retransmitted: self.state.packets_retransmitted,
+                                mtu_probe_successes: self.state.mtu_probe_successes,
+                                mtu_probe_failures: self.state.mtu_probe_failures,
+                                mtu_blackhole_recoveries: self.state.mtu_blackhole_recoveries,
                             };
                             let _ = respond_to.send(stats);
                         }
@@ -175,9 +220,27 @@ impl ZtConnectionActor {
                             unacked_changed = true;
                             reset_pacing!();
                         }
+                        ActorMessage::CloseWithError { error_code, reason } => {
+                            let _ = self.initiate_close_with_error(error_code, reason);
+                            idle_deadline = TokioInstant::now() + Duration::from_secs(5);
+                            idle_timer.as_mut().reset(idle_deadline);
+                            unacked_changed = true;
+                            reset_pacing!();
+                        }
                         ActorMessage::SendDatagram { data, respond_to } => {
                             let data_len = data.len();
-                            if self.state.bytes_in_flight + data_len > self.state.cc.cwnd() {
+                            let max_datagram_payload = self
+                                .state
+                                .mtu
+                                .saturating_sub(64)
+                                .min(self.state.peer_max_datagram_size);
+                            if data_len > max_datagram_payload {
+                                let _ = respond_to.send(Err(crate::error::ZtError::InvalidPacket(
+                                    format!(
+                                        "Datagram payload exceeds current path limit ({max_datagram_payload} bytes)"
+                                    ),
+                                )));
+                            } else if self.state.bytes_in_flight.saturating_add(data_len) > self.state.cc.cwnd() {
                                 let _ = respond_to.send(Err(crate::error::ZtError::CongestionWindowFull));
                             } else {
                                 let result = self.send_datagram_payload(data);
@@ -208,7 +271,8 @@ impl ZtConnectionActor {
                     if let Err(e) = self.send_mtu_probe() {
                         tracing::debug!("Failed to send MTU probe: {}", e);
                     }
-                    mtu_probe_deadline = TokioInstant::now() + Duration::from_secs(15);
+                    mtu_probe_deadline =
+                        TokioInstant::now() + self.endpoint.config.mtu_probe_interval;
                     mtu_probe_timer.as_mut().reset(mtu_probe_deadline);
                     unacked_changed = true;
                 }
@@ -224,36 +288,58 @@ impl ZtConnectionActor {
                     unacked_changed = true;
                 }
 
-                _ = &mut idle_timer => { break; }
-            }
-            // Periodic check for path validation challenge retransmissions
-            // Path Validation Timeout & Retransmission:
-            // Checks if a PathChallenge is outstanding. If the peer does not reply with a
-            // PathResponse within 2 * RTT (with a minimum of 50ms), we retransmit the challenge.
-            // We allow up to 3 retries. If validation fails after all retries, the new path
-            // is deemed invalid/unreachable, and we discard validation state, keeping the connection
-            // on its original verified path.
-            if let Some(sent_at) = self.path_validation_sent_at {
-                let rtt = self.state.rtt.max(Duration::from_millis(50));
-                if sent_at.elapsed() > rtt * 2 {
-                    if self.path_validation_retries < 3 {
+                _ = &mut path_validation_timer => {
+                    if self.path_validation_retries
+                        < self.endpoint.config.max_path_validation_retries
+                    {
                         if let Some(addr) = self.pending_validation_addr
-                            && let Some(token) = self.path_validation_token {
-                                tracing::info!("Retransmitting PathChallenge to {:?} (retry {})", addr, self.path_validation_retries + 1);
-                                self.path_validation_retries += 1;
-                                self.path_validation_sent_at = Some(std::time::Instant::now());
-                                let challenge = Frame::PathChallenge { data: token };
-                                let _ = self.send_frame_immediate(challenge, addr);
+                            && let Some(token) = self.path_validation_token
+                        {
+                            self.path_validation_retries += 1;
+                            self.path_validation_sent_at = Some(std::time::Instant::now());
+                            let challenge = Frame::PathChallenge { data: token };
+                            if let Err(error) = self.send_frame_immediate(challenge, addr) {
+                                tracing::debug!("PathChallenge retransmit failed: {error}");
                             }
+                        }
                     } else {
-                        tracing::warn!("Path validation failed after 3 retries for address {:?}", self.pending_validation_addr);
+                        tracing::warn!(
+                            "Path validation failed after {} retries for address {:?}",
+                            self.endpoint.config.max_path_validation_retries,
+                            self.pending_validation_addr
+                        );
                         self.pending_validation_addr = None;
                         self.path_validation_token = None;
                         self.path_validation_sent_at = None;
                         self.path_validation_retries = 0;
                     }
                 }
+
+                _ = &mut idle_timer => {
+                    if self.state.state != ConnectionState::Closing {
+                        self.state
+                            .termination
+                            .set(crate::stream::termination::TerminationReason::IdleTimeout);
+                        for stream in self.state.streams.values() {
+                            stream
+                                .termination
+                                .set(crate::stream::termination::TerminationReason::IdleTimeout);
+                        }
+                    }
+                    break;
+                }
             }
+
+            path_validation_deadline = self.path_validation_sent_at.map_or_else(
+                || TokioInstant::now() + SLEEP_FOREVER,
+                |sent_at| {
+                    let rtt = self.state.rtt.max(Duration::from_millis(50));
+                    TokioInstant::from_std(sent_at + rtt * 2)
+                },
+            );
+            path_validation_timer
+                .as_mut()
+                .reset(path_validation_deadline);
 
             if unacked_changed {
                 self.update_rto_timer(rto_timer.as_mut());
@@ -266,7 +352,7 @@ impl ZtConnectionActor {
             .closed
             .store(true, std::sync::atomic::Ordering::Release);
         for stream in self.state.streams.values() {
-            stream.window_opened.notify_waiters();
+            stream.signal_window_opened();
         }
 
         self.routing_table.remove(&self.scid);
